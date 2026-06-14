@@ -135,19 +135,31 @@ def ast_edit(path: str, target_symbol: str, new_source: str, *, dry_run: bool = 
 
     before = _read(path)
     suffix = p.suffix.lower()
+    validate_after = False  # only Python is cheaply re-parseable in-process
 
-    if suffix != ".py":
-        return EditResult(
-            False,
-            path,
-            f"ast_edit currently implements Python only ({suffix} unsupported); "
-            f"TODO: tree-sitter backend for java/kotlin/rust/cpp — fall back to search_replace",
+    if suffix == ".py":
+        try:
+            span = _python_symbol_span(before, target_symbol)
+        except SyntaxError as e:
+            return EditResult(False, path, f"cannot parse {path}: {e}")
+        validate_after = True
+    else:
+        # Multi-language path via tree-sitter (optional per-language grammar).
+        from . import treesitter_edit
+
+        try:
+            ts_span = treesitter_edit.find_span(before, target_symbol, suffix)
+        except treesitter_edit.GrammarUnavailable as e:
+            return EditResult(
+                False, path,
+                f"{e}; fall back to search_replace for this file",
+            )
+        span = (
+            _SymbolSpan(ts_span.name, ts_span.start_line, ts_span.end_line)
+            if ts_span is not None
+            else None
         )
 
-    try:
-        span = _python_symbol_span(before, target_symbol)
-    except SyntaxError as e:
-        return EditResult(False, path, f"cannot parse {path}: {e}")
     if span is None:
         return EditResult(False, path, f"symbol not found: {target_symbol}")
 
@@ -168,11 +180,12 @@ def ast_edit(path: str, target_symbol: str, new_source: str, *, dry_run: bool = 
 
     after = "".join(lines[: span.start_line - 1]) + new_block + "".join(lines[span.end_line :])
 
-    # Validate the result still parses before writing.
-    try:
-        ast.parse(after)
-    except SyntaxError as e:
-        return EditResult(False, path, f"edit would break syntax at line {e.lineno}: {e.msg}")
+    # Validate the result still parses before writing (Python only — cheap & in-process).
+    if validate_after:
+        try:
+            ast.parse(after)
+        except SyntaxError as e:
+            return EditResult(False, path, f"edit would break syntax at line {e.lineno}: {e.msg}")
 
     diff = _unified_diff(before, after, path)
     if not dry_run:
@@ -208,8 +221,9 @@ TOOL_SCHEMAS = [
         "function": {
             "name": "ast_edit",
             "description": (
-                "Replace an entire function/class by symbol name (e.g. 'Class.method'). Python only for now; "
-                "robust to whitespace drift and validates syntax before writing."
+                "Replace an entire function/class by symbol name (e.g. 'Class.method'). Python (stdlib) "
+                "plus Java/Kotlin/Rust/C++/Go/TS/JS via tree-sitter; robust to whitespace drift. "
+                "Python edits are syntax-validated before writing."
             ),
             "parameters": {
                 "type": "object",

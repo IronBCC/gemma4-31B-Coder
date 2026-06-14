@@ -27,7 +27,9 @@ Measurable lift over the Phase-0 baseline on SWE-bench Lite/Verified.
 - `scaffold/test_loop.py` — subprocess runner (local or `docker exec`), timeout cap, pytest/unittest failure parsing, `.feedback()` for the model.
 - `scaffold/agent.py` — multi-turn OpenAI-compatible loop (vLLM), tool dispatch, crash/retry, `reasoning_content` preserved across turns, returns a `Trajectory`.
 
-Still TODO: tree-sitter backend for `ast_edit` (java/kotlin/rust/cpp), embedding/LLM rerank in the localizer, and pinning the Gemma-4 tool-call parser against the live server.
+`ast_edit` now supports Java/Kotlin/Rust/C++/Go/TS/JS via tree-sitter (`scaffold/treesitter_edit.py`, optional per-language grammars; missing grammar falls back to `search_replace`).
+
+Still TODO: embedding/LLM rerank in the localizer, and pinning the Gemma-4 tool-call parser against the live server.
 
 ### Run tests
 ```bash

@@ -1,0 +1,16 @@
+# Base model + serving identity (keep template/EOS identical across train + serve)
+base_model: google/gemma-4-31B-it
+params: 30.7B            # dense
+max_ctx: 262144          # 256K
+chat_template: gemma-4-thinking
+features: [thinking, native_function_calling, native_mtp_draft_heads]
+
+harness: mini-swe-agent  # same harness for collection + eval
+target_baseline:
+  model: Qwen/Qwen3.6-27B
+  note: run under OUR identical stack; do not compare to self-reported numbers
+
+precision:
+  capability_claim: bf16   # beat-Qwen claim is BF16-vs-BF16
+  deployment: nvfp4        # W4A4 on RTX 6000 Pro (SM120)
+  fallback: fp8            # capability fallback if NVFP4 gap too large

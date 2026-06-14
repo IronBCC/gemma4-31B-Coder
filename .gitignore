@@ -1,0 +1,53 @@
+# ---- ML / data artifacts (never commit) ----
+# datasets & corpora
+data/raw/
+data/processed/
+data/cache/
+*.jsonl
+*.parquet
+*.arrow
+!data/manifests/*.jsonl        # keep small manifests
+# model weights / checkpoints
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+*.ckpt
+adapters/
+eagle3-head/
+# quantized artifacts
+*.nvfp4
+*-fp8/
+*-nvfp4/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.ipynb_checkpoints/
+
+# ---- experiment tracking / logs ----
+wandb/
+runs/
+outputs/
+logs/
+*.log
+.swe-agent/
+docker-images/
+
+# ---- env / secrets ----
+.env
+*.key
+hf_token*
+secrets/
+
+# ---- OS / editor ----
+.DS_Store
+.idea/
+.vscode/
+.omc/

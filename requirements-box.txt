@@ -11,3 +11,6 @@ swebench                   # official SWE-bench harness (Docker-based scoring)
 docker
 pyyaml
 tqdm
+openai>=1.30                # OpenAI-compatible client for the vLLM endpoint (agent loop)
+tree-sitter                 # (optional) multi-lang ast_edit backend — TODO
+pytest                      # scaffold unit tests

@@ -1,0 +1,13 @@
+# Box (RTX 6000 Pro Blackwell) deps for Phase 0/A/B. Pin exact versions per your CUDA/vLLM.
+# --- serving / inference ---
+vllm>=0.6.0                 # confirm version that supports Gemma-4 + NVFP4 + eagle3 spec config
+# --- agent harness ---
+mini-swe-agent             # same harness for collection + eval (confirm package/repo name)
+# --- data / eval ---
+datasets>=2.19
+huggingface-hub>=0.23
+swebench                   # official SWE-bench harness (Docker-based scoring)
+# --- utils ---
+docker
+pyyaml
+tqdm

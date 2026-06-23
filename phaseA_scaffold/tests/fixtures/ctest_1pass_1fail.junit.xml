@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="simdjson" tests="2" failures="1" errors="0" time="3.2">
+  <testcase name="parse_valid_json" classname="simdjson" time="1.1" status="run"/>
+  <testcase name="parse_regression_unicode" classname="simdjson" time="2.1" status="fail">
+    <failure message="Expected 0x1F600, got replacement char" type="assert">value mismatch at offset 12</failure>
+  </testcase>
+</testsuite>

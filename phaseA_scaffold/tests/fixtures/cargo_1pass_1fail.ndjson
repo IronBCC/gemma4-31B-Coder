@@ -1,0 +1,8 @@
+{"reason":"compiler-artifact","package_id":"bat 0.24.0","target":{"name":"bat"},"executable":"/testbed/target/debug/deps/bat-abc"}
+{"reason":"build-finished","success":true}
+{"type":"suite","event":"started","test_count":2}
+{"type":"test","event":"started","name":"tests::test_decode_ok"}
+{"type":"test","name":"tests::test_decode_ok","event":"ok"}
+{"type":"test","event":"started","name":"tests::test_highlight_regression"}
+{"type":"test","name":"tests::test_highlight_regression","event":"failed","stdout":"assertion failed: left == right"}
+{"type":"suite","event":"failed","passed":1,"failed":1}

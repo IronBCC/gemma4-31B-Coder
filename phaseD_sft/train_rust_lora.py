@@ -30,6 +30,7 @@ def main() -> int:
     ap.add_argument("--bsz", type=int, default=1)
     ap.add_argument("--grad-accum", type=int, default=16)
     ap.add_argument("--max-seq", type=int, default=8192)
+    ap.add_argument("--warmup-steps", type=int, default=20)
     ap.add_argument("--max-steps", type=int, default=-1)  # -1 = full epochs; >0 caps for a quick run
     ap.add_argument("--load-4bit", action="store_true", help="QLoRA 4-bit base (less VRAM)")
     a = ap.parse_args()
@@ -79,7 +80,7 @@ def main() -> int:
         output_dir=a.out,
         per_device_train_batch_size=a.bsz,
         gradient_accumulation_steps=a.grad_accum,
-        warmup_ratio=0.03,
+        warmup_steps=a.warmup_steps,
         num_train_epochs=a.epochs,
         max_steps=a.max_steps,
         learning_rate=a.lr,

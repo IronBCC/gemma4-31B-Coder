@@ -63,16 +63,17 @@ def main() -> int:
 
     from unsloth import FastLanguageModel
     from unsloth.chat_templates import get_chat_template
+    # Load the ADAPTER directory directly: unsloth reads its base_model_name_or_path and
+    # loads base+LoRA in ONE pass. Avoids the load_adapter()-on-loaded-model double
+    # caching_allocator_warmup that tried to re-allocate the whole 58GB base -> OOM.
+    print(f"[load] loading base+adapter from {a.adapter}", flush=True)
     model, tok = FastLanguageModel.from_pretrained(
-        model_name=a.base, max_seq_length=4096, dtype=None, load_in_4bit=a.load_4bit,
+        model_name=a.adapter, max_seq_length=4096, dtype=None, load_in_4bit=a.load_4bit,
     )
     try:
         tok = get_chat_template(tok, chat_template="gemma-4")
     except Exception:
         pass
-    print(f"[load] attaching adapter {a.adapter}", flush=True)
-    model.load_adapter(a.adapter, adapter_name="rust")
-    model.set_adapter("rust")
     FastLanguageModel.for_inference(model)
 
     results = []

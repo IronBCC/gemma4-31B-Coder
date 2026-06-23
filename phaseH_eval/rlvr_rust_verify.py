@@ -77,14 +77,14 @@ def _verify_one(container: str, work_root: str, row: dict, timeout_s: int = 90) 
     )
     try:
         proc = subprocess.run(
-            ["docker", "exec", container, "bash", "-lc", script],
+            ["docker", "exec", container, "sh", "-c", script],
             capture_output=True, text=True, timeout=timeout_s + 30,
         )
         out = proc.stdout + proc.stderr
     except subprocess.TimeoutExpired:
         return None
     finally:
-        subprocess.run(["docker", "exec", container, "bash", "-lc", f"rm -rf {crate}"],
+        subprocess.run(["docker", "exec", container, "sh", "-c", f"rm -rf {crate}"],
                        capture_output=True, timeout=30)
     if "RLVR_ALL_ASSERTS_PASSED" in out and proc.returncode == 0:
         return {"id": rid, "problem": row.get("translated_problem", ""),
@@ -107,7 +107,7 @@ def main() -> int:
     if a.limit:
         ds = ds.select(range(min(a.limit, len(ds))))
     rows = [dict(r) for r in ds]
-    subprocess.run(["docker", "exec", a.container, "bash", "-lc", f"mkdir -p {a.work_root}"],
+    subprocess.run(["docker", "exec", a.container, "sh", "-c", f"mkdir -p {a.work_root}"],
                    capture_output=True)
 
     kept = 0

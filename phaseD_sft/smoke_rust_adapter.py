@@ -57,12 +57,14 @@ def main() -> int:
     ap.add_argument("--adapter", required=True)
     ap.add_argument("--container", default="rlvr-rustc")
     ap.add_argument("--max-new", type=int, default=512)
+    ap.add_argument("--load-4bit", action="store_true",
+                    help="4-bit base so smoke fits alongside a running training job on the same GPU")
     a = ap.parse_args()
 
     from unsloth import FastLanguageModel
     from unsloth.chat_templates import get_chat_template
     model, tok = FastLanguageModel.from_pretrained(
-        model_name=a.base, max_seq_length=4096, dtype=None, load_in_4bit=False,
+        model_name=a.base, max_seq_length=4096, dtype=None, load_in_4bit=a.load_4bit,
     )
     try:
         tok = get_chat_template(tok, chat_template="gemma-4")

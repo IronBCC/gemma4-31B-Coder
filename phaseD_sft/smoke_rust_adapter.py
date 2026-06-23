@@ -78,9 +78,16 @@ def main() -> int:
 
     results = []
     for i, prompt in enumerate(PROMPTS):
-        msgs = [{"role": "user", "content": prompt}]
-        inputs = tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True,
-                                         return_tensors="pt").to(model.device)
+        # Gemma-4 processor template wants typed content parts, not a bare string.
+        msgs = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+        try:
+            inputs = tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True,
+                                             return_tensors="pt").to(model.device)
+        except (TypeError, KeyError):
+            # fallback for tokenizers that want a plain string
+            msgs = [{"role": "user", "content": prompt}]
+            inputs = tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True,
+                                             return_tensors="pt").to(model.device)
         out = model.generate(input_ids=inputs, max_new_tokens=a.max_new, temperature=0.0,
                              do_sample=False)
         text = tok.decode(out[0][inputs.shape[1]:], skip_special_tokens=True)

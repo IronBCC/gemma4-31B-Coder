@@ -33,6 +33,8 @@ def main() -> int:
     ap.add_argument("--warmup-steps", type=int, default=20)
     ap.add_argument("--max-steps", type=int, default=-1)  # -1 = full epochs; >0 caps for a quick run
     ap.add_argument("--load-4bit", action="store_true", help="QLoRA 4-bit base (less VRAM)")
+    ap.add_argument("--resume", action="store_true",
+                    help="resume from the latest checkpoint in --out (reboot-safe)")
     a = ap.parse_args()
 
     from unsloth import FastLanguageModel
@@ -97,8 +99,17 @@ def main() -> int:
         report_to="none",
     )
     trainer = SFTTrainer(model=model, tokenizer=tokenizer, train_dataset=ds, args=cfg)
+    resume = a.resume
+    if resume:
+        import glob
+        cks = glob.glob(os.path.join(a.out, "checkpoint-*"))
+        if not cks:
+            print("[resume] no checkpoint found — starting fresh", flush=True)
+            resume = False
+        else:
+            print(f"[resume] resuming from latest of {len(cks)} checkpoints in {a.out}", flush=True)
     print("[train] starting LoRA SFT (frozen base)…", flush=True)
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume)
 
     # save ADAPTER ONLY — never merge into base (frozen-base guarantee)
     model.save_pretrained(a.out)

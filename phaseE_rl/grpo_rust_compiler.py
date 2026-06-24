@@ -91,15 +91,18 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0)
     a = ap.parse_args()
 
-    from unsloth import FastLanguageModel
+    # plain transformers+peft load (RL venv is unsloth-free to keep trl/transformers compatible)
+    import torch
     from datasets import Dataset
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import PeftModel
     from trl import GRPOConfig, GRPOTrainer
 
-    # load SFT adapter as the policy cold-start (base+LoRA one pass)
-    model, tok = FastLanguageModel.from_pretrained(
-        model_name=a.adapter, max_seq_length=a.max_prompt + a.max_completion, dtype=None, load_in_4bit=False,
-    )
-    FastLanguageModel.for_training(model)
+    tok = AutoTokenizer.from_pretrained(a.base)
+    base = AutoModelForCausalLM.from_pretrained(a.base, torch_dtype=torch.bfloat16, device_map={"": 0})
+    # SFT adapter as the policy cold-start; merge it in so GRPO trains a fresh LoRA on top
+    model = PeftModel.from_pretrained(base, a.adapter)
+    model = model.merge_and_unload()
 
     # build prompt dataset (problem -> chat prompt); keep tests alongside for the reward
     rows = []
@@ -130,8 +133,14 @@ def main() -> int:
         logging_steps=1, save_steps=a.max_steps, bf16=True, report_to="none",
         temperature=1.0, beta=0.04,
     )
+    # GRPO trains a FRESH LoRA on top of the SFT-warmed policy (not the full 31B)
+    from peft import LoraConfig
+    rl_lora = LoraConfig(
+        r=32, lora_alpha=32, lora_dropout=0.0, bias="none", task_type="CAUSAL_LM",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    )
     trainer = GRPOTrainer(model=model, processing_class=tok, args=cfg,
-                          train_dataset=ds, reward_funcs=[reward_fn])
+                          train_dataset=ds, reward_funcs=[reward_fn], peft_config=rl_lora)
     print("[grpo] starting RLVR (compiler reward)…", flush=True)
     trainer.train()
     model.save_pretrained(a.out); tok.save_pretrained(a.out)

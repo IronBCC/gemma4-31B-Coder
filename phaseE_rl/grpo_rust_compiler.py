@@ -129,7 +129,7 @@ def main() -> int:
     cfg = GRPOConfig(
         output_dir=a.out, per_device_train_batch_size=a.num_gen, num_generations=a.num_gen,
         gradient_accumulation_steps=1, learning_rate=1e-5, max_steps=a.max_steps,
-        max_prompt_length=a.max_prompt, max_completion_length=a.max_completion,
+        max_completion_length=a.max_completion,
         logging_steps=1, save_steps=a.max_steps, bf16=True, report_to="none",
         temperature=1.0, beta=0.04,
     )

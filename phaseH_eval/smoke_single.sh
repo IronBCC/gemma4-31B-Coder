@@ -12,6 +12,7 @@ SUBSET="${SUBSET:-lite}"
 SPLIT="${SPLIT:-test}"
 SLICE="${SLICE:-0:5}"
 WORKERS="${WORKERS:-1}"
+TEMPERATURE="${TEMPERATURE:-0}"
 OUT="${OUT:-$ROOT/runs/smoke_single_${NAME}_$(date +%Y%m%d_%H%M%S)}"
 SCORE="${SCORE:-1}"
 CONFIG="${CONFIG:-swebench_edit_first.yaml}"
@@ -25,7 +26,7 @@ fi
 
 mkdir -p "$OUT"
 
-echo "### mini-SWE smoke name=$NAME port=$PORT subset=$SUBSET split=$SPLIT slice=$SLICE workers=$WORKERS config=$CONFIG -> $OUT ###"
+echo "### mini-SWE smoke name=$NAME port=$PORT subset=$SUBSET split=$SPLIT slice=$SLICE workers=$WORKERS temperature=$TEMPERATURE config=$CONFIG -> $OUT ###"
 PYTHONPATH="$HERE" MSWEA_SILENT_STARTUP=1 "$MINI" swebench \
   --subset "$SUBSET" \
   --split "$SPLIT" \
@@ -36,7 +37,7 @@ PYTHONPATH="$HERE" MSWEA_SILENT_STARTUP=1 "$MINI" swebench \
   -m "openai/$NAME" \
   -c "$CONFIG" \
   -c model.model_kwargs.api_base="http://localhost:$PORT/v1" \
-  -c model.model_kwargs.temperature=0 \
+  -c model.model_kwargs.temperature="$TEMPERATURE" \
   -o "$OUT/$NAME" \
   > "$OUT/$NAME.gen.log" 2>&1
 

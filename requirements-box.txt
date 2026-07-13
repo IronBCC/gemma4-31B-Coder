@@ -14,6 +14,11 @@ tqdm
 openai>=1.30                # OpenAI-compatible client for the vLLM endpoint (agent loop)
 tree-sitter                 # (optional) multi-lang ast_edit backend — TODO
 pytest                      # scaffold unit tests
+# --- phase I DeepSpeed/Ulysses long-context probe ---
+torch                       # install CUDA build matching the box driver
+transformers
+peft
+deepspeed
 # optional tree-sitter grammars for ast_edit (install only the langs you target)
 tree-sitter-java
 tree-sitter-kotlin

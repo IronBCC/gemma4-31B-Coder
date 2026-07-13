@@ -191,12 +191,20 @@ def main() -> int:
         return out
 
     cfg = GRPOConfig(
-        output_dir=a.out, per_device_train_batch_size=a.num_gen, num_generations=a.num_gen,
-        gradient_accumulation_steps=1, learning_rate=a.lr, max_steps=a.max_steps,
+        output_dir=a.out,
+        # backward over 2 sequences at a time (OOM at 4×~3.5k tokens on 95GB);
+        # generation_batch = 2*2 = num_gen so the GRPO group stays 4.
+        per_device_train_batch_size=2, num_generations=a.num_gen,
+        gradient_accumulation_steps=2, learning_rate=a.lr, max_steps=a.max_steps,
         max_completion_length=a.max_completion,
-        logging_steps=1, save_steps=a.max_steps, save_total_limit=3, bf16=True,
+        logging_steps=1, save_steps=25, save_total_limit=3, bf16=True,
         report_to="none", temperature=0.9, beta=0.04,
         gradient_checkpointing=True,
+        # Dr. GRPO (arXiv:2503.20783): constant-length normalizer kills the length
+        # bias that subsidizes rambling 0-reward completions (our observed failure),
+        # and no std-scaling keeps advantages stable across our discrete low-variance
+        # reward groups ({0,0.2,0.6,1.0}; many all-0.2 groups).
+        loss_type="dr_grpo", scale_rewards=False,
         # trl overrides model.generation_config (grpo_trainer.py:1418) and hardcodes
         # the tokenizer eos (:806); generation_kwargs is the supported stop override.
         generation_kwargs={"eos_token_id": [tok.eos_token_id, 49, 106]},

@@ -66,7 +66,7 @@ def decision_reward(completion_text: str, context_files: set[str]) -> float:
     return 0.6
 
 
-def main() -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data/rlvr_swe_decision_v1.jsonl")
     ap.add_argument("--base", default="/media/ironbcc/CrucialX10/models/google/gemma-4-31B-it")
@@ -80,7 +80,17 @@ def main() -> int:
     ap.add_argument("--max-prompt-tokens", type=int, default=3072)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--lr", type=float, default=1e-5)
-    a = ap.parse_args()
+    ap.add_argument(
+        "--loss-type",
+        choices=("grpo", "dr_grpo"),
+        default="dr_grpo",
+        help="TRL objective; standard GRPO uses reward standardization.",
+    )
+    return ap
+
+
+def main() -> int:
+    a = build_arg_parser().parse_args()
 
     import torch
     from datasets import Dataset
@@ -200,11 +210,9 @@ def main() -> int:
         logging_steps=1, save_steps=25, save_total_limit=3, bf16=True,
         report_to="none", temperature=0.9, beta=0.04,
         gradient_checkpointing=True,
-        # Dr. GRPO (arXiv:2503.20783): constant-length normalizer kills the length
-        # bias that subsidizes rambling 0-reward completions (our observed failure),
-        # and no std-scaling keeps advantages stable across our discrete low-variance
-        # reward groups ({0,0.2,0.6,1.0}; many all-0.2 groups).
-        loss_type="dr_grpo", scale_rewards=False,
+        # Dr. GRPO (arXiv:2503.20783) removes length normalization and reward
+        # standardization. Plain GRPO retains the latter for the matched comparison.
+        loss_type=a.loss_type, scale_rewards=(a.loss_type == "grpo"),
         # trl overrides model.generation_config (grpo_trainer.py:1418) and hardcodes
         # the tokenizer eos (:806); generation_kwargs is the supported stop override.
         generation_kwargs={"eos_token_id": [tok.eos_token_id, 49, 106]},

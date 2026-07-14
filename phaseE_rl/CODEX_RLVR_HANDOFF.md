@@ -12,11 +12,44 @@ decision directly. User picked "why not DrGRPO" (arXiv:2503.20783) mid-run — i
 (no length normalization: stops subsidizing rambling 0-reward completions; no σ-scaling:
 stable advantages on our discrete rewards) map onto our observed pathologies.
 
-## 1. Running now
-- **Dr. GRPO s2**: `phaseE_rl/grpo_swe_edit_decision.py`, out `adapters/swe_drgrpo_v1_s2`,
-  log `/tmp/drgrpo_s2.log`, 100 steps, save every 25, GPU1. Expect ~4h.
-  Healthy signature: `completions/mean_length` VARIED (46-708, not pinned at cap),
-  `reward_fn/mean` climbing off the 0.2 read-floor toward 0.6+.
+## 1. Current verified state (2026-07-14)
+- Both matched 100-step runs are complete: Dr. GRPO at
+  `adapters/swe_drgrpo_v1_s2/checkpoint-100` (`/tmp/drgrpo_s2.log`) and standard GRPO at
+  `adapters/swe_grpo_v1_s2/checkpoint-100` (`/tmp/grpo_cmp_s2.log`). The only intentional
+  config difference is `--loss-type dr_grpo` versus `--loss-type grpo`.
+- Dr. GRPO has been three-way merged without altering the frozen base at
+  `/media/ironbcc/CrucialX10/models/merged/swe_drgrpo_v1`. Its hard30 result is **19/30**;
+  the fresh same-day cp20 anchor is **20/30**, so it passes the regression floor (>=18), not
+  a promotion claim. Its completed 30-case temp-0.7 SWE-Lite artifact is
+  `runs/smoke_swe_drgrpo_v1_t07_lite_0_30`: **17/30** non-empty patches (promotion miss by
+  one), **2/30** format errors (6.67%), **23/30** edit-reaching, median first edit command
+  **13**, and **7/17 resolved** non-empty predictions. Do not relaunch it.
+- Standard GRPO was merged to `/media/ironbcc/CrucialX10/models/merged/swe_grpo_v1` with
+  the same frozen-base + v8cp30 + RL-LoRA three-way merge. Its fresh hard30 result is
+  **18/30** against the same-day cp20 anchor at **20/30**, exactly passing the regression
+  floor (>=18). Its completed 30-case temp-0.7 SWE-Lite artifact is
+  `runs/smoke_swe_grpo_v1_t07_lite_0_30`: **20/30** non-empty patches, **3/30** format
+  errors (**10.0%**, so it misses the strict `<10%` format gate), **25/30** edit-reaching,
+  median first edit command **14**, and **6/20 resolved** non-empty predictions.
+- Curve caveat to include in the comparison: Dr. GRPO has one step-14 outlier (loss 11.007,
+  grad norm 1587.5, KL 275.2); standard GRPO peaks at loss 0.00274, grad norm 43.9, and KL
+  0.0684. Both completed 100 steps, so behavioral artifacts remain the decision evidence.
+
+### Reproducible smoke extraction
+
+`phaseH_eval/summarize_smoke.py` reads raw `*.traj.json`, `preds.json`, and
+`exit_statuses_*.yaml`; `preds.json` is authoritative for the non-empty-patch gate. Run:
+
+```bash
+PYTHONPATH=$PWD .venv-eval/bin/python phaseH_eval/summarize_smoke.py \
+  runs/smoke_<name>_t07_lite_0_30/<name>
+```
+
+It reports attempted cases, non-empty patches, format errors/rate, edit reach, first
+source-edit distribution, and resolved count once the harness final report exists. Tests: `PYTHONPATH=$PWD .venv-eval/bin/python -m unittest
+phaseH_eval.tests.test_summarize_smoke phaseH_eval.tests.test_smoke_single`.
+
+## 2. Reward and integration fixes already made — do NOT re-hit these
 - **Reward** (shaped, parse-only phase 1): 0.0 no tool call / 0.2 read / 0.6 edit /
   1.0 edit touching a file named in context. Regexes in the script; 8/8 unit tests
   (`phaseE_rl/tests/test_grpo_swe_reward.py`).
@@ -25,7 +58,6 @@ stable advantages on our discrete rewards) map onto our observed pathologies.
   (per-source caps, no coder_repair) was directed earlier — finish it when idle; use for
   any run AFTER the comparison (don't change dataset mid-comparison).
 
-## 2. Integration fixes already made — do NOT re-hit these
 All in `phaseE_rl/grpo_swe_edit_decision.py` (committed, 4ea4bea + later edits synced to box):
 1. `Gemma4ClippableLinear` is un-peft-able → SFT adapter (v8cp30) is MANUALLY merged into
    inner `nn.Linear` weights (fp32 B@A, assert >100 matrices).
@@ -50,17 +82,12 @@ All in `phaseE_rl/grpo_swe_edit_decision.py` (committed, 4ea4bea + later edits s
 - Never `pkill -f`. GPU0/prod vLLM off-limits; ports 8000/8101/8103/8104 stay green.
 
 ## 4. YOUR SEQUENCE (user-authorized)
-1. **Watch Dr. GRPO s2 to completion** (`done ->` in /tmp/drgrpo_s2.log; checkpoints
-   25/50/75/100 in `adapters/swe_drgrpo_v1_s2`). If it OOMs mid-run: latest checkpoint
-   survives — note step count, don't relaunch, proceed with what saved.
-2. **Schedule standard GRPO comparison** (user explicitly authorized): add a
-   `--loss-type` CLI arg to the script (choices grpo|dr_grpo, plumb to
-   `GRPOConfig(loss_type=...)`; for plain grpo also set `scale_rewards=True` i.e. drop
-   the scale_rewards=False override). Then run IDENTICAL config except loss type:
-   out `adapters/swe_grpo_v1_s2`, log `/tmp/grpo_cmp_s2.log`, same data/steps/caps/seed.
-3. **Compare**: (a) training curves — reward_fn/mean trajectory, completion mean_length
-   trajectory, frac_reward_zero_std (extract from both logs, table in the report);
-   (b) behavioral eval BOTH final checkpoints:
+1. **Completed:** Dr. GRPO s2 and the matched standard-GRPO run both reached checkpoint-100;
+   both three-way serving merges and both hard30 + 30-case temp-0.7 evaluations are complete.
+   Do not restart either run or alter their data/configuration; they are the controlled pair.
+2. **Completed comparison:** (a) training curves — reward_fn/mean trajectory, completion
+   mean_length trajectory, frac_reward_zero_std; (b) behavioral evaluation for both final
+   checkpoints:
    - 3-way merge for serving: base is FROZEN — merge (bf16 base + v8cp30 + RL LoRA) into a
      NEW dir (e.g. /media/ironbcc/CrucialX10/models/merged/swe_<variant>_v1) using the same
      manual-merge approach as the script (RL LoRA keys are standard peft over the grafted
@@ -72,8 +99,11 @@ All in `phaseE_rl/grpo_swe_edit_decision.py` (committed, 4ea4bea + later edits s
      SCORE=1 bash phaseH_eval/smoke_single.sh.
    - Baselines to beat: v8cp30 = 11/30 patches, 6/30 resolved, 14/30 edit-reach;
      v7s1cp5 = 13/30 patches, 7/30 resolved. Gate ≥18/30 non-empty, <10% format.
-4. **Report**: comparison table (GRPO vs Dr.GRPO: curves + smoke numbers) to the
-   coordinator/user. NO further training or data rebuilds beyond this without approval.
+3. **Verdict:** standard GRPO is the first variant to clear the patch-count gate (20/30),
+   but it fails the strict format gate at exactly 10.0%; Dr. GRPO passes format but misses
+   patch count by one (17/30). Neither can promote the Python lane. Report the comparison
+   table to the coordinator/user; NO further training or data rebuilds beyond this without
+   approval.
 
 ## 5. If RL doesn't move the gate — ranked next levers (proposals, not authorizations)
 1. Reward phase 2: docker apply-check for the 1.0 tier (patch actually applies) — kills

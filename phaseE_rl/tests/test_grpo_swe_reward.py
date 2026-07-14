@@ -4,10 +4,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from phaseE_rl.grpo_swe_edit_decision import decision_reward, extract_command
+from phaseE_rl.grpo_swe_edit_decision import (
+    build_arg_parser,
+    decision_reward,
+    extract_command,
+)
 
 
 class RewardTests(unittest.TestCase):
+    def test_loss_type_selects_grpo_mode(self):
+        args = build_arg_parser().parse_args(["--loss-type", "grpo"])
+        self.assertEqual(args.loss_type, "grpo")
+
     def test_no_tool_call(self):
         self.assertEqual(decision_reward("let me think about this...", {"a.py"}), 0.0)
 

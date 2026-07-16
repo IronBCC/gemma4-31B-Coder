@@ -1,0 +1,69 @@
+agent:
+  system_template: |
+    You are a practical software engineer using a shell to fix one repository bug.
+    Prefer a small correct source edit over extended inspection.
+  instance_template: |
+    <pr_description>
+    {{task}}
+    </pr_description>
+
+    <instructions>
+    You are in `/testbed`. Modify only regular source files needed for the fix.
+    Do not edit tests, generated files, packaging files, or unrelated code.
+
+    Required workflow:
+    - Use the first few commands to locate the relevant source file and inspect only the needed lines.
+    - By command 20, make the smallest plausible source edit. Do not keep reading.
+    - Never repeat the same read-only command. If you are about to repeat one, edit instead.
+    - After an edit, run a focused check if practical.
+    - Then create and submit a patch.
+
+    Submission commands must be separate:
+    1. `git diff -- path/to/modified_source.py > patch.txt`
+    2. `cat patch.txt`
+    3. `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt`
+
+    The submitted patch must be non-empty and must contain only source-file changes.
+    </instructions>
+  step_limit: 80
+  cost_limit: 3.
+
+environment:
+  cwd: "/testbed"
+  timeout: 60
+  interpreter: ["bash", "-c"]
+  env:
+    PAGER: cat
+    MANPAGER: cat
+    LESS: -R
+    PIP_PROGRESS_BAR: "off"
+    TQDM_DISABLE: "1"
+    BASH_ENV: /root/.bashrc
+  environment_class: docker_selfretry.DockerSelfRetryEnv
+
+model:
+  observation_template: |
+    {% if output.exception_info -%}
+    <exception>{{output.exception_info}}</exception>
+    {% endif -%}
+    <returncode>{{output.returncode}}</returncode>
+    {% if output.output | length < 4000 -%}
+    <output>
+    {{ output.output -}}
+    </output>
+    {%- else -%}
+    <warning>Output was too long; use a narrower command and proceed to an edit.</warning>
+    <output_head>
+    {{ output.output[:1800] }}
+    </output_head>
+    <output_tail>
+    {{ output.output[-1800:] }}
+    </output_tail>
+    {%- endif -%}
+  format_error_template: |
+    Tool call error: {{error}}
+    Reply with exactly one bash tool call. If you already edited, run `git diff -- . > patch.txt && cat patch.txt`.
+  model_name: "anthropic/claude-sonnet-4-5-20250929"
+  model_kwargs:
+    drop_params: true
+    parallel_tool_calls: true

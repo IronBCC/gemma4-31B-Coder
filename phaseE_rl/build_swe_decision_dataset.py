@@ -125,6 +125,40 @@ def extract_decision_point(messages: list[dict[str, Any]]) -> DecisionPoint | No
     return None
 
 
+def extract_edit_adjacent_point(messages: list[dict[str, Any]]) -> DecisionPoint | None:
+    """Stop before the command immediately preceding the first source edit.
+
+    The prompt therefore asks the policy to make the last read/inspection
+    decision before it historically edited, rather than replaying the exact
+    pre-edit state.  Multi-call assistant turns cannot be cut at a command
+    boundary without fabricating a partial assistant message, so they are
+    excluded deliberately.
+    """
+    commands: list[tuple[int, int, str]] = []
+    command_index = 0
+    for message_index, message in enumerate(messages):
+        for command in assistant_commands(message):
+            command_index += 1
+            if EDIT_COMMAND.search(command):
+                if not commands:
+                    return None
+                prior_message_index, prior_command_index, _ = commands[-1]
+                if prior_message_index == message_index:
+                    return None
+                prefix = messages[:prior_message_index]
+                if not prefix:
+                    return None
+                return DecisionPoint(
+                    messages=prefix,
+                    had_edit=True,
+                    trigger="one_command_before_first_edit",
+                    command_index=prior_command_index,
+                    edit_files=files_in_prior_observations(prefix),
+                )
+            commands.append((message_index, command_index, command))
+    return None
+
+
 def _content_hash(messages: list[dict[str, Any]]) -> str:
     return hashlib.sha256(
         json.dumps(messages, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
@@ -140,7 +174,10 @@ def _make_row(source: str, instance_id: str, point: DecisionPoint) -> dict[str, 
     }
 
 
-def candidates_from_trajectory(path: Path) -> tuple[Candidate | None, str]:
+def candidates_from_trajectory(
+    path: Path,
+    extractor: Callable[[list[dict[str, Any]]], DecisionPoint | None] = extract_decision_point,
+) -> tuple[Candidate | None, str]:
     try:
         trajectory = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -148,7 +185,7 @@ def candidates_from_trajectory(path: Path) -> tuple[Candidate | None, str]:
     messages = trajectory.get("messages")
     if not isinstance(messages, list) or not all(isinstance(message, dict) for message in messages):
         return None, "invalid_messages"
-    point = extract_decision_point(messages)
+    point = extractor(messages)
     if point is None or not point.messages:
         return None, "no_decision_point"
     instance_id = str(trajectory.get("instance_id") or path.parent.name)
@@ -156,11 +193,14 @@ def candidates_from_trajectory(path: Path) -> tuple[Candidate | None, str]:
     return Candidate(_make_row(f"smoke:{run_name}", instance_id, point), "smoke"), point.trigger
 
 
-def candidates_from_sft_row(row: dict[str, Any]) -> tuple[Candidate | None, str]:
+def candidates_from_sft_row(
+    row: dict[str, Any],
+    extractor: Callable[[list[dict[str, Any]]], DecisionPoint | None] = extract_decision_point,
+) -> tuple[Candidate | None, str]:
     messages = row.get("messages")
     if not isinstance(messages, list) or not all(isinstance(message, dict) for message in messages):
         return None, "invalid_messages"
-    point = extract_decision_point(messages)
+    point = extractor(messages)
     if point is None or not point.messages:
         return None, "no_decision_point"
     source = str(row.get("source") or "sft:MISSING")
@@ -200,6 +240,76 @@ def _rendered_tokens(tokenizer, messages: list[dict[str, Any]]) -> int:
     return len(input_ids)
 
 
+def source_group(candidate: Candidate) -> str:
+    """Map concrete training/rollout sources to the v2 balancing groups."""
+    if candidate.origin == "smoke":
+        return "smoke"
+    source = str(candidate.row["source"])
+    if source == "swe-smith":
+        return "swe-smith"
+    if source == "swe_train_oracle_edit_trace":
+        return "oracle"
+    if source == "open_swe_traces_qwen35":
+        return "openswe"
+    if source == "kwai_klear_miniswe":
+        return "kwai"
+    return source
+
+
+def select_source_balanced(
+    accepted: list[tuple[Candidate, int]],
+    *,
+    source_caps: dict[str, int | None],
+    include_only_capped_sources: bool,
+) -> tuple[list[tuple[Candidate, int]], dict[str, int]]:
+    """Take shortest deterministic prefixes within independently capped source groups."""
+    buckets: dict[str, list[tuple[Candidate, int]]] = {
+        source: [] for source in source_caps
+    }
+    for item in accepted:
+        group = source_group(item[0])
+        if group in buckets:
+            buckets[group].append(item)
+        elif not include_only_capped_sources:
+            buckets.setdefault(group, []).append(item)
+
+    selected: list[tuple[Candidate, int]] = []
+    counts: dict[str, int] = {}
+    for group, items in buckets.items():
+        items.sort(key=lambda item: (item[1], item[0].row["source"], item[0].row["instance_id"]))
+        cap = source_caps.get(group)
+        chosen = items if cap is None else items[:cap]
+        selected.extend(chosen)
+        if chosen:
+            counts[group] = len(chosen)
+    return selected, dict(sorted(counts.items()))
+
+
+def parse_source_caps(values: list[str] | None) -> dict[str, int | None] | None:
+    if not values:
+        return None
+    caps: dict[str, int | None] = {}
+    for value in values:
+        group, separator, raw_cap = value.partition("=")
+        group = group.strip()
+        raw_cap = raw_cap.strip().lower()
+        if not separator or not group or not raw_cap or group in caps:
+            raise ValueError(f"invalid or duplicate --source-cap {value!r}; expected GROUP=COUNT|all")
+        if raw_cap == "all":
+            caps[group] = None
+            continue
+        try:
+            cap = int(raw_cap)
+        except ValueError as exc:
+            raise ValueError(
+                f"source cap for {group!r} must be a positive integer or 'all'"
+            ) from exc
+        if cap <= 0:
+            raise ValueError(f"source cap for {group!r} must be a positive integer or 'all'")
+        caps[group] = cap
+    return caps
+
+
 def dedup_budget_and_cap(
     candidates: list[Candidate],
     tokenizer,
@@ -208,6 +318,8 @@ def dedup_budget_and_cap(
     cap: int,
     workers: int,
     progress_every: int,
+    source_caps: dict[str, int | None] | None = None,
+    include_only_capped_sources: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if workers <= 0 or cap <= 0 or max_tokens <= 0 or progress_every <= 0:
         raise ValueError("workers, cap, max_tokens, and progress_every must be positive")
@@ -251,17 +363,30 @@ def dedup_budget_and_cap(
         if workers != 1:
             executor.shutdown(wait=True)
 
-    # On-policy smoke decision points are retained first. Within each origin and source,
-    # shorter valid prefixes are selected deterministically to maximize cap utility.
-    accepted.sort(
-        key=lambda item: (
-            0 if item[0].origin == "smoke" else 1,
-            item[1],
-            item[0].row["source"],
-            item[0].row["instance_id"],
+    selected_by_group: dict[str, int] | None = None
+    if source_caps is not None:
+        selected, selected_by_group = select_source_balanced(
+            accepted,
+            source_caps=source_caps,
+            include_only_capped_sources=include_only_capped_sources,
         )
-    )
-    selected = accepted[:cap]
+        if len(selected) > cap:
+            raise ValueError(
+                f"source-capped selection has {len(selected)} rows, exceeding global cap {cap}; "
+                "lower a source cap rather than silently biasing a group"
+            )
+    else:
+        # On-policy smoke decision points are retained first. Within each origin and source,
+        # shorter valid prefixes are selected deterministically to maximize cap utility.
+        accepted.sort(
+            key=lambda item: (
+                0 if item[0].origin == "smoke" else 1,
+                item[1],
+                item[0].row["source"],
+                item[0].row["instance_id"],
+            )
+        )
+        selected = accepted[:cap]
     source_counts = Counter(item[0].row["source"] for item in selected)
     origin_counts = Counter(item[0].origin for item in selected)
     tokens = [item[1] for item in selected]
@@ -281,8 +406,13 @@ def dedup_budget_and_cap(
         "budget_stats": dict(sorted(budget_stats.items())),
         "selected_by_source": dict(sorted(source_counts.items())),
         "selected_by_origin": dict(sorted(origin_counts.items())),
+        "selected_by_selection_group": selected_by_group,
         "prefix_token_stats": token_stats,
-        "selection_policy": "smoke_first_then_shorter_prefix; deterministic_source_instance_tiebreak",
+        "selection_policy": (
+            "source_capped_then_shorter_prefix; deterministic_source_instance_tiebreak"
+            if source_caps is not None
+            else "smoke_first_then_shorter_prefix; deterministic_source_instance_tiebreak"
+        ),
     }
 
 
@@ -295,25 +425,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument("--cap", type=int, default=2000)
+    parser.add_argument(
+        "--source-cap",
+        action="append",
+        metavar="GROUP=COUNT|all",
+        help="Independently select the shortest valid prefixes in each source group.",
+    )
+    parser.add_argument(
+        "--only-capped-sources",
+        action="store_true",
+        help="Drop source groups without a --source-cap (used to exclude coder_repair in v2).",
+    )
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--progress-every", type=int, default=100)
+    parser.add_argument(
+        "--edit-adjacent",
+        action="store_true",
+        help="Keep only edit trajectories and end each prompt before the command preceding its first edit.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    try:
+        source_caps = parse_source_caps(args.source_cap)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     trajectory_paths = sorted({Path(path) for pattern in args.trajectory_glob for path in glob.glob(pattern)})
     if not trajectory_paths:
         raise SystemExit("no trajectory files matched")
     extraction_stats: Counter[str] = Counter()
+    extractor = extract_edit_adjacent_point if args.edit_adjacent else extract_decision_point
     candidates: list[Candidate] = []
     for path in trajectory_paths:
-        candidate, reason = candidates_from_trajectory(path)
+        candidate, reason = candidates_from_trajectory(path, extractor)
         extraction_stats[f"smoke:{reason}"] += 1
         if candidate:
             candidates.append(candidate)
     for row in load_sft_rows(args.sft_data):
-        candidate, reason = candidates_from_sft_row(row)
+        candidate, reason = candidates_from_sft_row(row, extractor)
         extraction_stats[f"sft:{reason}"] += 1
         if candidate:
             candidates.append(candidate)
@@ -329,6 +480,8 @@ def main() -> None:
         cap=args.cap,
         workers=args.workers,
         progress_every=args.progress_every,
+        source_caps=source_caps,
+        include_only_capped_sources=args.only_capped_sources,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8") as handle:
@@ -341,6 +494,9 @@ def main() -> None:
         "extraction": dict(sorted(extraction_stats.items())),
         "tokenizer": args.tokenizer,
         "workers": args.workers,
+        "edit_adjacent": args.edit_adjacent,
+        "requested_source_caps": source_caps,
+        "only_capped_sources": args.only_capped_sources,
         "output": str(args.out),
         **budget_manifest,
     }

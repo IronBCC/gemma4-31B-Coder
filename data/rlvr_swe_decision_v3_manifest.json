@@ -1,0 +1,58 @@
+{
+  "allow_under_target": true,
+  "base_image_local": 119,
+  "budget_accepted": 1024,
+  "budget_stats": {
+    "over_budget": 4016
+  },
+  "candidates": 5832,
+  "deduped": 5040,
+  "duplicates_removed": 792,
+  "edit_cut": "before_assistant_command_immediately_preceding_first_source_edit",
+  "extraction": {
+    "sft:no_decision_point": 1283,
+    "sft:one_command_before_first_edit": 5767,
+    "smoke:no_decision_point": 84,
+    "smoke:one_command_before_first_edit": 65
+  },
+  "fixture_verifiable": 345,
+  "fixtures_output": "data/rlvr_swe_decision_v3_fixtures.jsonl",
+  "max_prompt_tokens": 3072,
+  "output": "data/rlvr_swe_decision_v3.jsonl",
+  "prefix_token_stats": {
+    "max": 3072,
+    "min": 86,
+    "p50": 1653
+  },
+  "requested_target": 768,
+  "selected": 431,
+  "selected_by_group": {
+    "kwai": 43,
+    "openswe": 22,
+    "oracle": 64,
+    "smoke": 13,
+    "swe-smith": 289
+  },
+  "selected_by_source": {
+    "kwai_klear_miniswe": 43,
+    "open_swe_traces_qwen35": 22,
+    "smoke:smoke_v6_49k_s1_rerun4_lite_0_30": 2,
+    "smoke:smoke_v6_49k_s1_t07_lite_0_30": 1,
+    "smoke:smoke_v7_49k_s1_t07_lite_0_30": 2,
+    "smoke:smoke_v7s2cp15_t07_lite_0_30": 4,
+    "smoke:smoke_v8cp30_t07_lite_0_30": 4,
+    "swe-smith": 289,
+    "swe_train_oracle_edit_trace": 64
+  },
+  "selected_shortfall": 337,
+  "selection_policy": "fixture_backed_swe-smith_kwai_smoke_first; oracle_openswe_diversity<=20%; shortest_prefix_with_deterministic_tiebreak",
+  "sft_data": "data/unsloth_agentic_train_swe_edit_trace_v8_budget49152",
+  "source_fixture_sidecar": "data/rlvr_swe_decision_v2_fixtures.jsonl",
+  "tokenizer": "/media/ironbcc/CrucialX10/models/RedHatAI/gemma-4-31B-it-NVFP4",
+  "trajectory_files": 149,
+  "trajectory_globs": [
+    "runs/smoke_v*_t07_lite_0_30/*/*/*.traj.json",
+    "runs/smoke_v6_49k_s1_rerun4_lite_0_30/*/*/*.traj.json"
+  ],
+  "workers": 8
+}

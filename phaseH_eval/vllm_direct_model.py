@@ -2,6 +2,17 @@
 
 This mirrors the remote eval path the smoke used, but keeps the request clamps
 local so the same logic can be versioned with the repo.
+
+One-shot recovery mode (2026-07-15): raw base resolves 16/30 but produces
+`RepeatedFormatError` on ~4/30 where a turn finishes on `length` with no tool
+call (model consumes the 4k budget reasoning, never emits an action). Rather
+than raise the global clamp (32k caused runaway thought loops) or retrain, we
+patch the CLIENT: when a normal response is length+no-tool AND text-salvage
+also fails, arm recovery for the NEXT harness retry of that step. The recovery
+request forces a structured bash call (max_tokens 1024, tool_choice=bash,
+thinking off, terse instruction). Success clears recovery; failure falls through
+to the existing format-error policy. Normal behavior for the 26 passing cases is
+untouched.
 """
 from __future__ import annotations
 
@@ -34,6 +45,30 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for package-style imp
         forced_command_for_history,
     )
 
+RECOVERY_MAX_TOKENS = 1024
+RECOVERY_INSTRUCTION = "Emit exactly one bash tool call now. No explanation."
+
+
+def response_needs_recovery(response: Any) -> bool:
+    """True when a turn finished on length with no usable tool call — the
+    RepeatedFormatError signature. Called AFTER normalize/salvage, so a
+    text-salvaged command already cleared the no-tool condition."""
+    choice = response.choices[0]
+    finished_on_length = getattr(choice, "finish_reason", None) == "length"
+    has_tool_call = bool(getattr(choice.message, "tool_calls", None))
+    return finished_on_length and not has_tool_call
+
+
+def build_recovery_kwargs(base_kwargs: dict) -> tuple[dict, dict]:
+    """Return (call_kwargs, create_kwargs) forcing a single structured bash call
+    with thinking disabled and a tight token budget."""
+    call_kwargs = dict(base_kwargs)
+    call_kwargs.pop("extra_body", None)
+    call_kwargs["max_tokens"] = RECOVERY_MAX_TOKENS
+    call_kwargs["tool_choice"] = {"type": "function", "function": {"name": "bash"}}
+    create_kwargs = {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+    return call_kwargs, create_kwargs
+
 
 class VllmDirectModel(LitellmModel):
     abort_exceptions: list[type[Exception]] = [KeyboardInterrupt]
@@ -48,6 +83,7 @@ class VllmDirectModel(LitellmModel):
             mk.pop(key, None)
         self._call_kwargs = build_call_kwargs(mk)
         self._client = OpenAI(base_url=base_url, api_key=api_key)
+        self._recovery_armed = False
 
     def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
         forced_command = forced_command_for_history(messages)
@@ -58,22 +94,31 @@ class VllmDirectModel(LitellmModel):
     def _query(self, messages: list[dict[str, str]], **kwargs):
         served = self.config.model_name.split("/", 1)[-1]
         call_kwargs = self._call_kwargs | kwargs
-        # NOTE: Gemma-4 thinking (chat_template enable_thinking / <|channel>thought)
-        # is NOT enabled here. Probe on port 8012 (2026-07-12) proved this v6 adapter
-        # was not trained for the thinking channel: enable_thinking=true yields
-        # degenerate "<|turn>model" loops and no tool call, while thinking-off yields
-        # clean bash tool calls. Thinking support requires retraining with that
-        # channel format, not a serving flag. Optional opt-in kept via extra_body.
-        extra_body = call_kwargs.pop("extra_body", None)
-        create_kwargs = {"extra_body": extra_body} if extra_body else {}
+        # NOTE: Gemma-4 thinking is handled by the server's chat template; not
+        # forced here. See module docstring for the recovery rationale.
+        recovering = self._recovery_armed
+        if recovering:
+            self._recovery_armed = False  # one-shot: consume the arm now
+            call_kwargs, create_kwargs = build_recovery_kwargs(call_kwargs)
+            live = compact_live_messages(add_budget_pressure_messages(messages))
+            live = live + [{"role": "user", "content": RECOVERY_INSTRUCTION}]
+        else:
+            extra_body = call_kwargs.pop("extra_body", None)
+            create_kwargs = {"extra_body": extra_body} if extra_body else {}
+            live = compact_live_messages(add_budget_pressure_messages(messages))
         response = self._client.chat.completions.create(
             model=served,
-            messages=compact_live_messages(add_budget_pressure_messages(messages)),
+            messages=live,
             tools=[BASH_TOOL],
             **create_kwargs,
             **call_kwargs,
         )
         normalize_bash_tool_calls(response)
+        # Arm recovery for the NEXT retry only on a normal (non-recovery) request
+        # that finished on length with no salvageable tool call. A recovery
+        # request that still fails falls through to the format-error policy.
+        if not recovering and response_needs_recovery(response):
+            self._recovery_armed = True
         return response
 
     def _calculate_cost(self, response) -> dict[str, float]:

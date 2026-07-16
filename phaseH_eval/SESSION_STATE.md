@@ -1030,3 +1030,194 @@ Full analysis + run-by-run history: `phaseD_sft/V6_49K_RETROSPECTIVE.md`. Compre
   `runs/smoke_swe_grpo_v1_t07_lite_0_30`; reproducible extractor
   `phaseH_eval/summarize_smoke.py`. No further data rebuild or training is authorized without
   a user gate.
+
+## RLVR v2 rebalanced decision dataset (2026-07-14)
+
+- Completed CPU-only artifact: `data/rlvr_swe_decision_v2.jsonl` (1,895 rows; SHA-256
+  `ab63e3f797a99d9db2564ab097f54a22587c5ecf5d57070e97e2f099b2edcaf`) with manifest
+  `data/rlvr_swe_decision_v2_manifest.json` (SHA-256
+  `3f6e841dc3db909ce279189fcbc51b0c5bf40c953a93948af8bfcb1c5b1a33b6`). This is data
+  preparation only: no GPU, serving, training, or source-data deletion occurred.
+- It preserves the v1 decision extraction: first source-edit prefix, otherwise prefix just
+  before the first repeated command or fourth consecutive read. The new source-balanced,
+  shortest-prefix selection keeps smoke contexts in full and caps `swe-smith=700`,
+  `swe_train_oracle_edit_trace=256` (all valid rows; fewer than its 300 cap),
+  `open_swe_traces_qwen35=300`, and `kwai_klear_miniswe=500`; `coder_repair_synthetic` is
+  deliberately excluded. Smoke contributes 139 rows over five completed evaluation runs.
+- Independent JSON/schema/content-hash verification found 1,895 valid rows and 1,895 unique
+  rendered-message hashes. Budgeting used one main-process Gemma tokenizer shared by
+  `ThreadPoolExecutor(8)` and accepted only rendered prefixes <=8,192 tokens (p50 2,001;
+  max 5,331), remaining compatible with the GRPO loader's `--max-prompt-tokens 2560` clamp.
+  Builder support is in `phaseE_rl/build_swe_decision_dataset.py` via explicit source caps;
+  its targeted local unit suite is 7/7 green.
+
+## Rust raw-base fixed-subset baseline (2026-07-14)
+
+- The Rust lane uses the fixed image-backed denominator
+  `data/mswe_rust_prs_imagebacked.jsonl`: **75** of the original 239 Rust instances whose
+  `mswebench/<org>_m_<repo>:pr-<number>` image is present locally. The manifest records the
+  composition: clap 35, fd 14, ripgrep 13, bytes 5, bat 3, serde 2, rayon 2, nushell 1.
+  This fixed list—not the image-incomplete 239-row source—is the required comparison set for
+  future Rust adapters.
+- Coordinator smoke-5 first validated the raw NVFP4 serving path on 8012 with the v2
+  thinkopen template. The production baseline used the committed
+  `phaseA_scaffold/rust_baseline_driver.py` at `5507f8b`: raw model
+  `gemma4-rust-baseline`, temperature 0.7, sequential Docker rollouts, no LoRA or training.
+  Critical execution contract: Docker commands use **`bash -c`**, not `bash -lc`; the latter
+  resets PATH in these images and produces false `cargo: command not found` failures.
+- **Full baseline complete:** `runs/rust_baseline_rawbase_full75/results.jsonl` has 75 unique
+  instances, **61/75 non-empty patches (81.33%)**, **11/75 resolved (14.67%)**, and **zero
+  driver/runtime errors**. Mean/median instance wall time were 449.8s/375.9s (9.37 aggregate
+  sequential hours). Per-repo resolves: clap 3/35, fd 4/14, bytes 3/5, rayon 1/2; bat,
+  ripgrep, serde, and nushell had zero resolves.
+- Resolution here is the self-contained image's canonical `/home/test-run.sh` after the
+  model edit (its test patch is freshly applied, so test tampering self-defeats). The official
+  `/home/ironbcc/multi-swe-bench` evaluator remains available for an optional later
+  id-level report cross-score; it was not substituted or silently claimed as this baseline's
+  scorer. GPU0/prod ports stayed green, Docker loopback stayed at 94GB free, and the raw-base
+  8012 service remained healthy after completion.
+
+## (29) User decisions locked + GRPO promotion executed (2026-07-14)
+
+1. **PROMOTED**: `adapters/swe_grpo_v1_s2/checkpoint-100` is the current Python policy
+   (20/30 patches vs SFT 11, edit-reach 25 vs 14, hard30 floor pass; known caveats:
+   resolve 6/30 unchanged, format 10.0% at boundary, patch precision 30%).
+   v8cp30 remains immutable as rollback. `merged/swe_drgrpo_v1` was deleted (58 GB reclaimed;
+   Dr. GRPO adapter checkpoint retained); `merged/swe_grpo_v1` is the serving artifact.
+2. **Verified-reward RL round: GO on RLVR-v2.** Phase 2 replaces parse-only 1.0 with a Docker
+   apply/F2P-test tier, initialized from promoted GRPO checkpoint-100.
+3. **C++ image builds: active CPU/disk lane** for `data/mswe_cpp_prs/` (257 instances).
+   Docker loopback must remain >=40 GiB, families build serially, dangling layers are pruned
+   only between families, and any floor breach stops and reports.
+4. **Rust adapter v2:** queued after this Python verified-reward round; fixed baseline remains
+   11/75 resolved.
+
+## RLVR verified-reward phase-2 preflight (2026-07-14)
+
+- **User policy:** standard GRPO `adapters/swe_grpo_v1_s2/checkpoint-100` is the current Python
+  policy; its retained serving artifact is `merged/swe_grpo_v1`. This explicit promotion
+  supersedes the prior strict-format-boundary hold. `merged/swe_drgrpo_v1` was deleted after
+  comparison (58 GB reclaimed); adapter checkpoints remain for controlled evidence.
+- Fixture sidecar: `data/rlvr_swe_decision_v2_fixtures.jsonl` and
+  `data/rlvr_swe_decision_v2_imagecov.json` exact-join **1,330/1,895 (70.2%)** v2 decision
+  prefixes to image and F2P metadata: SWE-smith 691/700, Kwai 500/500, and smoke 139/139
+  (all smoke images local). OpenSWE 300, oracle 256, and nine SWE-smith rows are explicitly
+  `unverified=true`; they can retain the phase-1 parse/edit tier through 0.6 but must never be
+  awarded execution/F2P rewards. Normalizing all oracle trace IDs to owner/repo/number joined
+  0/256 against SWE-smith, SWE-Lite, and full SWE-bench, so no suffix-only mapping was invented.
+- `phaseE_rl/reconstruct_swe_decision_state.py` provides a bounded Docker state cache keyed by
+  prompt hash. It replays only strict read-only prefix commands under `bash -c` in a
+  network-isolated container, commits labelled `rlvr-state:*` images, removes containers by
+  exact id, and LRU-evicts only its own images while enforcing the 40-GiB loopback floor. The
+  local dry run (`runs/rlvr_state_cache/dry10.jsonl`) created 10/10 states; a follow-up
+  (`runs/rlvr_state_cache/hit1.jsonl`) confirmed a cache hit, with Docker still 92 GiB free.
+  This validates cache mechanics only—the coordinator-owned completion apply/F2P verifier must
+  still demonstrate observed 0.8/1.0 tiers on ten prompts before a verified-reward training run.
+
+## Submission-protocol recovery: cp300/cp100 clean rerun (2026-07-15)
+
+- Investigation of the apparent cp300 patch loss found **8/30** trajectories with real tracked
+  source hunks mid-trajectory (`git diff` 1.3–3.8 KB) that were discarded by the submission
+  protocol, not by the model. The stock mini-SWE Docker environment accepts a submission only
+  when the marker is the first output line and return code is zero; it also accepted an empty
+  printed patch. Context use was only 4–24k of 49,152 and no response approached the 4,096
+  clamp, so neither explains the loss.
+- The synchronized fix is `phaseH_eval/docker_selfretry.py`
+  (`DockerSelfRetryEnv`) and `phaseH_eval/swebench_edit_first_selfretry.yaml`: reject empty
+  submissions up to two times with a `git add -A`/cached-diff recovery observation, and nudge
+  once when the marker appears after the first output line. Targeted tests passed **6/6**.
+- Consequently the historical cp100-versus-cp300 smoke comparison is confounded. After the
+  in-flight Rust fixed-75 evaluation completes, let the coordinator restore merged cp300
+  (`/tmp/restore_cp300_v2.log`) and run both cp300 and retained `merged/swe_grpo_v1`/cp100
+  through the identical 30-case self-retry harness before any promotion decision. Do not delete
+  either merged model while this clean comparison is pending.
+
+## Rust v2p SFT verdict: agentic regression (2026-07-15)
+
+- Training data `data/rust_sft_v2p_5k` passed its 1,000-sample Gemma format gate with zero
+  failures. A fresh frozen-base r32/a32 LoRA completed a one-step 49,152-context sm120 gate
+  (checkpoint present; 16 microsteps, 15.77 s) and then a 25-step bounded run at 49,152;
+  `adapters/rust_sft_v2p_5k_s1/checkpoint-25` is retained. The three-prompt format smoke
+  passed thinking **3/3**, Rust function **3/3**, and container compilation **3/3**.
+- The agentic evaluation was stopped early by user decision after a deterministic, stratified
+  matched **15-instance** slice. `runs/rust_v2p_strat25/verdict_summary.json` is the canonical
+  comparison: v2p **0/15 resolved, 4/15 non-empty patches, 6 errors**, versus raw base
+  **2/15 resolved, 14/15 non-empty patches, 0 errors** on exactly the same IDs. Measured
+  total and mean wall time were **4.30x** raw base (30,851.3 s vs 7,176.7 s); this artifact
+  value supersedes the initial rough 8x estimate.
+- Several errors were exact context-cap failures after the function-level policy continued
+  deliberating until prompt + fixed 4,096 output budget exceeded the 131,072-token raw-base
+  serving limit. Keep the driver unmodified for this parity comparison: raw base completed
+  the same configuration without these failures, making the behavior part of the candidate
+  result rather than a retroactive harness fix.
+- **Decision:** Rust v2p is a regression for agentic use. Likely retraining levers are
+  reasoning-length-stratified Rust data, explicit agentic-trace mixing, and a separately
+  evaluated serving-side reasoning budget; do not scale this adapter. Artifacts retained:
+  `runs/rust_v2p_strat25/{results.jsonl,rawbase_same15.jsonl,verdict_summary.json}` and
+  `data/mswe_rust_prs_strat25_manifest.json` (seed 20260715, early-stop provenance).
+
+## RLVR v3 edit-adjacent decision prompts (2026-07-15)
+
+- `data/rlvr_swe_decision_v3.jsonl` contains **431** deduplicated decision prompts. Each ends
+  immediately before the assistant command one command before the trajectory's first source
+  edit; it deliberately does not reuse round-1 stall/repeat prefixes. Rendered prompts are
+  bounded at 3,072 Gemma tokens (min/p50/max: 86/1,653/3,072).
+- Selection remained evidence-limited rather than padded: **345/431 (80.0%)** rows are exact
+  fixture-verifiable via the v2 sidecar, while Oracle+OpenSWE are **86/431 (20.0%)**—the hard
+  diversity ceiling. Source groups: SWE-Smith 289, Kwai 43, smoke 13, oracle 64, OpenSWE 22.
+  The requested 768 target is recorded as a 337-row honest shortfall in
+  `data/rlvr_swe_decision_v3_manifest.json`; no quality or leakage rule was relaxed.
+- The fixture sidecar is `data/rlvr_swe_decision_v3_fixtures.jsonl`; 119 selected fixtures have
+  bases already local and are eligible for prompt-hash state reconstruction only. The cache
+  extension uses `reconstruct_swe_decision_state.py --local-only --floor-gib 40
+  --max-cache-gib 4000`; it must never pull an image or prune non-`rlvr.state` layers.
+
+## Self-retry promotion control + vGRPO round 2 (2026-07-15)
+
+- The corrected, identical 30-case self-retry harness changes the historical resolution
+  interpretation: the protocol fix lifted both retained policies by roughly 3–4 resolves, so
+  the former 6–7/30 resolution plateau was substantially a **submission-protocol artifact**,
+  not clean evidence that resolve quality had stalled. Treat all pre-selfretry cp100/cp300
+  resolve comparisons as confounded.
+- Clean artifacts: `runs/smoke_swe_vgrpo_v1_cp300_selfretry_t07_lite_0_30/summary.json` is
+  cp300 = **18 patches, 9 resolved, 23 edit reach, median first edit 14, 10.0% format,
+  50.0% precision**. `runs/smoke_swe_grpo_v1_cp100_selfretry_t07_lite_0_30/summary.json` is
+  cp100 = **21 patches, 10 resolved, 27 edit reach, median 17, 6.67% format, 47.6% precision**.
+  cp100 remains the policy: it wins patches, resolves, edit reach, and the strict format gate;
+  cp300 only leads on first-edit timing and precision.
+- v3 local-only cache completion: 86 state records for the new prompt hashes (**75 created,
+  11 existing cache hits**); 33/119 local-image candidates were replay-unsafe and deliberately
+  skipped. The round-2 trainer's 3,072 token load filter leaves 424 prompts, 338
+  fixture-eligible; only the 86 state-backed rows can earn Docker execution tiers while cache
+  misses remain parse-capped. No images were pulled and Docker held 53 GiB free.
+- Authorized round 2 is `adapters/swe_vgrpo_v2`: frozen policy initialization ordered as
+  `swe_edit_v8_49k_s1/checkpoint-30` then `swe_grpo_v1_s2/checkpoint-100`, fresh r32 LoRA,
+  standard GRPO, verified reward, `num_gen=8`, `gen_temperature=1.0`, 200 steps, and the
+  synced trainer's group-preserving gradient accumulation (`num_gen // 2`). Log:
+  `/tmp/vgrpo_v2.log`. GPU1 only; check checkpoints every 25 steps before any evaluation.
+
+## Raw-base length-recovery gate (2026-07-16)
+
+- The 131,072-context raw NVFP4 control was behaviorally strong but initially missed the
+  strict format gate: **26/30 patches, 16/30 resolved, 27/30 edit reach, 4/30 format errors**.
+  The four errors were `django-11019`, `django-11283`, `django-11630`, and `django-12113`:
+  ordinary responses hit the intentional 4,096 completion clamp with `finish_reason=length`
+  and no tool call after spending the budget in thought. Prompt use was only 1.3k--10.5k,
+  so increasing the 131k context window could not address it; globally raising the clamp to
+  32k had previously caused runaway thought loops.
+- The reviewed/synchronized fix is the one-shot client recovery in
+  `phaseH_eval/vllm_direct_model.py`. Only after a normal, unsalvageable
+  `length + no-tool-call` response, the next harness retry uses `max_tokens=1024`, forced
+  `bash` tool choice, `enable_thinking=false`, and `Emit exactly one bash tool call now. No
+  explanation.` It is consumed once and cannot re-arm, leaving normal trajectories unchanged.
+  Focused coverage is `phaseH_eval/tests/test_vllm_recovery.py`; host tests passed **23/23**
+  including existing clamp tests. A live 8012 request with those exact fields returned a
+  structured `bash` tool call in 13 completion tokens.
+- Targeted replay of the four original Lite positions submitted all **4/4**; one exercised the
+  exact length-to-recovery transition and produced the valid next tool call. The full fixed
+  self-retry confirmation is
+  `runs/smoke_gemma4_rawbase_recovery_selfretry_t07_lite_0_30`: **27/30 non-empty patches,
+  15/30 resolved, 29/30 edit reach, median first edit 13, 0/30 format errors**. Its scored
+  report is `openai__gemma4-rawbase.smoke_gemma4-rawbase.json`. This clears the <10% format
+  gate and establishes raw base as the current behavior/reference control; GPU1 was released
+  to 2 MiB and production ports remained green after evaluation.

@@ -57,18 +57,61 @@ def merge_adapter(model, adapter_dir: Path) -> int:
     return merged
 
 
+def merge_adapters(model, adapter_dirs: list[Path]) -> list[tuple[Path, int]]:
+    """Merge adapters in order, rejecting an incomplete merge at each boundary."""
+    results: list[tuple[Path, int]] = []
+    for adapter_dir in adapter_dirs:
+        count = merge_adapter(model, adapter_dir)
+        if count <= 100:
+            raise RuntimeError(
+                f"only {count} matrices merged from {adapter_dir}; expected >100"
+            )
+        results.append((adapter_dir, count))
+    return results
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="/media/ironbcc/CrucialX10/models/google/gemma-4-31B-it")
-    ap.add_argument("--sft-adapter", required=True)
-    ap.add_argument("--rl-adapter", required=True)
+    ap.add_argument(
+        "--adapter",
+        action="append",
+        default=None,
+        help="repeatable; merge in CLI order (for example: SFT, GRPO, vGRPO)",
+    )
+    ap.add_argument(
+        "--sft-adapter",
+        help="deprecated compatibility alias; maps to the first ordered adapter",
+    )
+    ap.add_argument(
+        "--rl-adapter",
+        help="deprecated compatibility alias; maps to the second ordered adapter",
+    )
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-shard-size", default="20GB")
     return ap
 
 
+def resolve_adapter_paths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> list[Path]:
+    """Return one unambiguous ordered adapter list, preserving the old CLI."""
+    ordered = args.adapter or []
+    legacy = [args.sft_adapter, args.rl_adapter]
+    if ordered:
+        if any(legacy):
+            parser.error("--adapter cannot be combined with deprecated adapter aliases")
+        return [Path(adapter) for adapter in ordered]
+    if all(legacy):
+        print("[merge] DEPRECATED: --sft-adapter/--rl-adapter; use repeatable --adapter", flush=True)
+        return [Path(adapter) for adapter in legacy]
+    if any(legacy):
+        parser.error("legacy mode requires both --sft-adapter and --rl-adapter")
+    parser.error("provide at least one --adapter or both legacy adapter aliases")
+
+
 def main() -> int:
-    args = build_arg_parser().parse_args()
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    adapter_dirs = resolve_adapter_paths(args, parser)
 
     out = Path(args.out)
     if out.exists():
@@ -101,11 +144,9 @@ def main() -> int:
     if meta:
         raise RuntimeError(f"graft left meta parameters: {meta[:3]}")
 
-    sft_count = merge_adapter(model, Path(args.sft_adapter))
-    rl_count = merge_adapter(model, Path(args.rl_adapter))
-    if sft_count <= 100 or rl_count <= 100:
-        raise RuntimeError(f"unexpected merge counts: sft={sft_count}, rl={rl_count}")
-    print(f"[merge] SFT={sft_count} RL={rl_count} matrices; saving {out}", flush=True)
+    merge_results = merge_adapters(model, adapter_dirs)
+    counts = ", ".join(f"{path}={count}" for path, count in merge_results)
+    print(f"[merge] adapters: {counts} matrices; saving {out}", flush=True)
     model.save_pretrained(
         out, safe_serialization=True, max_shard_size=args.max_shard_size
     )

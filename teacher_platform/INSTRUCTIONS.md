@@ -4,13 +4,41 @@ Goal: collect teacher (Claude/Codex/OpenRouter) solutions to problems the **base
 model cannot solve**, F2P-verify them, and turn them into a training-ready SFT
 dataset — then smoke-test that it trains. One CLI does every step.
 
-**All commands run on the box, from the repo root**
-(`~/projects/gemma4-31B-Coder`), with `.venv-eval/bin/python`.
+## WHERE to run (read this first — it is the #1 failure)
+
+**Run everything ON THE GPU BOX**, never on a laptop/Mac:
+`ssh ironbcc@192.168.50.148`, then `cd ~/projects/gemma4-31B-Coder`.
+
+WHY it must be the box, not a Mac: collection starts a Docker container per task
+from the SWE-smith **linux/amd64** images and drives it via `docker exec`. On an
+arm64 Mac, `docker run` emits a `WARNING: The requested image's platform...` line
+and the container never works — every command returns
+`Error response from daemon: No such container`, so the "patch" is just that
+error string and 0 traces are real. (This exact mistake wasted a whole kimi run.)
+The box has the images, the venvs, and matching arch.
 
 ```
-PY=.venv-eval/bin/python
+PY=.venv-eval/bin/python            # eval venv: has datasets/docker deps
 PLAT="$PY teacher_platform/teacher_platform.py"
 ```
+
+## Backend model IDs (must be exact — a wrong slug 400s and now fail-fast aborts)
+
+| backend | good `--model` values |
+|---|---|
+| `claude` (subscription) | `claude-fable-5` |
+| `codex` (subscription) | `gpt-5.6-terra` |
+| `openrouter` (needs `OPENROUTER_API_KEY`) | **`moonshotai/kimi-k3`** (Kimi3), `moonshotai/kimi-k2.7-code`, `anthropic/claude-3.7-sonnet` |
+
+For OpenRouter, the slug must match `https://openrouter.ai/api/v1/models` exactly.
+`moonshotai/kimi-3` is **NOT valid** (it's `kimi-k3`). A bad slug now aborts the run
+immediately instead of erroring through every task.
+
+## Resume: just re-run the same `collect` command
+
+`collect --loop` is stateful via the run ledger. If it pauses on a quota wall or
+you stop it, **re-run the identical command** — it skips finished tasks and
+continues. Nothing else to reset.
 
 Hard rules (do not skip — each earned a failed adapter):
 - **Only train on base-FAILED tasks.** Traces on tasks the base already solves

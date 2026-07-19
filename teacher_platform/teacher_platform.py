@@ -207,16 +207,28 @@ def _probe_quota(backend: str, model: str) -> bool:
     return False
 
 
-def _remaining(tasks_path: str, out_glob: str) -> list:
-    pool = _read_jsonl(tasks_path)
+def _attempted_from_run_globs(*run_globs) -> set:
+    """Union of instance_ids REALLY attempted across any matching run dirs.
+    This is the cross-run no-overlap mechanism: a new campaign excludes every
+    problem any prior run already worked."""
     attempted = set()
-    for f in globmod.glob(out_glob):
-        try:
-            for rec in _read_jsonl(f):
-                if _is_real_attempt(rec):
-                    attempted.add(rec["instance_id"])
-        except (FileNotFoundError, json.JSONDecodeError):
-            pass
+    for g in run_globs:
+        if not g:
+            continue
+        pat = g if g.endswith("results.jsonl") else g.rstrip("/") + "*/results.jsonl"
+        for f in globmod.glob(pat):
+            try:
+                for rec in _read_jsonl(f):
+                    if _is_real_attempt(rec):
+                        attempted.add(rec["instance_id"])
+            except (FileNotFoundError, json.JSONDecodeError):
+                pass
+    return attempted
+
+
+def _remaining(tasks_path: str, *run_globs) -> list:
+    pool = _read_jsonl(tasks_path)
+    attempted = _attempted_from_run_globs(*run_globs)
     return [r for r in pool if r["instance_id"] not in attempted]
 
 
@@ -225,8 +237,11 @@ def cmd_collect(a) -> int:
                         "openrouter": "anthropic/claude-3.7-sonnet"}[a.backend]
     out_root = Path(a.out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
-    # scan sibling batch dirs (out_dir plus <out_dir>_run*) for real attempts
+    # scan sibling batch dirs (out_dir plus <out_dir>_run*) for real attempts;
+    # --exclude-runs adds OTHER campaigns so problems never overlap across runs.
     out_glob = str(out_root.parent / (out_root.name + "*/results.jsonl"))
+    all_globs = [out_glob, *a.exclude_runs]
+    cross_run_done = _attempted_from_run_globs(*a.exclude_runs)
 
     def one_pass(tasks_file: str, outdir: Path) -> None:
         outdir.mkdir(parents=True, exist_ok=True)
@@ -234,6 +249,7 @@ def cmd_collect(a) -> int:
         ledger = outdir / "results.jsonl"
         results = _read_jsonl(ledger) if ledger.exists() and ledger.stat().st_size else []
         rows = ttd.remaining_task_rows(rows, results)
+        rows = [r for r in rows if r["instance_id"] not in cross_run_done]
         streak = ttd.trailing_credit_streak(results)
         for row in rows:
             if a.backend == "openrouter":
@@ -262,7 +278,7 @@ def cmd_collect(a) -> int:
             subprocess.run(["docker", "container", "prune", "-f"], capture_output=True)
             if _docker_free_gib() < a.floor_gib + 2:
                 subprocess.run(["docker", "image", "prune", "-f"], capture_output=True)
-            rem = _remaining(a.tasks, out_glob)
+            rem = _remaining(a.tasks, *all_globs)
             print(f"[collect] iter={it} remaining={len(rem)} walls={walls} "
                   f"free={_docker_free_gib()}G", flush=True)
             if not rem:
@@ -281,9 +297,9 @@ def cmd_collect(a) -> int:
                 print(f"[collect] quota walled ({walls}), sleeping {a.wall_sleep}s", flush=True)
                 time.sleep(a.wall_sleep)
     # tally
-    done = _remaining(a.tasks, out_glob)
+    done = _remaining(a.tasks, *all_globs)
     total = len(_read_jsonl(a.tasks))
-    print(f"[collect] attempted={total - len(done)}/{total}", flush=True)
+    print(f"[collect] attempted+excluded={total - len(done)}/{total}", flush=True)
     return 0
 
 
@@ -562,6 +578,135 @@ def cmd_prepare(a) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# ingest  (external trajectory datasets, e.g. nvidia/Open-SWE-Traces)          #
+# --------------------------------------------------------------------------- #
+def steps_from_trajectory(msgs: list) -> list:
+    """Parse an OpenAI-style trajectory (system/user/assistant+tool_calls/tool)
+    into [{thought, command, observation}]. Open-SWE-Traces commands are already
+    bare /testbed commands; the docker-exec strip is a no-op safety net."""
+    steps, pending = [], None
+    for m in msgs:
+        role = m.get("role")
+        tcs = m.get("tool_calls") or []
+        if role == "assistant" and tcs:
+            thought = (m.get("content") or "").strip()
+            for tc in tcs:
+                fn = tc.get("function") if isinstance(tc, dict) else None
+                if not fn:
+                    continue
+                try:
+                    cmd = json.loads(fn.get("arguments", "{}")).get("command", "")
+                except (json.JSONDecodeError, TypeError):
+                    cmd = ""
+                if cmd:
+                    pending = {"thought": thought, "command": _strip_docker_exec(cmd), "observation": ""}
+                    break
+        elif role in ("tool", "user") and pending is not None:
+            obs = str(m.get("content") or "")
+            obs = re.sub(r"^OBSERVATION:\s*", "", obs)
+            steps.append({**pending, "observation": obs[-2000:]})
+            pending = None
+    return steps
+
+
+def cmd_ingest(a) -> int:
+    """Ingest an external resolved-trajectory dataset into mini-SWE SFT rows,
+    shape-safe and decontaminated. Default schema = nvidia/Open-SWE-Traces
+    (instance_id, repo, language, trajectory, resolved)."""
+    import ast
+
+    from datasets import Dataset, load_dataset
+
+    exclude = _attempted_ids(*a.exclude)
+    out, seen = [], set()
+    stats = Counter()
+    scanned = kept_resolved = 0
+    for cfg in a.configs:
+        d = load_dataset(a.dataset, cfg, streaming=True)
+        for split in d.keys():
+            for r in d[split]:
+                scanned += 1
+                if a.language and r.get("language") != a.language:
+                    continue
+                if a.resolved_only and str(r.get("resolved")) != "1":
+                    continue
+                kept_resolved += 1
+                iid = r["instance_id"]
+                if iid in exclude or iid in seen:
+                    continue
+                traj = r["trajectory"]
+                try:
+                    msgs = ast.literal_eval(traj) if isinstance(traj, str) else traj
+                except (ValueError, SyntaxError):
+                    continue
+                steps = steps_from_trajectory(msgs)
+                pr = next((str(m.get("content")) for m in msgs if m.get("role") == "user"), "")
+                task = {"instance_id": iid, "problem_statement": pr, "repo": r.get("repo", ""),
+                        "backend": "open-swe", "model": f"{cfg}:{split}"}
+                sft = render_sft(task, steps)
+                if sft:
+                    out.append(sft)
+                    seen.add(iid)
+                    stats[f"{cfg}/{split}"] += 1
+                    if a.limit and len(out) >= a.limit:
+                        break
+            if a.limit and len(out) >= a.limit:
+                break
+        if a.limit and len(out) >= a.limit:
+            break
+    if not out:
+        print("[ingest] nothing ingested (check filters/exclude)", flush=True)
+        return 1
+    Dataset.from_list(out).save_to_disk(a.out)
+    _write_jsonl(str(a.out) + ".jsonl", out)
+    man = {"dataset": a.dataset, "configs": a.configs, "language": a.language,
+           "resolved_only": a.resolved_only, "scanned": scanned, "resolved_matched": kept_resolved,
+           "ingested": len(out), "excluded_ids": len(exclude), "per_source": dict(stats),
+           "note": "external teacher traces rendered to mini-SWE SFT; blend with own teacher traces via `blend`"}
+    Path(str(a.out) + ".manifest.json").write_text(json.dumps(man, indent=1))
+    print(f"[ingest] scanned={scanned} resolved-matched={kept_resolved} "
+          f"ingested={len(out)} -> {a.out}", flush=True)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# blend  (combine SFT sources -> one training dataset, dedup, per-source cap)  #
+# --------------------------------------------------------------------------- #
+def cmd_blend(a) -> int:
+    """Combine multiple prepared/ingested SFT sources into ONE training dataset
+    dir. Dedup by instance_id (earlier sources win, so put your best teacher
+    first). Optional --cap limits rows per source to control the mix."""
+    from datasets import Dataset
+
+    rows, seen = [], set()
+    stats = Counter()
+    for src in a.sources:
+        srows = _load_rows_any(src)
+        taken = 0
+        for r in srows:
+            iid = r.get("instance_id")
+            if iid in seen:
+                continue
+            if a.cap and taken >= a.cap:
+                break
+            seen.add(iid)
+            rows.append({"instance_id": iid, "messages": r["messages"],
+                         "repo": r.get("repo", ""), "source": r.get("source", src)})
+            stats[src] += 1
+            taken += 1
+    if not rows:
+        print("[blend] no rows", flush=True)
+        return 1
+    Dataset.from_list(rows).save_to_disk(a.out)
+    _write_jsonl(str(a.out) + ".jsonl", rows)
+    man = {"sources": a.sources, "cap_per_source": a.cap, "total_rows": len(rows),
+           "per_source": dict(stats), "dedup": "by instance_id, earlier source wins"}
+    Path(str(a.out) + ".manifest.json").write_text(json.dumps(man, indent=1))
+    print(f"[blend] {dict(stats)} -> {len(rows)} rows -> {a.out}", flush=True)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # smoke-train                                                                  #
 # --------------------------------------------------------------------------- #
 def _load_rows_any(path):
@@ -655,6 +800,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-walls", type=int, default=48)
     p.add_argument("--wall-sleep", type=int, default=1200)
     p.add_argument("--floor-gib", type=int, default=40)
+    p.add_argument("--exclude-runs", nargs="*", default=[],
+                   help="run dir globs (e.g. 'runs/teacher_*') whose attempted "
+                        "problems to skip — guarantees no overlap across campaigns")
     p.set_defaults(fn=cmd_collect)
 
     p = sub.add_parser("merge", help="consolidate collect batches into a training-ready set")
@@ -668,6 +816,26 @@ def build_parser() -> argparse.ArgumentParser:
                    help="task jsonl(s)/globs with problem_statement to join by instance_id")
     p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_prepare)
+
+    p = sub.add_parser("ingest", help="ingest an external resolved-trajectory dataset (e.g. Open-SWE-Traces) into SFT")
+    p.add_argument("--out", required=True)
+    p.add_argument("--dataset", default="nvidia/Open-SWE-Traces")
+    p.add_argument("--configs", nargs="+", default=["sweagent", "openhands"])
+    p.add_argument("--language", default="python")
+    p.add_argument("--resolved-only", action="store_true", default=True)
+    p.add_argument("--all-outcomes", dest="resolved_only", action="store_false",
+                   help="keep unresolved trajectories too (default: resolved only)")
+    p.add_argument("--limit", type=int, default=0, help="0 = no cap")
+    p.add_argument("--exclude", nargs="*", default=[],
+                   help="jsonl files/globs of eval + already-used instance_ids to exclude (decontam)")
+    p.set_defaults(fn=cmd_ingest)
+
+    p = sub.add_parser("blend", help="combine SFT sources into one training dataset (dedup, per-source cap)")
+    p.add_argument("--sources", nargs="+", required=True,
+                   help="prepared/ingested SFT dataset dirs or jsonls; earlier wins on dedup")
+    p.add_argument("--out", required=True)
+    p.add_argument("--cap", type=int, default=0, help="max rows per source (0 = all)")
+    p.set_defaults(fn=cmd_blend)
 
     p = sub.add_parser("smoke-train", help="validate a prepared dataset is trainable")
     p.add_argument("--data", required=True)

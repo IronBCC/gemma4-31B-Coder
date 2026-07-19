@@ -89,6 +89,22 @@ OPENROUTER_API_KEY=sk-... $PLAT collect --tasks data/hard_tasks.jsonl \
 quota walls (does not burn the pool), prunes docker between passes, and stops
 when the pool is exhausted. Safe to re-run; it resumes.
 
+**No overlap across runs (important).** Within one `--out-dir` family the loop
+already skips finished problems. To guarantee a NEW campaign never re-collects a
+problem an EARLIER campaign already did (across different out-dirs, teachers, or
+task files), pass `--exclude-runs`:
+
+```
+# second campaign (e.g. a different teacher) skips everything already attempted:
+$PLAT collect --tasks data/hard_tasks.jsonl --out-dir runs/teacher_codex \
+      --backend codex --loop --exclude-runs 'runs/teacher_*'
+```
+
+`--exclude-runs` unions the *real* attempts (dud/quota-wall rows are ignored)
+from every matching run dir and removes them from this run's work list. Use the
+same convention when building a fresh task file: `hard`/`pool` take `--exclude`
+with the same globs, so each new pool is disjoint from all prior work.
+
 Run it in the background and watch the ledger:
 ```
 nohup $PLAT collect --tasks data/hard_tasks.jsonl --out-dir runs/teacher_claude \
@@ -121,7 +137,7 @@ Produces `runs/teacher_merged/`:
 ## Step 3 — Prepare for training (render to SFT format)
 
 ```
-$PLAT prepare --merged runs/teacher_merged --tasks data/hard_tasks.jsonl --out data/teacher_sft.jsonl
+$PLAT prepare --merged runs/teacher_merged --tasks data/hard_tasks.jsonl --out data/teacher_sft
 ```
 
 This is the **critical** step. It parses each teacher stream into
@@ -130,19 +146,43 @@ This is the **critical** step. It parses each teacher stream into
 and `user`(OBSERVATION). It **strips the `docker exec <cid> bash -c` wrapper** so
 the student learns bare `/testbed` commands, not the teacher's harness shape —
 this is what prevents the data-mirror regression. Check
-`data/teacher_sft.jsonl.manifest.json`: `median_first_edit_cmd` should be small
+`data/teacher_sft.manifest.json`: `median_first_edit_cmd` should be small
 (edit-first); `dropped_unparseable` should be near 0.
 
 ---
+
+## Step 3b — Blend external traces (Open-SWE-Traces) into the mix
+
+Besides your own collected traces, fold in ready-made **verified** real-issue
+trajectories and train on them together.
+
+```
+# ingest resolved Python trajectories from nvidia/Open-SWE-Traces -> SFT
+# (decontaminate: exclude eval ids + anything you already used)
+$PLAT ingest --out data/open_swe_sft --resolved-only --language python \
+      --exclude 'runs/teacher_*/results.jsonl' data/lite_eval_ids.jsonl
+
+# blend YOUR teacher traces + Open-SWE into ONE training set.
+# Sources are deduped by instance_id; the FIRST source wins, so put your own
+# (higher-value) teacher traces first. --cap N limits rows per source.
+$PLAT blend --sources data/teacher_sft data/open_swe_sft \
+      --out data/main_train_mix
+```
+
+`ingest` renders each external trajectory shape-safe (same mini-SWE format,
+`docker exec` / `cd /testbed` prefixes stripped) and skips unresolved rows.
+`blend` writes a single HF dataset dir + `.manifest.json` with per-source counts
+and the mix. Decontamination is your responsibility: always pass eval instance
+ids to `ingest --exclude`.
 
 ## Step 4 — Smoke-test for training
 
 ```
 # structural + Gemma format-loss gates (no GPU):
-$PLAT smoke-train --data data/teacher_sft.jsonl
+$PLAT smoke-train --data data/teacher_sft
 
 # add a 2-step LoRA micro-run to prove it actually trains (needs a training GPU):
-$PLAT smoke-train --data data/teacher_sft.jsonl --micro-train
+$PLAT smoke-train --data data/teacher_sft --micro-train
 ```
 
 PASS criteria: every row has a system message + at least one assistant
@@ -157,8 +197,10 @@ real training run.
 ```
 $PLAT collect --tasks data/hard_tasks.jsonl --out-dir runs/teacher_claude --backend claude --loop
 $PLAT merge   --glob 'runs/teacher_*' --out-dir runs/teacher_merged
-$PLAT prepare --merged runs/teacher_merged --tasks data/hard_tasks.jsonl --out data/teacher_sft.jsonl
-$PLAT smoke-train --data data/teacher_sft.jsonl
+$PLAT prepare --merged runs/teacher_merged --tasks data/hard_tasks.jsonl --out data/teacher_sft
+$PLAT ingest  --out data/open_swe_sft --resolved-only --language python --exclude data/lite_eval_ids.jsonl
+$PLAT blend   --sources data/teacher_sft data/open_swe_sft --out data/main_train_mix
+$PLAT smoke-train --data data/main_train_mix
 ```
 
 ## Troubleshooting

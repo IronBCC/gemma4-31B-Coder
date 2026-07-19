@@ -64,6 +64,51 @@ def test_normalize_steps_openrouter(tmp_path):
     assert steps[0]["thought"] == "read it" and steps[0]["observation"].startswith("def a")
 
 
+def test_steps_from_trajectory_openai_style():
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "PR: fix it"},
+        {"role": "assistant", "content": "explore",
+         "tool_calls": [{"function": {"name": "bash", "arguments": '{"command": "ls /testbed"}'}}]},
+        {"role": "tool", "content": "OBSERVATION:\na.py b.py"},
+        {"role": "assistant", "content": "patch",
+         "tool_calls": [{"function": {"name": "bash", "arguments": '{"command": "sed -i s/a/b/ a.py"}'}}]},
+        {"role": "tool", "content": "done"},
+    ]
+    steps = tp.steps_from_trajectory(msgs)
+    assert [s["command"] for s in steps] == ["ls /testbed", "sed -i s/a/b/ a.py"]
+    assert steps[0]["thought"] == "explore" and steps[0]["observation"] == "a.py b.py"  # OBSERVATION: stripped
+
+
+def test_cross_run_exclusion(tmp_path):
+    import json
+    (tmp_path / "runA").mkdir()
+    (tmp_path / "runB").mkdir()
+    (tmp_path / "runA" / "results.jsonl").write_text(
+        json.dumps({"instance_id": "x1", "n_assistant_events": 40, "patch_len": 10}) + "\n" +
+        json.dumps({"instance_id": "dud", "n_assistant_events": 1, "patch_len": 0}) + "\n")
+    (tmp_path / "runB" / "results.jsonl").write_text(
+        json.dumps({"instance_id": "x2", "n_assistant_events": 0, "patch_len": 500}) + "\n")
+    done = tp._attempted_from_run_globs(str(tmp_path / "run") )
+    assert done == {"x1", "x2"}          # duds excluded, both real attempts caught across dirs
+
+
+def test_blend_dedup_earlier_source_wins(tmp_path):
+    import json
+    a = tmp_path / "a.jsonl"
+    b = tmp_path / "b.jsonl"
+    a.write_text(json.dumps({"instance_id": "i1", "messages": [1], "source": "A"}) + "\n")
+    b.write_text(json.dumps({"instance_id": "i1", "messages": [2], "source": "B"}) + "\n" +
+                 json.dumps({"instance_id": "i2", "messages": [3], "source": "B"}) + "\n")
+    from types import SimpleNamespace
+    out = tmp_path / "blended"
+    tp.cmd_blend(SimpleNamespace(sources=[str(a), str(b)], out=str(out), cap=0))
+    rows = tp._read_jsonl(str(out) + ".jsonl")
+    by = {r["instance_id"]: r for r in rows}
+    assert set(by) == {"i1", "i2"}
+    assert by["i1"]["source"] == "A"      # earlier source wins on dedup
+
+
 def test_normalize_steps_claude(tmp_path):
     import json
     p = tmp_path / "c.stream.jsonl"

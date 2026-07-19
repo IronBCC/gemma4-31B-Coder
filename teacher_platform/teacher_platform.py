@@ -45,6 +45,7 @@ import glob as globmod
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -226,6 +227,17 @@ def _attempted_from_run_globs(*run_globs) -> set:
     return attempted
 
 
+_FATAL_ERR_MARKERS = ("not a valid model", "invalid model", "no such model",
+                      "401", "invalid api key", "no auth credentials", "403 ")
+
+
+def _is_fatal_error(err) -> bool:
+    """Config errors that will fail EVERY task identically (bad model id, bad
+    key) — stop immediately instead of burning the whole task list."""
+    low = str(err or "").lower()
+    return bool(err) and any(m in low for m in _FATAL_ERR_MARKERS)
+
+
 def _remaining(tasks_path: str, *run_globs) -> list:
     pool = _read_jsonl(tasks_path)
     attempted = _attempted_from_run_globs(*run_globs)
@@ -263,6 +275,8 @@ def cmd_collect(a) -> int:
             with open(ledger, "w") as fh:
                 for x in results:
                     fh.write(json.dumps(x) + "\n")
+            if _is_fatal_error(rec.get("error")):
+                raise RuntimeError(f"fatal config error (bad model id / key?), aborting: {rec.get('error')}")
             streak = ttd.next_credit_streak(streak, rec.get("error"))
             if streak >= a.max_consecutive_credit_hits:
                 print(f"[collect] {streak} consecutive credit hits -> pausing pass", flush=True)
@@ -311,10 +325,20 @@ def collect_one_openrouter(row: dict, outdir: Path, max_turns: int, model: str) 
 
     iid = row["instance_id"]
     t0 = time.time()
-    out, rc = ttd.sh(["docker", "run", "-d", row["image_name"], "sleep", "infinity"], 120)
-    if rc:
-        return {"instance_id": iid, "error": f"container: {out[-200:]}", "resolved": False}
-    cid = out.strip().splitlines()[-1][:12]
+    out, rc = ttd.sh(["docker", "run", "-d", row["image_name"], "sleep", "infinity"], 300)
+    # Robust cid parse: docker may emit WARNING/platform lines (e.g. amd64 image
+    # on an arm64 host) that would otherwise be mistaken for the container id.
+    cid = next((m.group(0) for line in reversed(out.splitlines())
+                for m in [re.fullmatch(r"[0-9a-f]{12,64}", line.strip())] if m), "")
+    if rc or not cid:
+        return {"instance_id": iid, "error": f"container-start failed (wrong host/arch?): {out[-200:]}",
+                "resolved": False}
+    cid = cid[:12]
+    # confirm the container is actually running before driving it
+    st, _ = ttd.sh(["docker", "inspect", "-f", "{{.State.Running}}", cid], 30)
+    if "true" not in st.lower():
+        ttd.sh(["docker", "rm", "-f", cid], 30)
+        return {"instance_id": iid, "error": f"container not running: {st[-120:]}", "resolved": False}
     rec = {"instance_id": iid, "image": row["image_name"], "model": model, "backend": "openrouter"}
     raw_path = outdir / f"{iid}.stream.jsonl"
     stream = open(raw_path, "w")
@@ -580,46 +604,294 @@ def cmd_prepare(a) -> int:
 # --------------------------------------------------------------------------- #
 # ingest  (external trajectory datasets, e.g. nvidia/Open-SWE-Traces)          #
 # --------------------------------------------------------------------------- #
-def steps_from_trajectory(msgs: list) -> list:
-    """Parse an OpenAI-style trajectory (system/user/assistant+tool_calls/tool)
-    into [{thought, command, observation}]. Open-SWE-Traces commands are already
-    bare /testbed commands; the docker-exec strip is a no-op safety net."""
+class UnsupportedTrajectoryTool(ValueError):
+    """A trajectory cannot be represented by the one-bash-tool schema."""
+
+
+_OPEN_SWE_EDITOR_VIEW_MARKER = "# OPEN_SWE_EDITOR_VIEW"
+
+
+def _require_positive_int(value: int, name: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+def _require_nonnegative_int(value: int, name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be nonnegative")
+    return value
+
+
+def _required_trajectory_string(arguments: dict, key: str, *, nonempty: bool = False) -> str:
+    value = arguments.get(key)
+    if not isinstance(value, str) or (nonempty and not value.strip()):
+        raise UnsupportedTrajectoryTool(f"{key} must be a{' nonempty' if nonempty else ''} string")
+    return value
+
+
+def _trajectory_testbed_path(arguments: dict) -> str:
+    path = _required_trajectory_string(arguments, "path", nonempty=True)
+    normalized = os.path.normpath(path)
+    if normalized != "/testbed" and not normalized.startswith("/testbed/"):
+        raise UnsupportedTrajectoryTool("editor path must be under /testbed")
+    return normalized
+
+
+def _quoted_python_editor(lines: list[str]) -> str:
+    return (
+        "python3 - <<'OPEN_SWE_PY'\n"
+        "# OPEN_SWE_EDITOR_MUTATION\n"
+        + "\n".join(lines)
+        + "\nOPEN_SWE_PY"
+    )
+
+
+def translate_trajectory_tool_call(tool_call: dict) -> str | None:
+    """Translate one Open-SWE tool call into executable bash, or reject it.
+
+    ``None`` is reserved for ``submit``, a harness control action which should
+    not become a training command.
+    """
+    if not isinstance(tool_call, dict) or not isinstance(tool_call.get("function"), dict):
+        raise UnsupportedTrajectoryTool("malformed tool call")
+    function = tool_call["function"]
+    name = function.get("name")
+    raw_arguments = function.get("arguments")
+    if not isinstance(name, str) or not isinstance(raw_arguments, str):
+        raise UnsupportedTrajectoryTool("tool name and arguments must be strings")
+    try:
+        arguments = json.loads(raw_arguments)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise UnsupportedTrajectoryTool("malformed tool arguments") from exc
+    if not isinstance(arguments, dict):
+        raise UnsupportedTrajectoryTool("tool arguments must decode to an object")
+
+    if name == "submit":
+        return None
+    if name == "bash":
+        command = _required_trajectory_string(arguments, "command", nonempty=True)
+        command = _strip_docker_exec(command).strip()
+        if not command:
+            raise UnsupportedTrajectoryTool("bash command is empty after wrapper cleanup")
+        return command
+    if name != "str_replace_editor":
+        raise UnsupportedTrajectoryTool(f"unsupported trajectory tool: {name}")
+
+    editor_command = _required_trajectory_string(arguments, "command", nonempty=True)
+    path = _trajectory_testbed_path(arguments)
+    python_path = json.dumps(path)
+
+    if editor_command == "view":
+        quoted_path = shlex.quote(path)
+        if "view_range" in arguments:
+            view_range = arguments["view_range"]
+            if (
+                not isinstance(view_range, list)
+                or len(view_range) != 2
+                or any(type(line) is not int for line in view_range)
+            ):
+                raise UnsupportedTrajectoryTool("view_range must be a two-integer list")
+            start, end = view_range
+            if start < 1 or (end != -1 and end < start):
+                raise UnsupportedTrajectoryTool("invalid view_range")
+            last = "$" if end == -1 else str(end)
+            sed_range = shlex.quote(f"{start},{last}p")
+            command = (
+                f"if [ -d {quoted_path} ]; then "
+                "echo 'view_range is invalid for a directory' >&2; exit 1; "
+                f"elif [ ! -f {quoted_path} ]; then "
+                "echo 'view target is not a regular file' >&2; exit 1; "
+                "else "
+                f"line_count=$(awk 'END {{ print NR }}' {quoted_path}) || exit 1; "
+                f"if [ \"$line_count\" -lt {start} ]; then "
+                "echo 'view_range starts past end of file' >&2; exit 1; fi; "
+                f"set -o pipefail; nl -ba {quoted_path} | sed -n {sed_range}; fi"
+            )
+        else:
+            command = (
+                f"if [ -d {quoted_path} ]; then ls -la {quoted_path}; "
+                f"else nl -ba {quoted_path}; fi"
+            )
+        return f"{_OPEN_SWE_EDITOR_VIEW_MARKER}\n{command}"
+
+    if editor_command == "create":
+        file_text = _required_trajectory_string(arguments, "file_text")
+        return _quoted_python_editor([
+            "from pathlib import Path",
+            f"path = Path({python_path})",
+            f"file_text = {json.dumps(file_text)}",
+            "with path.open('x', encoding='utf-8') as handle:",
+            "    handle.write(file_text)",
+        ])
+
+    if editor_command == "str_replace":
+        old_str = _required_trajectory_string(arguments, "old_str", nonempty=True)
+        new_str = _required_trajectory_string(arguments, "new_str")
+        return _quoted_python_editor([
+            "from pathlib import Path",
+            f"path = Path({python_path})",
+            f"old_str = {json.dumps(old_str)}",
+            f"new_str = {json.dumps(new_str)}",
+            "text = path.read_text(encoding='utf-8')",
+            "matches = text.count(old_str)",
+            "if matches != 1:",
+            "    raise SystemExit(f'expected exactly one old_str match, found {matches}')",
+            "path.write_text(text.replace(old_str, new_str), encoding='utf-8')",
+        ])
+
+    if editor_command == "insert":
+        insert_line = arguments.get("insert_line")
+        if type(insert_line) is not int or insert_line < 0:
+            raise UnsupportedTrajectoryTool("insert_line must be a nonnegative integer")
+        new_str = _required_trajectory_string(arguments, "new_str")
+        return _quoted_python_editor([
+            "from pathlib import Path",
+            f"path = Path({python_path})",
+            f"insert_line = {insert_line}",
+            f"new_str = {json.dumps(new_str)}",
+            "text = path.read_text(encoding='utf-8')",
+            "physical_line_count = len(text.splitlines())",
+            "if insert_line > physical_line_count:",
+            "    raise SystemExit(",
+            "        f'insert_line {insert_line} exceeds {physical_line_count} lines'",
+            "    )",
+            "lines = text.split('\\n')",
+            "lines[insert_line:insert_line] = new_str.split('\\n')",
+            "path.write_text('\\n'.join(lines), encoding='utf-8')",
+        ])
+
+    raise UnsupportedTrajectoryTool(f"unsupported editor command: {editor_command}")
+
+
+def steps_from_trajectory(msgs: list, max_obs: int = 2000) -> list:
+    """Parse an OpenAI-style trajectory into strict command/result pairs."""
+    _require_positive_int(max_obs, "max_obs")
     steps, pending = [], None
+    pending_tool_call_id = None
+    omitted_submit = False
+    omitted_tool_call_id = None
     for m in msgs:
+        if not isinstance(m, dict):
+            raise UnsupportedTrajectoryTool("trajectory message must be an object")
         role = m.get("role")
         tcs = m.get("tool_calls") or []
         if role == "assistant" and tcs:
-            thought = (m.get("content") or "").strip()
-            for tc in tcs:
-                fn = tc.get("function") if isinstance(tc, dict) else None
-                if not fn:
-                    continue
-                try:
-                    cmd = json.loads(fn.get("arguments", "{}")).get("command", "")
-                except (json.JSONDecodeError, TypeError):
-                    cmd = ""
-                if cmd:
-                    pending = {"thought": thought, "command": _strip_docker_exec(cmd), "observation": ""}
-                    break
+            if pending is not None:
+                raise UnsupportedTrajectoryTool("tool call is missing its observation")
+            omitted_submit = False
+            omitted_tool_call_id = None
+            if not isinstance(tcs, list) or len(tcs) != 1:
+                raise UnsupportedTrajectoryTool("trajectory turns must contain exactly one tool call")
+            tool_call_id = tcs[0].get("id") if isinstance(tcs[0], dict) else None
+            if tool_call_id is not None and (
+                not isinstance(tool_call_id, str) or not tool_call_id
+            ):
+                raise UnsupportedTrajectoryTool("tool call id must be a nonempty string")
+            thought = next(
+                (value.strip() for key in ("content", "reasoning_content", "think")
+                 if isinstance((value := m.get(key)), str) and value.strip()),
+                "",
+            )
+            command = translate_trajectory_tool_call(tcs[0])
+            if command is None:
+                omitted_submit = True
+                omitted_tool_call_id = tool_call_id
+            else:
+                pending = {"thought": thought, "command": command, "observation": ""}
+                pending_tool_call_id = tool_call_id
         elif role in ("tool", "user") and pending is not None:
-            obs = str(m.get("content") or "")
-            obs = re.sub(r"^OBSERVATION:\s*", "", obs)
-            steps.append({**pending, "observation": obs[-2000:]})
+            obs = m.get("content")
+            if not isinstance(obs, str):
+                raise UnsupportedTrajectoryTool("observation content must be a string")
+            if role == "user" and not obs.lstrip().startswith("OBSERVATION:"):
+                raise UnsupportedTrajectoryTool("user tool result must start with OBSERVATION:")
+            result_has_id = "tool_call_id" in m
+            result_id = m.get("tool_call_id")
+            if result_has_id and (not isinstance(result_id, str) or not result_id):
+                raise UnsupportedTrajectoryTool("tool result id must be a nonempty string")
+            if pending_tool_call_id is not None or result_has_id:
+                if result_id != pending_tool_call_id:
+                    raise UnsupportedTrajectoryTool("tool result id does not match tool call id")
+            obs = re.sub(r"^\s*OBSERVATION:\s*", "", obs).strip()
+            if len(obs) > max_obs:
+                head_chars = max_obs // 2
+                tail_chars = max_obs - head_chars
+                obs = obs[:head_chars] + "\n...[truncated]...\n" + obs[-tail_chars:]
+            steps.append({**pending, "observation": obs})
             pending = None
+            pending_tool_call_id = None
+        elif role == "tool" or (
+            role == "user" and str(m.get("content") or "").lstrip().startswith("OBSERVATION:")
+        ):
+            if omitted_submit:
+                obs = m.get("content")
+                if not isinstance(obs, str):
+                    raise UnsupportedTrajectoryTool("observation content must be a string")
+                result_has_id = "tool_call_id" in m
+                result_id = m.get("tool_call_id")
+                if result_has_id and (not isinstance(result_id, str) or not result_id):
+                    raise UnsupportedTrajectoryTool("tool result id must be a nonempty string")
+                if omitted_tool_call_id is not None or result_has_id:
+                    if result_id != omitted_tool_call_id:
+                        raise UnsupportedTrajectoryTool("tool result id does not match tool call id")
+                omitted_submit = False
+                omitted_tool_call_id = None
+            else:
+                raise UnsupportedTrajectoryTool("observation has no matching tool call")
+        elif pending is not None:
+            raise UnsupportedTrajectoryTool("tool call is missing its observation")
+        elif omitted_submit:
+            omitted_submit = False
+            omitted_tool_call_id = None
+    if pending is not None:
+        raise UnsupportedTrajectoryTool("trajectory ended before a tool observation")
     return steps
 
 
+_EDIT_RE = re.compile(
+    r'\b(sed -i|>|>>|tee |patch |apply|cat <<|python -c|>\s*/testbed)'
+    r'|# OPEN_SWE_EDITOR_MUTATION'
+)
+
+
+def edit_first_trim(steps: list, max_steps: int) -> list:
+    """Keep an edit-biased slice while preserving the mutation and verification."""
+    _require_nonnegative_int(max_steps, "max_steps")
+    if max_steps == 0 or len(steps) <= max_steps:
+        return steps
+    first_edit = next((i for i, s in enumerate(steps) if _EDIT_RE.search(s["command"])), None)
+    if first_edit is None:
+        return steps[-max_steps:]
+
+    selected = {first_edit}
+    for index in range(min(3, len(steps))):
+        if len(selected) < max_steps:
+            selected.add(index)
+    if first_edit > 0 and len(selected) < max_steps:
+        selected.add(first_edit - 1)
+    for index in range(len(steps) - 1, first_edit, -1):
+        if len(selected) >= max_steps:
+            break
+        selected.add(index)
+    return [steps[index] for index in sorted(selected)]
+
+
 def cmd_ingest(a) -> int:
-    """Ingest an external resolved-trajectory dataset into mini-SWE SFT rows,
-    shape-safe and decontaminated. Default schema = nvidia/Open-SWE-Traces
-    (instance_id, repo, language, trajectory, resolved)."""
+    """Ingest an external resolved-trajectory dataset into mini-SWE SFT rows."""
     import ast
+
+    _require_nonnegative_int(a.limit, "limit")
+    _require_positive_int(a.max_obs_chars, "max_obs_chars")
+    _require_nonnegative_int(a.max_steps, "max_steps")
+    _require_nonnegative_int(a.max_pr_chars, "max_pr_chars")
 
     from datasets import Dataset, load_dataset
 
     exclude = _attempted_ids(*a.exclude)
     out, seen = [], set()
     stats = Counter()
+    tool_conversion_drop_reasons = Counter()
     scanned = kept_resolved = 0
     for cfg in a.configs:
         d = load_dataset(a.dataset, cfg, streaming=True)
@@ -639,8 +911,16 @@ def cmd_ingest(a) -> int:
                     msgs = ast.literal_eval(traj) if isinstance(traj, str) else traj
                 except (ValueError, SyntaxError):
                     continue
-                steps = steps_from_trajectory(msgs)
+                try:
+                    steps = steps_from_trajectory(msgs, max_obs=a.max_obs_chars)
+                except UnsupportedTrajectoryTool as exc:
+                    tool_conversion_drop_reasons[str(exc)] += 1
+                    continue
+                if a.max_steps:
+                    steps = edit_first_trim(steps, a.max_steps)
                 pr = next((str(m.get("content")) for m in msgs if m.get("role") == "user"), "")
+                if a.max_pr_chars and len(pr) > a.max_pr_chars:
+                    pr = pr[: a.max_pr_chars] + "\n...[truncated]..."
                 task = {"instance_id": iid, "problem_statement": pr, "repo": r.get("repo", ""),
                         "backend": "open-swe", "model": f"{cfg}:{split}"}
                 sft = render_sft(task, steps)
@@ -654,16 +934,20 @@ def cmd_ingest(a) -> int:
                 break
         if a.limit and len(out) >= a.limit:
             break
+    man = {"dataset": a.dataset, "configs": a.configs, "language": a.language,
+           "resolved_only": a.resolved_only, "scanned": scanned, "resolved_matched": kept_resolved,
+           "ingested": len(out), "excluded_ids": len(exclude), "per_source": dict(stats),
+           "dropped_tool_conversion": sum(tool_conversion_drop_reasons.values()),
+           "tool_conversion_drop_reasons": dict(sorted(tool_conversion_drop_reasons.items())),
+           "note": "external teacher traces rendered to mini-SWE SFT; blend with own teacher traces via `blend`"}
+    manifest_path = Path(str(a.out) + ".manifest.json")
     if not out:
+        manifest_path.write_text(json.dumps(man, indent=1))
         print("[ingest] nothing ingested (check filters/exclude)", flush=True)
         return 1
     Dataset.from_list(out).save_to_disk(a.out)
     _write_jsonl(str(a.out) + ".jsonl", out)
-    man = {"dataset": a.dataset, "configs": a.configs, "language": a.language,
-           "resolved_only": a.resolved_only, "scanned": scanned, "resolved_matched": kept_resolved,
-           "ingested": len(out), "excluded_ids": len(exclude), "per_source": dict(stats),
-           "note": "external teacher traces rendered to mini-SWE SFT; blend with own teacher traces via `blend`"}
-    Path(str(a.out) + ".manifest.json").write_text(json.dumps(man, indent=1))
+    manifest_path.write_text(json.dumps(man, indent=1))
     print(f"[ingest] scanned={scanned} resolved-matched={kept_resolved} "
           f"ingested={len(out)} -> {a.out}", flush=True)
     return 0
@@ -767,6 +1051,20 @@ def cmd_smoke_train(a) -> int:
 # cli                                                                          #
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
+    def positive_int(value: str) -> int:
+        try:
+            parsed = int(value)
+            return _require_positive_int(parsed, "value")
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+
+    def nonnegative_int(value: str) -> int:
+        try:
+            parsed = int(value)
+            return _require_nonnegative_int(parsed, "value")
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+
     ap = argparse.ArgumentParser(description="Teacher-trace platform")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -825,7 +1123,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resolved-only", action="store_true", default=True)
     p.add_argument("--all-outcomes", dest="resolved_only", action="store_false",
                    help="keep unresolved trajectories too (default: resolved only)")
-    p.add_argument("--limit", type=int, default=0, help="0 = no cap")
+    p.add_argument("--limit", type=nonnegative_int, default=0, help="0 = no cap")
+    p.add_argument("--max-obs-chars", type=positive_int, default=800,
+                   help="truncate each observation to this many chars (head+tail)")
+    p.add_argument("--max-steps", type=nonnegative_int, default=25,
+                   help="edit-first trim long trajectories to this many steps (0 = keep all)")
+    p.add_argument("--max-pr-chars", type=nonnegative_int, default=6000,
+                   help="truncate problem statement (0 = keep all)")
     p.add_argument("--exclude", nargs="*", default=[],
                    help="jsonl files/globs of eval + already-used instance_ids to exclude (decontam)")
     p.set_defaults(fn=cmd_ingest)

@@ -61,7 +61,6 @@ _RETURN_CODE_RE = re.compile(
     r"(?:<returncode>|command (?:completed|finished) with exit code )(?P<rc>[0-9]+)",
     re.IGNORECASE,
 )
-_SINGLE_PIPE_RE = re.compile(r"(?<!\|)\|(?!\|)")
 _COMPLETE_COMMAND = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 _TEST_PATH_PARTS = frozenset(
     {
@@ -809,88 +808,167 @@ def _scope_path(raw: str, *, cwd: PurePosixPath) -> PurePosixPath | None:
     return resolved
 
 
+_QUOTED_SHELL_CONTROL_MASK = {
+    character: chr(0xE000 + index)
+    for index, character in enumerate(";&|<>(){}\n")
+}
+_QUOTED_SHELL_CONTROL_UNMASK = {
+    masked: character for character, masked in _QUOTED_SHELL_CONTROL_MASK.items()
+}
+_SHELL_CONTROL_OPERATORS = frozenset({"&&", "||", ";", "\n", "|", "|&", "&"})
+_SHELL_GROUP_TOKENS = frozenset({"(", ")", "{", "}"})
+
+
+def _mask_quoted_shell_controls(command: str) -> str:
+    """Protect quoted operator text so shlex cannot promote it to shell syntax."""
+    output: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for character in command:
+        if escaped:
+            output.append(character)
+            escaped = False
+            continue
+        if character == "\\" and quote != "'":
+            output.append(character)
+            escaped = True
+            continue
+        if character in {"'", '"'}:
+            if quote is None:
+                quote = character
+            elif quote == character:
+                quote = None
+            output.append(character)
+            continue
+        output.append(
+            _QUOTED_SHELL_CONTROL_MASK.get(character, character)
+            if quote is not None
+            else character
+        )
+    return "".join(output)
+
+
+def _unmask_shell_token(token: str) -> str:
+    return "".join(
+        _QUOTED_SHELL_CONTROL_UNMASK.get(character, character)
+        for character in token
+    )
+
+
+def _shell_executable_fragments(
+    command: str,
+) -> tuple[tuple[tuple[str, ...], str | None], ...] | None:
+    """Parse conservative shell-visible fragments and their following operators."""
+    visible = _mask_quoted_shell_controls(_shell_visible_text(command))
+    try:
+        lexer = shlex.shlex(visible, posix=True, punctuation_chars=";&|<>(){}\n")
+        lexer.whitespace_split = True
+        lexer.whitespace = " \t\r"
+        lexer.commenters = "#"
+        shell_tokens = list(lexer)
+    except ValueError:
+        return None
+
+    fragments: list[tuple[tuple[str, ...], str | None]] = []
+    fragment: list[str] = []
+    for raw_token in shell_tokens:
+        if raw_token in _SHELL_CONTROL_OPERATORS:
+            if not fragment:
+                if raw_token == "\n":
+                    continue
+                return None
+            fragments.append((tuple(fragment), raw_token))
+            fragment = []
+            continue
+        if any(character in raw_token for character in _SHELL_GROUP_TOKENS):
+            return None
+        fragment.append(_unmask_shell_token(raw_token))
+    if fragment:
+        fragments.append((tuple(fragment), None))
+    return tuple(fragments)
+
+
+def _render_shell_fragment(tokens: Sequence[str]) -> str:
+    """Render parsed tokens for the existing literal mutation extractor."""
+    return " ".join(
+        token
+        if token and all(character in "<>&" for character in token)
+        else shlex.quote(token)
+        for token in tokens
+    )
+
+
+def _unsupported_cwd_change(tokens: Sequence[str]) -> bool:
+    executable = PurePosixPath(tokens[0]).name
+    if executable in {"pushd", "popd"}:
+        return True
+    if executable in {"command", "builtin"} and len(tokens) > 1:
+        return PurePosixPath(tokens[1]).name in {"cd", "pushd", "popd"}
+    return any(PurePosixPath(token).name == "cd" for token in tokens)
+
+
+def _fragment_mutation_paths(tokens: Sequence[str]) -> tuple[str, ...]:
+    fragment = _render_shell_fragment(tokens).replace("pathlib.Path(", "Path(")
+    visible = _shell_visible_text(fragment)
+    if not _PATCH_APPLY_OPERATOR_RE.search(visible):
+        fragment = _EMBEDDED_PATCH_MARKER_RE.sub("INERT_PATCH_MARKER ", fragment)
+    paths = edited_paths(fragment)
+    for index, token in enumerate(tokens[:-1]):
+        if token not in {">", ">>", ">|", "&>", "&>>", ">&"}:
+            continue
+        target = tokens[index + 1]
+        if target == "/dev/null" or target.isdigit() or target.startswith("&"):
+            continue
+        paths.append(target)
+    return tuple(dict.fromkeys(paths))
+
+
 def _mutation_scope(command: str, declared_root: str) -> MutationScope:
     """Classify literal edit operands relative to one declared repository root."""
     root = _scope_path(declared_root, cwd=PurePosixPath("/"))
     if root is None or root.as_posix() == "/":
         return MutationScope((), (), True)
 
-    visible = _shell_visible_text(command)
-    try:
-        lexer = shlex.shlex(visible, posix=True, punctuation_chars=";&|\n")
-        lexer.whitespace_split = True
-        lexer.whitespace = " \t\r"
-        lexer.commenters = "#"
-        tokens = list(lexer)
-    except ValueError:
+    fragments = _shell_executable_fragments(command)
+    if fragments is None:
         return MutationScope((), (), True)
 
-    fragments: list[list[str]] = []
-    fragment: list[str] = []
-    separators: list[str] = []
-    for token in tokens:
-        if token and all(character in ";&|\n" for character in token):
-            if fragment:
-                fragments.append(fragment)
-                fragment = []
-            separators.append(token)
-            continue
-        fragment.append(token)
-    if fragment:
-        fragments.append(fragment)
-
     cwd = root
-    cd_count = 0
-    saw_non_cd = False
-    for index, tokens_for_fragment in enumerate(fragments):
-        executable = PurePosixPath(tokens_for_fragment[0]).name
-        if executable != "cd":
-            saw_non_cd = True
-            continue
-        cd_count += 1
+    start = 0
+    if fragments and PurePosixPath(fragments[0][0][0]).name == "cd":
+        cd_tokens, following_operator = fragments[0]
         if (
-            saw_non_cd
-            or cd_count > 1
-            or len(tokens_for_fragment) != 2
-            or (index < len(separators) and separators[index] not in {"&&", ";", "\n"})
+            len(cd_tokens) != 2
+            or following_operator not in {"&&", ";", "\n"}
         ):
             return MutationScope((), (), True)
-        resolved_cwd = _scope_path(tokens_for_fragment[1], cwd=cwd)
+        resolved_cwd = _scope_path(cd_tokens[1], cwd=cwd)
         if resolved_cwd is None:
             return MutationScope((), (), True)
         cwd = resolved_cwd
-    textual_cd_count = len(re.findall(r"(?:^|[;&|\n(])\s*cd(?:\s|$)", visible))
-    if textual_cd_count != cd_count:
-        return MutationScope((), (), True)
+        start = 1
 
-    detectable_command = command.replace("pathlib.Path(", "Path(")
-    if not _PATCH_APPLY_OPERATOR_RE.search(visible):
-        detectable_command = _EMBEDDED_PATCH_MARKER_RE.sub(
-            "INERT_PATCH_MARKER ", detectable_command
-        )
-    raw_paths = edited_paths(detectable_command)
-    without_initial_cd = re.sub(
-        r"^\s*cd\s+(?:'[^']*'|\"[^\"]*\"|[^\s;&|]+)\s*(?:&&|;)\s*",
-        "",
-        detectable_command,
-        count=1,
-    )
-    if without_initial_cd != detectable_command:
-        raw_paths = list(dict.fromkeys((*raw_paths, *edited_paths(without_initial_cd))))
     repository_paths: list[str] = []
     scratch_paths: list[str] = []
-    for raw_path in raw_paths:
-        resolved = _scope_path(raw_path, cwd=cwd)
-        if resolved is None:
+    for tokens, _following_operator in fragments[start:]:
+        if _unsupported_cwd_change(tokens):
             return MutationScope((), (), True)
-        try:
-            repository_path = resolved.relative_to(root).as_posix()
-        except ValueError:
-            scratch_paths.append(resolved.as_posix())
-        else:
-            if not repository_path or repository_path == ".":
+        executable = PurePosixPath(tokens[0]).name
+        has_heredoc = "<<" in tokens or "<<-" in tokens
+        if has_heredoc and executable not in {"cat", "tee"}:
+            return MutationScope((), (), True)
+        for raw_path in _fragment_mutation_paths(tokens):
+            resolved = _scope_path(raw_path, cwd=cwd)
+            if resolved is None:
                 return MutationScope((), (), True)
-            repository_paths.append(repository_path)
+            try:
+                repository_path = resolved.relative_to(root).as_posix()
+            except ValueError:
+                scratch_paths.append(resolved.as_posix())
+            else:
+                if not repository_path or repository_path == ".":
+                    return MutationScope((), (), True)
+                repository_paths.append(repository_path)
     return MutationScope(
         tuple(dict.fromkeys(repository_paths)),
         tuple(dict.fromkeys(scratch_paths)),
@@ -898,16 +976,58 @@ def _mutation_scope(command: str, declared_root: str) -> MutationScope:
     )
 
 
+def _rust_verification_tokens(tokens: Sequence[str]) -> bool:
+    executable = PurePosixPath(tokens[0]).name
+    if executable == "cargo":
+        return len(tokens) > 1 and tokens[1] in {
+            "check",
+            "test",
+            "build",
+            "clippy",
+            "nextest",
+        }
+    if executable == "rustc":
+        return True
+    return (
+        executable in {"just", "make", "ninja"}
+        and len(tokens) > 1
+        and tokens[1] in {"check", "test", "build"}
+    )
+
+
+def _updated_pipefail(tokens: Sequence[str], current: bool) -> bool:
+    if PurePosixPath(tokens[0]).name != "set" or "pipefail" not in tokens[1:]:
+        return current
+    option_tokens = tokens[1 : tokens.index("pipefail")]
+    if any(token.startswith("+") and "o" in token for token in option_tokens):
+        return False
+    if any(token.startswith("-") and "o" in token for token in option_tokens):
+        return True
+    return current
+
+
 def _trusted_rust_verification(
     command: str, observation: Mapping[str, Any]
 ) -> bool:
-    visible = _shell_visible_text(command)
-    if _RUST_VERIFY_RE.search(visible) is None:
+    fragments = _shell_executable_fragments(command)
+    if not fragments or any(operator in {"||", "&"} for _, operator in fragments):
         return False
-    if _SINGLE_PIPE_RE.search(visible) and not re.search(
-        r"(?:set\s+-o\s+pipefail|set\s+-[^;\n]*o[^;\n]*pipefail)", visible
-    ):
+    if fragments[-1][1] not in {None, ";", "\n"}:
         return False
+
+    final_start = len(fragments) - 1
+    while final_start > 0 and fragments[final_start - 1][1] in {"|", "|&"}:
+        final_start -= 1
+    final_pipeline = fragments[final_start:]
+    if not any(_rust_verification_tokens(tokens) for tokens, _ in final_pipeline):
+        return False
+
+    pipefail = False
+    for tokens, _operator in fragments[:final_start]:
+        pipefail = _updated_pipefail(tokens, pipefail)
+    if len(final_pipeline) > 1 and not pipefail:
+        return False
+
     matches = list(_RETURN_CODE_RE.finditer(_observation_body(observation)))
     return bool(matches) and int(matches[-1].group("rc")) == 0
 

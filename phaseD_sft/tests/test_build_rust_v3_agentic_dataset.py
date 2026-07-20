@@ -579,6 +579,80 @@ def test_mutation_scope_fails_closed_for_unresolvable_location(command: str) -> 
     assert scope.ambiguous is True
 
 
+@pytest.mark.parametrize(
+    ("command", "repo"),
+    [
+        (
+            "printf x > src/lib.rs && printf y > tests/case.rs",
+            ("src/lib.rs", "tests/case.rs"),
+        ),
+        (
+            "cat > src/lib.rs </dev/null && cat > Cargo.lock </dev/null",
+            ("src/lib.rs", "Cargo.lock"),
+        ),
+        (
+            "cargo check > build.log && true > Cargo.lock",
+            ("build.log", "Cargo.lock"),
+        ),
+    ],
+)
+def test_mutation_scope_classifies_every_compound_redirect(
+    command: str, repo: tuple[str, ...]
+) -> None:
+    scope = rust_v3_builder._mutation_scope(command, "/workspace/repo")
+    assert scope.repository_paths == repo
+    assert scope.scratch_paths == ()
+    assert scope.ambiguous is False
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "from pathlib import Path\nPath('src/lib.rs').write_text('x')",
+        "open('Cargo.lock', 'w').write('x')",
+        "sed -i s/a/b/ src/lib.rs",
+    ],
+)
+def test_mutation_scope_ignores_inert_heredoc_body_mutations(body: str) -> None:
+    command = f"cat > /tmp/repro.py <<'PY'\n{body}\nPY"
+    scope = rust_v3_builder._mutation_scope(command, "/workspace/repo")
+    assert scope.repository_paths == ()
+    assert scope.scratch_paths == ("/tmp/repro.py",)
+    assert scope.ambiguous is False
+
+
+def test_mutation_scope_rejects_interpreter_heredoc_semantics() -> None:
+    command = (
+        "python3 - <<'PY'\n"
+        "from pathlib import Path\n"
+        "Path('src/lib.rs').write_text('x')\n"
+        "PY"
+    )
+    scope = rust_v3_builder._mutation_scope(command, "/workspace/repo")
+    assert scope.repository_paths == ()
+    assert scope.scratch_paths == ()
+    assert scope.ambiguous is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "command cd /workspace && sed -i s/a/b/ repro.rs",
+        "builtin cd /workspace && sed -i s/a/b/ repro.rs",
+        "{ cd /workspace; sed -i s/a/b/ repro.rs; }",
+        "(cd /workspace && sed -i s/a/b/ repro.rs)",
+        "pushd /workspace >/dev/null && sed -i s/a/b/ repro.rs",
+    ],
+)
+def test_mutation_scope_rejects_unsupported_working_directory_changes(
+    command: str,
+) -> None:
+    scope = rust_v3_builder._mutation_scope(command, "/workspace/repo")
+    assert scope.repository_paths == ()
+    assert scope.scratch_paths == ()
+    assert scope.ambiguous is True
+
+
 def _observation(rc: int) -> dict[str, object]:
     return {
         "role": "user",
@@ -627,6 +701,32 @@ def test_trusted_verification_fails_closed_on_masking_or_bad_returncode(
 ) -> None:
     observation = {"role": "user", "content": content}
     assert rust_v3_builder._trusted_rust_verification(command, observation) is expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cargo test || true",
+        "cargo test; true",
+        "cargo test; exit 0",
+        "cargo test || echo ignored",
+        "cargo test | tail -20; set -o pipefail",
+        "set -o pipefail; set +o pipefail; cargo test | tail -20",
+        "echo '; cargo test'",
+    ],
+)
+def test_trusted_verification_rejects_masked_or_inert_rust_commands(
+    command: str,
+) -> None:
+    assert rust_v3_builder._trusted_rust_verification(
+        command, _observation(0)
+    ) is False
+
+
+def test_trusted_verification_uses_executable_tokens_not_quoted_operators() -> None:
+    assert rust_v3_builder._trusted_rust_verification(
+        "echo '|' && cargo test", _observation(0)
+    ) is True
 
 
 def test_synthetic_audit_counter_preserves_exact_736_boundary() -> None:

@@ -57,6 +57,11 @@ _RUST_VERIFY_RE = re.compile(
     r"rustc\b|(?:just|make|ninja)\s+(?:check|test|build)\b"
     r")"
 )
+_RETURN_CODE_RE = re.compile(
+    r"(?:<returncode>|command (?:completed|finished) with exit code )(?P<rc>[0-9]+)",
+    re.IGNORECASE,
+)
+_SINGLE_PIPE_RE = re.compile(r"(?<!\|)\|(?!\|)")
 _COMPLETE_COMMAND = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 _TEST_PATH_PARTS = frozenset(
     {
@@ -97,6 +102,13 @@ class TrackedMutation:
     command: str
     edited_paths: tuple[str, ...]
     tracked_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MutationScope:
+    repository_paths: tuple[str, ...]
+    scratch_paths: tuple[str, ...]
+    ambiguous: bool
 
 
 @dataclass(frozen=True)
@@ -219,6 +231,11 @@ def _is_test_path(path: str) -> bool:
         or stem in {"test", "tests"}
         or stem.endswith("_test")
     )
+
+
+def _forbidden_training_path(path: str) -> bool:
+    name = PurePosixPath(path).name.lower()
+    return _is_test_path(path) or name == "cargo.lock" or name.endswith(".lock")
 
 
 def extract_tracked_rust_paths(
@@ -768,6 +785,131 @@ def _shell_visible_text(command: str) -> str:
             delimiter = match.group("delimiter")
             strip_tabs = bool(match.group("strip"))
     return "\n".join(visible)
+
+
+def _scope_path(raw: str, *, cwd: PurePosixPath) -> PurePosixPath | None:
+    """Resolve one literal mutation operand without shell expansion."""
+    value = raw.strip().strip("'\"")
+    if (
+        not value
+        or "\x00" in value
+        or "\\" in value
+        or value.startswith("~")
+        or any(character in value for character in "$`*?[]{}")
+    ):
+        return None
+    raw_parts = value.split("/")
+    path_parts = raw_parts[1:] if value.startswith("/") else raw_parts
+    if any(part in {"", ".", ".."} for part in path_parts):
+        return None
+    candidate = PurePosixPath(value)
+    resolved = candidate if candidate.is_absolute() else cwd / candidate
+    if not resolved.is_absolute():
+        return None
+    return resolved
+
+
+def _mutation_scope(command: str, declared_root: str) -> MutationScope:
+    """Classify literal edit operands relative to one declared repository root."""
+    root = _scope_path(declared_root, cwd=PurePosixPath("/"))
+    if root is None or root.as_posix() == "/":
+        return MutationScope((), (), True)
+
+    visible = _shell_visible_text(command)
+    try:
+        lexer = shlex.shlex(visible, posix=True, punctuation_chars=";&|\n")
+        lexer.whitespace_split = True
+        lexer.whitespace = " \t\r"
+        lexer.commenters = "#"
+        tokens = list(lexer)
+    except ValueError:
+        return MutationScope((), (), True)
+
+    fragments: list[list[str]] = []
+    fragment: list[str] = []
+    separators: list[str] = []
+    for token in tokens:
+        if token and all(character in ";&|\n" for character in token):
+            if fragment:
+                fragments.append(fragment)
+                fragment = []
+            separators.append(token)
+            continue
+        fragment.append(token)
+    if fragment:
+        fragments.append(fragment)
+
+    cwd = root
+    cd_count = 0
+    saw_non_cd = False
+    for index, tokens_for_fragment in enumerate(fragments):
+        executable = PurePosixPath(tokens_for_fragment[0]).name
+        if executable != "cd":
+            saw_non_cd = True
+            continue
+        cd_count += 1
+        if (
+            saw_non_cd
+            or cd_count > 1
+            or len(tokens_for_fragment) != 2
+            or (index < len(separators) and separators[index] not in {"&&", ";", "\n"})
+        ):
+            return MutationScope((), (), True)
+        resolved_cwd = _scope_path(tokens_for_fragment[1], cwd=cwd)
+        if resolved_cwd is None:
+            return MutationScope((), (), True)
+        cwd = resolved_cwd
+    textual_cd_count = len(re.findall(r"(?:^|[;&|\n(])\s*cd(?:\s|$)", visible))
+    if textual_cd_count != cd_count:
+        return MutationScope((), (), True)
+
+    detectable_command = command.replace("pathlib.Path(", "Path(")
+    if not _PATCH_APPLY_OPERATOR_RE.search(visible):
+        detectable_command = _EMBEDDED_PATCH_MARKER_RE.sub(
+            "INERT_PATCH_MARKER ", detectable_command
+        )
+    raw_paths = edited_paths(detectable_command)
+    without_initial_cd = re.sub(
+        r"^\s*cd\s+(?:'[^']*'|\"[^\"]*\"|[^\s;&|]+)\s*(?:&&|;)\s*",
+        "",
+        detectable_command,
+        count=1,
+    )
+    if without_initial_cd != detectable_command:
+        raw_paths = list(dict.fromkeys((*raw_paths, *edited_paths(without_initial_cd))))
+    repository_paths: list[str] = []
+    scratch_paths: list[str] = []
+    for raw_path in raw_paths:
+        resolved = _scope_path(raw_path, cwd=cwd)
+        if resolved is None:
+            return MutationScope((), (), True)
+        try:
+            repository_path = resolved.relative_to(root).as_posix()
+        except ValueError:
+            scratch_paths.append(resolved.as_posix())
+        else:
+            if not repository_path or repository_path == ".":
+                return MutationScope((), (), True)
+            repository_paths.append(repository_path)
+    return MutationScope(
+        tuple(dict.fromkeys(repository_paths)),
+        tuple(dict.fromkeys(scratch_paths)),
+        False,
+    )
+
+
+def _trusted_rust_verification(
+    command: str, observation: Mapping[str, Any]
+) -> bool:
+    visible = _shell_visible_text(command)
+    if _RUST_VERIFY_RE.search(visible) is None:
+        return False
+    if _SINGLE_PIPE_RE.search(visible) and not re.search(
+        r"(?:set\s+-o\s+pipefail|set\s+-[^;\n]*o[^;\n]*pipefail)", visible
+    ):
+        return False
+    matches = list(_RETURN_CODE_RE.finditer(_observation_body(observation)))
+    return bool(matches) and int(matches[-1].group("rc")) == 0
 
 
 def classify_tracked_mutations(

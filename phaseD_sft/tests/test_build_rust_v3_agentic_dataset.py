@@ -516,6 +516,119 @@ def test_inline_inert_patch_markers_are_not_source_mutations(command: str) -> No
     assert report == {"kept": False, "reason": "no_tracked_source_mutation"}
 
 
+@pytest.mark.parametrize(
+    ("command", "repo", "scratch", "ambiguous"),
+    [
+        ("sed -i s/a/b/ src/lib.rs", ("src/lib.rs",), (), False),
+        (
+            "cd /workspace/repo && cat > Cargo.toml <<'EOF'\nX\nEOF",
+            ("Cargo.toml",),
+            (),
+            False,
+        ),
+        (
+            "cd /workspace && cat > repro.rs <<'EOF'\nfn main(){}\nEOF",
+            (),
+            ("/workspace/repro.rs",),
+            False,
+        ),
+        ("cat > $TARGET <<'EOF'\nX\nEOF", (), (), True),
+    ],
+)
+def test_mutation_scope_distinguishes_repo_scratch_and_ambiguous(
+    command: str,
+    repo: tuple[str, ...],
+    scratch: tuple[str, ...],
+    ambiguous: bool,
+) -> None:
+    scope = rust_v3_builder._mutation_scope(command, "/workspace/repo")
+    assert scope.repository_paths == repo
+    assert scope.scratch_paths == scratch
+    assert scope.ambiguous is ambiguous
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tests/case.rs",
+        "examples/demo.rs",
+        "fixtures/input.txt",
+        "benches/bench.rs",
+        "Cargo.lock",
+        "supply-chain/imports.lock",
+    ],
+)
+def test_forbidden_training_paths(path: str) -> None:
+    assert rust_v3_builder._forbidden_training_path(path)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sed -i s/a/b/ ../src/lib.rs",
+        "cat > ${TARGET} <<'EOF'\nX\nEOF",
+        "cd /workspace/repo && sed -i s/a/b/ src/lib.rs; "
+        "cd /workspace && cat > repro.rs <<'EOF'\nX\nEOF",
+        "(cd /workspace && cat > repro.rs <<'EOF'\nX\nEOF)",
+    ],
+)
+def test_mutation_scope_fails_closed_for_unresolvable_location(command: str) -> None:
+    scope = rust_v3_builder._mutation_scope(command, "/workspace/repo")
+    assert scope.repository_paths == ()
+    assert scope.scratch_paths == ()
+    assert scope.ambiguous is True
+
+
+def _observation(rc: int) -> dict[str, object]:
+    return {
+        "role": "user",
+        "content": f"OBSERVATION:\n<returncode>{rc}</returncode>\noutput",
+    }
+
+
+@pytest.mark.parametrize(
+    ("command", "rc", "expected"),
+    [
+        ("cargo test", 0, True),
+        ("cargo check", 1, False),
+        ("cargo test 2>&1 | tail -20", 0, False),
+        ("set -o pipefail; cargo test 2>&1 | tail -20", 0, True),
+        ("grep cargo Cargo.toml", 0, False),
+    ],
+)
+def test_trusted_verification_requires_real_command_unmasked_zero_rc(
+    command: str, rc: int, expected: bool
+) -> None:
+    assert rust_v3_builder._trusted_rust_verification(
+        command, _observation(rc)
+    ) is expected
+
+
+@pytest.mark.parametrize(
+    ("command", "content", "expected"),
+    [
+        ("cargo test", "OBSERVATION:\noutput only", False),
+        (
+            "cargo test",
+            "OBSERVATION:\n<returncode>0</returncode>\n"
+            "command finished with exit code 1",
+            False,
+        ),
+        ("cargo test |& tail -20", "OBSERVATION:\n<returncode>0</returncode>", False),
+        (
+            "set -eo pipefail; cargo test | tail -20",
+            "OBSERVATION:\ncommand completed with exit code 0",
+            True,
+        ),
+    ],
+)
+def test_trusted_verification_fails_closed_on_masking_or_bad_returncode(
+    command: str, content: str, expected: bool
+) -> None:
+    observation = {"role": "user", "content": content}
+    assert rust_v3_builder._trusted_rust_verification(command, observation) is expected
+
+
 def test_synthetic_audit_counter_preserves_exact_736_boundary() -> None:
     rows = [
         _row(task_id=f"owner__crate-{index}", trajectory_id=f"t-{index}")

@@ -756,6 +756,24 @@ def test_mutation_scope_does_not_treat_long_options_or_operands_as_short_c(
     assert scope.ambiguous is False
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "fish -C 'touch Cargo.lock'",
+        "fish --command='rm tests/case.rs'",
+        "fish --init-command='touch Cargo.lock'",
+        "env fish -C 'git reset --hard HEAD'",
+        "fish --command 'rm tests/case.rs'",
+        "fish --init-command 'touch Cargo.lock'",
+    ],
+)
+def test_mutation_scope_rejects_fish_command_string_options(command: str) -> None:
+    scope = rust_v3_builder._mutation_scope(command, "/workspace/repo")
+    assert scope.repository_paths == ()
+    assert scope.scratch_paths == ()
+    assert scope.ambiguous is True
+
+
 def _observation(rc: int) -> dict[str, object]:
     return {
         "role": "user",

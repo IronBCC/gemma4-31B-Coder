@@ -982,15 +982,27 @@ def _git_subcommand(tokens: Sequence[str]) -> str | None:
 
 
 def _interpreter_uses_command_string(tokens: Sequence[str]) -> bool:
-    if not tokens or PurePosixPath(tokens[0]).name not in _COMMAND_STRING_INTERPRETERS:
+    if not tokens:
+        return False
+    executable = PurePosixPath(tokens[0]).name
+    if executable not in _COMMAND_STRING_INTERPRETERS:
         return False
     for token in tokens[1:]:
         if token == "--":
             return False
+        if executable == "fish" and (
+            token in {"--command", "--init-command"}
+            or token.startswith("--command=")
+            or token.startswith("--init-command=")
+        ):
+            return True
         if token.startswith("--"):
             continue
         if token.startswith("-") and len(token) > 1:
-            if "c" in token[1:]:
+            short_options = token[1:]
+            if "c" in short_options or (
+                executable == "fish" and "C" in short_options
+            ):
                 return True
             continue
         return False

@@ -659,10 +659,13 @@ git commit --only phaseD_sft/audit_rust_v3p1_dataset.py \
 cd /home/ironbcc/projects/gemma4-31B-Coder
 free -g
 test ! -e data/rust_sft_v3p1_agentic_49k
-test ! -e .data/rust_sft_v3p1_agentic_49k.publish.lock
+test ! -e data/.rust_sft_v3p1_agentic_49k.publish.lock
 ```
 
 Require at least 15 GiB available RAM. Do not inspect or alter GPUs/services for this CPU-only build.
+The exclusion CLI value is the builder's canonical sorted-ID-set SHA256
+(`bc0a6b...`); the JSONL file SHA256 is separately bound in the generated
+manifest as `5893e74...` and must not be substituted for the ID-set hash.
 
 - [ ] **Step 7: Run the structural/behavior audit first**
 
@@ -676,7 +679,7 @@ PYTHONPATH=$PWD .venv-train/bin/python \
   --config openhands:qwen35_122b \
   --exclude data/mswe_rust_prs_full239.jsonl \
   --expected-exclusion-count 239 \
-  --expected-exclusion-sha256 5893e74d6e45183fc4e922dbe5bbe1169c1c26c8fbfa31129fb84a0e0c43fa8b \
+  --expected-exclusion-sha256 bc0a6b0994d437af5f00323fbe87846e0f424c6a88b484f3f4c5592f1f1dc645 \
   --expected-pre-exclusion-eligible 825 \
   --progress-every 1000 \
   > data/rust_sft_v3p1_agentic_49k.audit.log 2>&1
@@ -695,7 +698,7 @@ PYTHONPATH=$PWD .venv-train/bin/python \
   --config openhands:qwen35_122b \
   --exclude data/mswe_rust_prs_full239.jsonl \
   --expected-exclusion-count 239 \
-  --expected-exclusion-sha256 5893e74d6e45183fc4e922dbe5bbe1169c1c26c8fbfa31129fb84a0e0c43fa8b \
+  --expected-exclusion-sha256 bc0a6b0994d437af5f00323fbe87846e0f424c6a88b484f3f4c5592f1f1dc645 \
   --expected-pre-exclusion-eligible 825 \
   --tokenizer /media/ironbcc/CrucialX10/models/google/gemma-4-31B-it \
   --tokenizer-revision local-gemma4-31b-it-20260614 \

@@ -8,7 +8,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import copy
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import errno
 import hashlib
 import json
@@ -74,6 +74,17 @@ _TEST_PATH_PARTS = frozenset(
         "fixtures",
     }
 )
+_BEHAVIOR_CONTRACTS = frozenset({"v3", "v3p1"})
+_ZERO_V3P1_INVARIANTS = {
+    "forbidden_mutations": 0,
+    "lockfile_mutations": 0,
+    "nonallowlisted_mutations": 0,
+    "ambiguous_mutations": 0,
+    "repeated_edit_commands": 0,
+    "missing_trusted_final_verification": 0,
+    "unbalanced_pairs": 0,
+    "terminal_not_last": 0,
+}
 
 
 @dataclass(frozen=True)
@@ -170,6 +181,7 @@ class AuditInputs:
     expected_exclusion_count: int
     expected_exclusion_sha256: str
     expected_pre_exclusion_eligible: int
+    behavior_contract: str = field(default="v3", kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -2201,6 +2213,24 @@ def _max_read_streak(messages: Sequence[Mapping[str, Any]]) -> int:
     return maximum
 
 
+def _first_repository_edit_command_index(
+    messages: Sequence[Mapping[str, Any]], *, declared_root: str
+) -> int:
+    pairing = _native_message_pairs(messages)
+    if pairing is None:
+        raise ValueError("cannot measure first edit from unbalanced messages")
+    pairs, _terminal_index = pairing
+    for command_index, (_assistant, _observation, command) in enumerate(
+        pairs, start=1
+    ):
+        scope = _mutation_scope(command, declared_root)
+        if scope.ambiguous:
+            raise ValueError("cannot measure first edit from ambiguous mutation")
+        if scope.repository_paths:
+            return command_index
+    raise ValueError("cannot measure first edit without a repository mutation")
+
+
 def _percentile(values: Sequence[int], percentile: int) -> int:
     if not values:
         return 0
@@ -2297,6 +2327,7 @@ class _ScanResult:
     per_config: dict[str, Counter[str]]
     per_config_drops: dict[str, Counter[str]]
     drop_reasons: Counter[str]
+    behavior_drop_reasons: Counter[str]
     provenance: list[dict[str, str]]
     exclusion_manifest: dict[str, Any]
     structurally_eligible: int
@@ -2314,6 +2345,10 @@ def _scan_streams(
 ) -> _ScanResult:
     if not inputs.dataset_revision:
         raise ValueError("dataset revision is required")
+    if inputs.behavior_contract not in _BEHAVIOR_CONTRACTS:
+        raise ValueError(
+            f"unknown behavior contract: {inputs.behavior_contract!r}"
+        )
     if progress_every < 0:
         raise ValueError("progress_every must be nonnegative")
     exclusions, exclusion_manifest = _load_frozen_exclusions(inputs)
@@ -2322,6 +2357,7 @@ def _scan_streams(
     per_config: dict[str, Counter[str]] = {}
     per_config_drops: dict[str, Counter[str]] = {}
     drop_reasons: Counter[str] = Counter()
+    behavior_drop_reasons: Counter[str] = Counter()
     provenance: list[dict[str, str]] = []
     structural_task_ids: set[str] = set()
     structural_repositories: set[str] = set()
@@ -2390,6 +2426,37 @@ def _scan_streams(
                 continue
             counters["compressed_eligible"] += 1
             messages = [copy.deepcopy(message) for message in compressed.messages]
+            behavior_fields: dict[str, Any] = {}
+            declared_root = _declared_root(analyzed.trajectory)
+            if inputs.behavior_contract == "v3p1":
+                decisive, decisive_report = _build_decisive_suffix(
+                    analyzed, compressed
+                )
+                if decisive is None:
+                    reason = str(decisive_report["reason"])
+                    drop_reasons[reason] += 1
+                    behavior_drop_reasons[reason] += 1
+                    config_drops[reason] += 1
+                    continue
+                if declared_root is None:
+                    raise AssertionError("accepted decisive row lacks repository root")
+                messages = [copy.deepcopy(message) for message in decisive.messages]
+                behavior_fields = {
+                    "final_edit_command_index": decisive.final_edit_command_index,
+                    "verification_command_index": decisive.verification_command_index,
+                    "textual_patch_allowlist": list(
+                        analyzed.patch_paths.textual_paths
+                    ),
+                    "declared_root": declared_root,
+                }
+            first_edit_command_index = int(
+                compression_report["first_edit_command_index"]
+            )
+            if inputs.behavior_contract == "v3p1":
+                assert declared_root is not None
+                first_edit_command_index = _first_repository_edit_command_index(
+                    messages, declared_root=declared_root
+                )
             candidates.append(
                 {
                     "source": stream.source,
@@ -2401,10 +2468,9 @@ def _scan_streams(
                     "trajectory_id": compressed.identity.trajectory_id,
                     "messages": messages,
                     "content_sha256": _sha256_bytes(_canonical_json(messages)),
-                    "first_edit_command_index": int(
-                        compression_report["first_edit_command_index"]
-                    ),
+                    "first_edit_command_index": first_edit_command_index,
                     "max_read_streak": _max_read_streak(messages),
+                    **behavior_fields,
                     "_config_key": key,
                 }
             )
@@ -2422,6 +2488,7 @@ def _scan_streams(
         per_config=per_config,
         per_config_drops=per_config_drops,
         drop_reasons=drop_reasons,
+        behavior_drop_reasons=behavior_drop_reasons,
         provenance=provenance,
         exclusion_manifest=exclusion_manifest,
         structurally_eligible=structurally_eligible,
@@ -2439,6 +2506,7 @@ def _audit_report(scan: _ScanResult, inputs: AuditInputs) -> dict[str, Any]:
         "event": "rust_v3_audit_final",
         "status": "passed" if matches else "boundary_mismatch",
         "dataset_revision": inputs.dataset_revision,
+        "behavior_contract": inputs.behavior_contract,
         "configs": sorted(
             scan.provenance,
             key=lambda item: (item["source"], item["config"], item["split"]),
@@ -2459,6 +2527,9 @@ def _audit_report(scan: _ScanResult, inputs: AuditInputs) -> dict[str, Any]:
             for key, value in sorted(scan.per_config.items())
         },
         "drop_reasons": dict(sorted(scan.drop_reasons.items())),
+        "behavior_drop_reasons": dict(
+            sorted(scan.behavior_drop_reasons.items())
+        ),
         "unique_structural_task_ids": len(scan.structural_task_ids),
         "unique_structural_repositories": len(scan.structural_repositories),
         "unique_compressed_task_ids": len(
@@ -2504,6 +2575,115 @@ def run_audit_cli(
     )
     emit(json.dumps(report, ensure_ascii=False, sort_keys=True))
     return 0 if report["status"] == "passed" else 2
+
+
+def _audit_v3p1_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    invariants = dict(_ZERO_V3P1_INVARIANTS)
+    for row in rows:
+        messages = row.get("messages")
+        allowlist_value = row.get("textual_patch_allowlist")
+        declared_root = row.get("declared_root")
+        if (
+            not isinstance(messages, list)
+            or isinstance(allowlist_value, (str, bytes))
+            or not isinstance(allowlist_value, Sequence)
+            or not all(isinstance(path, str) for path in allowlist_value)
+            or not isinstance(declared_root, str)
+        ):
+            invariants["ambiguous_mutations"] += 1
+            invariants["unbalanced_pairs"] += 1
+            continue
+
+        terminal_indices = [
+            index
+            for index, message in enumerate(messages)
+            if message.get("role") == "assistant"
+            and _native_command(message) == _COMPLETE_COMMAND
+        ]
+        if terminal_indices != [len(messages) - 1]:
+            invariants["terminal_not_last"] += 1
+
+        pairing = _native_message_pairs(messages)
+        if pairing is None:
+            invariants["unbalanced_pairs"] += 1
+            continue
+        pairs, _terminal_index = pairing
+        allowlist = set(allowlist_value)
+        seen_edit_commands: set[str] = set()
+        final_repository_edit = -1
+        classified: list[tuple[int, int, str, MutationScope]] = []
+        for assistant_index, observation_index, command in pairs:
+            scope = _mutation_scope(command, declared_root)
+            classified.append(
+                (assistant_index, observation_index, command, scope)
+            )
+            if scope.ambiguous:
+                invariants["ambiguous_mutations"] += 1
+                continue
+            if scope.repository_paths or scope.scratch_paths:
+                normalized = _normalized_command(command)
+                if normalized in seen_edit_commands:
+                    invariants["repeated_edit_commands"] += 1
+                seen_edit_commands.add(normalized)
+            for path in scope.repository_paths:
+                name = PurePosixPath(path).name.lower()
+                if name == "cargo.lock" or name.endswith(".lock"):
+                    invariants["lockfile_mutations"] += 1
+                elif _is_test_path(path):
+                    invariants["forbidden_mutations"] += 1
+                if path not in allowlist:
+                    invariants["nonallowlisted_mutations"] += 1
+            if scope.repository_paths:
+                final_repository_edit = assistant_index
+
+        has_trusted_final_verification = any(
+            assistant_index > final_repository_edit
+            and _trusted_rust_verification(command, messages[observation_index])
+            for assistant_index, observation_index, command, _scope in classified
+        )
+        if final_repository_edit < 0 or not has_trusted_final_verification:
+            invariants["missing_trusted_final_verification"] += 1
+    return invariants
+
+
+def _v3p1_publication_gate(
+    rows: Sequence[Mapping[str, Any]], invariants: Mapping[str, int]
+) -> dict[str, Any]:
+    row_count = len(rows)
+    repository_count = len({str(row["repository"]) for row in rows})
+    median_first_edit = _percentile(
+        [int(row["first_edit_command_index"]) for row in rows], 50
+    )
+    evidence = {
+        "minimum_rows": {
+            "threshold": 60,
+            "measured": row_count,
+            "passed": row_count >= 60,
+        },
+        "minimum_repositories": {
+            "threshold": 35,
+            "measured": repository_count,
+            "passed": repository_count >= 35,
+        },
+        "maximum_median_first_edit": {
+            "threshold": 4,
+            "measured": median_first_edit,
+            "passed": median_first_edit <= 4,
+        },
+        "post_build_invariants": {
+            "required": 0,
+            "passed": dict(invariants) == _ZERO_V3P1_INVARIANTS,
+        },
+    }
+    if not evidence["post_build_invariants"]["passed"]:
+        raise ValueError("post-build invariant gate failed")
+    if not evidence["minimum_rows"]["passed"]:
+        raise ValueError("minimum row gate failed")
+    if not evidence["minimum_repositories"]["passed"]:
+        raise ValueError("minimum repository gate failed")
+    if not evidence["maximum_median_first_edit"]["passed"]:
+        raise ValueError("median first-edit gate failed")
+    return evidence
 
 
 def build_streaming_dataset(
@@ -2554,6 +2734,7 @@ def build_streaming_dataset(
     per_config = scan.per_config
     per_config_drops = scan.per_config_drops
     drop_reasons = scan.drop_reasons
+    behavior_drop_reasons = scan.behavior_drop_reasons
     provenance = scan.provenance
     exclusion_manifest = scan.exclusion_manifest
     pre_exclusion_eligible = scan.structurally_eligible
@@ -2629,6 +2810,29 @@ def build_streaming_dataset(
     for candidate in final_internal:
         rows.append({key: value for key, value in candidate.items() if not key.startswith("_")})
 
+    behavior_manifest: dict[str, Any] = {}
+    if inputs.behavior_contract == "v3p1":
+        invariants = _audit_v3p1_rows(rows)
+        publication_gates = _v3p1_publication_gate(rows, invariants)
+        behavior_manifest = {
+            "final_edit_histogram": dict(
+                sorted(
+                    Counter(
+                        str(row["final_edit_command_index"]) for row in rows
+                    ).items()
+                )
+            ),
+            "verification_histogram": dict(
+                sorted(
+                    Counter(
+                        str(row["verification_command_index"]) for row in rows
+                    ).items()
+                )
+            ),
+            "post_build_invariants": invariants,
+            "publication_gates": publication_gates,
+        }
+
     jsonl = b"".join(_canonical_json(row) + b"\n" for row in rows)
     tokens = [row["tokens"] for row in rows]
     per_repo = dict(sorted(Counter(row["repository"] for row in rows).items()))
@@ -2643,6 +2847,7 @@ def build_streaming_dataset(
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "dataset_revision": inputs.dataset_revision,
+        "behavior_contract": inputs.behavior_contract,
         "configs": sorted(provenance, key=lambda item: (item["source"], item["config"], item["split"])),
         "builder_path": str(Path(__file__).resolve()),
         "builder_sha256": _sha256_bytes(Path(__file__).read_bytes()),
@@ -2681,6 +2886,7 @@ def build_streaming_dataset(
             for key, value in sorted(per_config.items())
         },
         "drop_reasons": dict(sorted(drop_reasons.items())),
+        "behavior_drop_reasons": dict(sorted(behavior_drop_reasons.items())),
         "per_repo": per_repo,
         "token_stats": {
             "min": min(tokens, default=0),
@@ -2690,6 +2896,7 @@ def build_streaming_dataset(
         },
         "first_edit_histogram": first_edit_hist,
         "read_streak_histogram": read_streak_hist,
+        **behavior_manifest,
     }
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -2739,6 +2946,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-exclusion-count", type=int, required=True)
     parser.add_argument("--expected-exclusion-sha256", required=True)
     parser.add_argument("--expected-pre-exclusion-eligible", type=int, required=True)
+    parser.add_argument(
+        "--behavior-contract",
+        choices=sorted(_BEHAVIOR_CONTRACTS),
+        default="v3",
+    )
     parser.add_argument("--tokenizer")
     parser.add_argument("--tokenizer-revision")
     parser.add_argument("--template-identity")
@@ -2792,6 +3004,7 @@ def main() -> int:
         expected_exclusion_count=args.expected_exclusion_count,
         expected_exclusion_sha256=args.expected_exclusion_sha256,
         expected_pre_exclusion_eligible=args.expected_pre_exclusion_eligible,
+        behavior_contract=args.behavior_contract,
     )
     if args.audit_only:
         return run_audit_cli(
@@ -2829,6 +3042,7 @@ def main() -> int:
             expected_exclusion_count=args.expected_exclusion_count,
             expected_exclusion_sha256=args.expected_exclusion_sha256,
             expected_pre_exclusion_eligible=args.expected_pre_exclusion_eligible,
+            behavior_contract=args.behavior_contract,
             max_tokens=args.max_tokens,
             max_workers=args.workers,
         ),

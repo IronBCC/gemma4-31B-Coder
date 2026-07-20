@@ -2109,6 +2109,58 @@ def _build_inputs(exclusion: Path, ids: list[str], *, boundary: int) -> BuildInp
     )
 
 
+def _v3p1_input_rows() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for index in range(60):
+        row = _valid_rich_row(pre_reads=3 if index == 0 else 1)
+        row["instance_id"] = f"owner__crate-{index}"
+        row["repo"] = f"owner-{index % 35}/crate-{index % 35}"
+        row["trajectory_id"] = f"safe-{index}"
+        trajectory = row["trajectory"]
+        assert isinstance(trajectory, list)
+        trajectory[1]["content"] = (
+            "<uploaded_files>\n/testbed\n</uploaded_files>\n"
+            f"Fix Rust bug {index}."
+        )
+        edit_index = 2 + (3 if index == 0 else 1) * 2
+        trajectory[edit_index] = _assistant(
+            "edit-1",
+            "execute_bash",
+            {"command": "sed -i s/old/new/ src/lib.rs"},
+            reasoning="edit-reasoning-verbatim",
+        )
+        trajectory[-2] = _result("verify-1", "<returncode>0</returncode>\ntests passed")
+        rows.append(row)
+
+    unsafe_shorter = _valid_rich_row(pre_reads=1)
+    unsafe_shorter["instance_id"] = "owner__crate-0"
+    unsafe_shorter["repo"] = "owner-0/crate-0"
+    unsafe_shorter["trajectory_id"] = "unsafe-shorter"
+    unsafe_trajectory = unsafe_shorter["trajectory"]
+    assert isinstance(unsafe_trajectory, list)
+    unsafe_trajectory[1]["content"] = (
+        "<uploaded_files>\n/testbed\n</uploaded_files>\nFix Rust bug 0."
+    )
+    unsafe_trajectory[4] = _assistant(
+        "edit-1",
+        "execute_bash",
+        {"command": "sed -i s/old/new/ src/lib.rs"},
+        reasoning="edit-reasoning-verbatim",
+    )
+    unsafe_trajectory[-2] = _result(
+        "verify-1", "<returncode>0</returncode>\ntests passed"
+    )
+    unsafe_trajectory[4:4] = [
+        _assistant(
+            "unsafe-1",
+            "execute_bash",
+            {"command": "cat > README_FIX.md <<'EOF'\nsummary\nEOF"},
+        ),
+        _result("unsafe-1", "<returncode>0</returncode>"),
+    ]
+    return [unsafe_shorter, *rows]
+
+
 def _fake_hf_publish(rows: list[dict[str, object]], path: Path) -> None:
     path.mkdir()
     (path / "rows.json").write_text(json.dumps(rows, sort_keys=True))
@@ -2138,6 +2190,215 @@ def test_streaming_build_validates_frozen_exclusion_before_consuming_rows(
 
     assert consumed is False
     assert not (tmp_path / "out").exists()
+
+
+def test_unknown_behavior_contract_fails_before_consuming_streams(
+    tmp_path: Path,
+) -> None:
+    consumed = False
+
+    def rows():
+        nonlocal consumed
+        consumed = True
+        yield _valid_rich_row()
+
+    exclusion = _exclusion_file(tmp_path / "exclude.jsonl", [])
+    inputs = BuildInputs(
+        **{
+            **_build_inputs(exclusion, [], boundary=0).__dict__,
+            "behavior_contract": "future-contract",
+        }
+    )
+
+    with pytest.raises(ValueError, match="behavior contract"):
+        build_streaming_dataset(
+            [SourceRowStream("open-swe", "cfg", "train", rows())],
+            output_dir=tmp_path / "out",
+            inputs=inputs,
+            count_rendered_tokens=lambda messages: len(json.dumps(messages)),
+            publish_hf=_fake_hf_publish,
+        )
+
+    assert consumed is False
+    assert not (tmp_path / "out").exists()
+
+
+def test_default_v3_matches_explicit_v3_and_omits_v3p1_row_fields(
+    tmp_path: Path,
+) -> None:
+    exclusion = _exclusion_file(tmp_path / "exclude.jsonl", [])
+    source = _valid_rich_row()
+    default_inputs = _build_inputs(exclusion, [], boundary=1)
+    explicit_inputs = BuildInputs(
+        **{**default_inputs.__dict__, "behavior_contract": "v3"}
+    )
+
+    manifests = []
+    payloads = []
+    for name, inputs in (("default", default_inputs), ("explicit", explicit_inputs)):
+        output = tmp_path / name
+        manifests.append(
+            build_streaming_dataset(
+                [SourceRowStream("open-swe", "cfg", "train", iter([source]))],
+                output_dir=output,
+                inputs=inputs,
+                count_rendered_tokens=lambda messages: len(json.dumps(messages)),
+                publish_hf=_fake_hf_publish,
+            )
+        )
+        payloads.append((output / "dataset.jsonl").read_bytes())
+
+    assert payloads[0] == payloads[1]
+    assert manifests[0]["per_config"] == manifests[1]["per_config"]
+    assert manifests[0]["drop_reasons"] == manifests[1]["drop_reasons"]
+    assert manifests[0]["behavior_contract"] == "v3"
+    row = json.loads(payloads[0])
+    assert "final_edit_command_index" not in row
+    assert "verification_command_index" not in row
+    assert "textual_patch_allowlist" not in row
+    assert "final_edit_histogram" not in manifests[0]
+    assert "verification_histogram" not in manifests[0]
+    assert "post_build_invariants" not in manifests[0]
+
+
+def test_v3p1_gates_before_selection_and_safe_longer_candidate_wins(
+    tmp_path: Path,
+) -> None:
+    exclusion = _exclusion_file(tmp_path / "exclude.jsonl", [])
+    inputs = BuildInputs(
+        **{
+            **_build_inputs(exclusion, [], boundary=61).__dict__,
+            "behavior_contract": "v3p1",
+        }
+    )
+
+    manifest = build_streaming_dataset(
+        [
+            SourceRowStream(
+                "open-swe", "cfg", "train", iter(_v3p1_input_rows())
+            )
+        ],
+        output_dir=tmp_path / "out",
+        inputs=inputs,
+        count_rendered_tokens=lambda messages: len(json.dumps(messages)),
+        publish_hf=_fake_hf_publish,
+        progress_every=0,
+    )
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "out/dataset.jsonl").read_text().splitlines()
+    ]
+    winner = next(row for row in rows if row["task_id"] == "owner__crate-0")
+    assert winner["trajectory_id"] == "safe-0"
+    assert winner["content_sha256"] == hashlib.sha256(
+        json.dumps(
+            winner["messages"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    assert winner["first_edit_command_index"] == 4
+    assert winner["final_edit_command_index"] == 4
+    assert winner["verification_command_index"] == 5
+    assert winner["textual_patch_allowlist"] == ["src/lib.rs"]
+    assert winner["max_read_streak"] == 3
+    assert manifest["behavior_contract"] == "v3p1"
+    assert manifest["drop_reasons"]["nonallowlisted_repository_mutation"] == 1
+    assert "task_shorter_candidate" not in manifest["drop_reasons"]
+    assert manifest["arithmetic"] == {
+        "rows_scanned": 61,
+        "rows_dropped": 1,
+        "rows_output": 60,
+        "balanced": True,
+    }
+    assert manifest["final_edit_histogram"] == {"2": 59, "4": 1}
+    assert manifest["verification_histogram"] == {"3": 59, "5": 1}
+    assert manifest["post_build_invariants"] == {
+        "forbidden_mutations": 0,
+        "lockfile_mutations": 0,
+        "nonallowlisted_mutations": 0,
+        "ambiguous_mutations": 0,
+        "repeated_edit_commands": 0,
+        "missing_trusted_final_verification": 0,
+        "unbalanced_pairs": 0,
+        "terminal_not_last": 0,
+    }
+    assert manifest["publication_gates"] == {
+        "minimum_rows": {"threshold": 60, "measured": 60, "passed": True},
+        "minimum_repositories": {
+            "threshold": 35,
+            "measured": 35,
+            "passed": True,
+        },
+        "maximum_median_first_edit": {
+            "threshold": 4,
+            "measured": 2,
+            "passed": True,
+        },
+        "post_build_invariants": {"required": 0, "passed": True},
+    }
+
+
+def test_v3p1_audit_only_runs_behavior_gate_and_counts_drop(
+    tmp_path: Path,
+) -> None:
+    exclusion = _exclusion_file(tmp_path / "exclude.jsonl", [])
+    rows = _v3p1_input_rows()[:1]
+    report = audit_streaming_dataset(
+        [SourceRowStream("open-swe", "cfg", "train", iter(rows))],
+        inputs=AuditInputs(
+            dataset_revision="revision-abc",
+            exclusion_path=exclusion,
+            expected_exclusion_count=0,
+            expected_exclusion_sha256=canonical_id_sha256([]),
+            expected_pre_exclusion_eligible=1,
+            behavior_contract="v3p1",
+        ),
+        progress_every=0,
+    )
+
+    assert report["behavior_contract"] == "v3p1"
+    assert report["drop_reasons"] == {
+        "nonallowlisted_repository_mutation": 1
+    }
+    assert report["unique_compressed_task_ids"] == 0
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("rows", "minimum row gate"),
+        ("repositories", "minimum repository gate"),
+        ("median", "median first-edit gate"),
+        ("invariant", "post-build invariant gate"),
+    ],
+)
+def test_v3p1_publication_gate_fails_closed_for_every_gate(
+    case: str, message: str
+) -> None:
+    rows = [
+        {
+            "repository": f"owner-{index % 35}/crate-{index % 35}",
+            "first_edit_command_index": 2,
+        }
+        for index in range(60)
+    ]
+    invariants = dict(rust_v3_builder._ZERO_V3P1_INVARIANTS)
+    if case == "rows":
+        rows.pop()
+    elif case == "repositories":
+        for row in rows:
+            row["repository"] = "owner/crate"
+    elif case == "median":
+        for row in rows:
+            row["first_edit_command_index"] = 5
+    else:
+        invariants["repeated_edit_commands"] = 1
+
+    with pytest.raises(ValueError, match=message):
+        rust_v3_builder._v3p1_publication_gate(rows, invariants)
 
 
 def test_streaming_build_selects_shortest_per_task_then_content_dedups_and_budgets(
@@ -2823,6 +3084,8 @@ def test_audit_cli_args_do_not_require_build_only_tokenizer_template_or_out(
             "a" * 64,
             "--expected-pre-exclusion-eligible",
             "736",
+            "--behavior-contract",
+            "v3p1",
         ]
     )
 
@@ -2830,6 +3093,41 @@ def test_audit_cli_args_do_not_require_build_only_tokenizer_template_or_out(
     assert args.tokenizer is None
     assert args.template_identity is None
     assert args.out is None
+    assert args.behavior_contract == "v3p1"
+
+
+def test_build_cli_accepts_v3p1_behavior_contract(tmp_path: Path) -> None:
+    args = _parse_args(
+        [
+            "--revision",
+            "revision-abc",
+            "--config",
+            "cfg:train",
+            "--exclude",
+            str(tmp_path / "exclude.jsonl"),
+            "--expected-exclusion-count",
+            "239",
+            "--expected-exclusion-sha256",
+            "a" * 64,
+            "--expected-pre-exclusion-eligible",
+            "736",
+            "--behavior-contract",
+            "v3p1",
+            "--tokenizer",
+            "tokenizer",
+            "--tokenizer-revision",
+            "revision",
+            "--template-identity",
+            "template",
+            "--template-sha256",
+            "b" * 64,
+            "--out",
+            str(tmp_path / "out"),
+        ]
+    )
+
+    assert args.audit_only is False
+    assert args.behavior_contract == "v3p1"
 
 
 def test_audit_cli_emits_final_json_before_nonzero_boundary_exit(

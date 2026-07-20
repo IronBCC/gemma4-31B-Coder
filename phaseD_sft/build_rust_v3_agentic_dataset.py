@@ -1046,6 +1046,23 @@ def _unclassified_worktree_mutator(tokens: Sequence[str]) -> bool:
     return False
 
 
+def _sed_in_place_option_boundary(tokens: Sequence[str]) -> bool:
+    if not tokens or PurePosixPath(tokens[0]).name != "sed" or "--" not in tokens:
+        return False
+    boundary = tokens.index("--")
+    for token in tokens[1:boundary]:
+        if token == "--in-place" or token.startswith("--in-place="):
+            return True
+        if not token.startswith("-") or token.startswith("--"):
+            continue
+        for option in token[1:]:
+            if option in {"e", "f"}:
+                break
+            if option == "i":
+                return True
+    return False
+
+
 def _fragment_mutation_paths(tokens: Sequence[str]) -> tuple[str, ...]:
     fragment = _render_shell_fragment(tokens).replace("pathlib.Path(", "Path(")
     visible = _shell_visible_text(fragment)
@@ -1090,7 +1107,11 @@ def _mutation_scope(command: str, declared_root: str) -> MutationScope:
     repository_paths: list[str] = []
     scratch_paths: list[str] = []
     for tokens, _following_operator in fragments[start:]:
-        if _unsupported_cwd_change(tokens) or _unclassified_worktree_mutator(tokens):
+        if (
+            _unsupported_cwd_change(tokens)
+            or _unclassified_worktree_mutator(tokens)
+            or _sed_in_place_option_boundary(tokens)
+        ):
             return MutationScope((), (), True)
         executable = PurePosixPath(tokens[0]).name
         has_heredoc = "<<" in tokens or "<<-" in tokens
@@ -1518,6 +1539,8 @@ def _sed_script_operands(tokens: Sequence[str]) -> tuple[str, ...]:
     index = 1
     while index < len(tokens):
         token = tokens[index]
+        if token == "--":
+            break
         if token in {"-f", "--file"}:
             if index + 1 >= len(tokens):
                 return ()

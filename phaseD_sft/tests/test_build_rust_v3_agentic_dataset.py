@@ -1342,6 +1342,53 @@ def test_decisive_suffix_accepts_supported_sed_scratch_input_options(
     assert result is not None
 
 
+def test_decisive_suffix_rejects_sed_post_boundary_filename_as_scratch_consume():
+    command = "sed -i 's/a/b/' -- -f/tmp/fix.sed src/lib.rs"
+    analyzed, compressed = _real_compressed_decisive_fixture(
+        [
+            ("cat > /tmp/fix.sed <<'EOF'\ns/a/b/\nEOF", 0),
+            (command, 0),
+            ("cargo test", 0),
+        ],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    result, report = rust_v3_builder._build_decisive_suffix(analyzed, compressed)
+    assert result is None
+    assert report["reason"] == "ambiguous_mutation_path"
+
+
+def test_sed_script_operands_stop_at_option_boundary() -> None:
+    assert rust_v3_builder._sed_script_operands(
+        ("sed", "-i", "s/a/b/", "--", "-f/tmp/fix.sed", "src/lib.rs")
+    ) == ()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sed -i 's/a/b/' -- -f/tmp/fix.sed src/lib.rs",
+        "sed -ni 's/a/b/' -- -f/tmp/fix.sed src/lib.rs",
+    ],
+)
+def test_sed_in_place_option_boundary_fails_closed_without_scratch_creator(
+    command: str,
+) -> None:
+    scope = rust_v3_builder._mutation_scope(command, "/workspace/repo")
+    assert scope.repository_paths == ()
+    assert scope.scratch_paths == ()
+    assert scope.ambiguous is True
+
+    if command.startswith("sed -ni "):
+        return
+    analyzed, compressed = _decisive_fixture(
+        [(command, 0), ("cargo test", 0)],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    assert rust_v3_builder._build_decisive_suffix(analyzed, compressed)[1][
+        "reason"
+    ] == "ambiguous_mutation_path"
+
+
 def test_decisive_suffix_rejects_literal_scratch_input_without_original_creator():
     analyzed, compressed = _decisive_fixture(
         [

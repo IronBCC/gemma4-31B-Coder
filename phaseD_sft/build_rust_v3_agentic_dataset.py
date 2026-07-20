@@ -1098,6 +1098,125 @@ def _fragment_mutation_paths(tokens: Sequence[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(paths))
 
 
+def _literal_python_heredoc_path(command: str) -> str | None:
+    """Return the one proven literal Python-heredoc write path, else None."""
+    lines = command.splitlines()
+    if not lines:
+        return None
+    start = _HEREDOC_START_RE.search(lines[0])
+    if (
+        start is None
+        or start.group("strip")
+        or start.group("quote") != "'"
+        or lines[-1] != start.group("delimiter")
+    ):
+        return None
+
+    fragments = _shell_executable_fragments(command)
+    if not fragments:
+        return None
+    executable_fragments = fragments
+    if PurePosixPath(fragments[0][0][0]).name == "cd":
+        executable_fragments = fragments[1:]
+    if len(executable_fragments) != 1:
+        return None
+    tokens, following = executable_fragments[0]
+    if (
+        following is not None
+        or len(tokens) != 4
+        or PurePosixPath(tokens[0]).name != "python3"
+        or tokens[1] != "-"
+        or tokens[2] != "<<"
+        or tokens[3] != start.group("delimiter")
+    ):
+        return None
+
+    try:
+        module = ast.parse("\n".join(lines[1:-1]))
+    except (SyntaxError, ValueError):
+        return None
+
+    if len(module.body) != 5:
+        return None
+    import_stmt, path_stmt, read_stmt, replace_stmt, write_stmt = module.body
+    if not (
+        isinstance(import_stmt, ast.Import)
+        and len(import_stmt.names) == 1
+        and import_stmt.names[0].name == "pathlib"
+        and import_stmt.names[0].asname is None
+    ):
+        return None
+    if not (
+        isinstance(path_stmt, ast.Assign)
+        and path_stmt.type_comment is None
+        and len(path_stmt.targets) == 1
+        and isinstance(path_stmt.targets[0], ast.Name)
+        and isinstance(path_stmt.value, ast.Call)
+        and isinstance(path_stmt.value.func, ast.Attribute)
+        and isinstance(path_stmt.value.func.value, ast.Name)
+        and path_stmt.value.func.value.id == "pathlib"
+        and path_stmt.value.func.attr == "Path"
+        and len(path_stmt.value.args) == 1
+        and not path_stmt.value.keywords
+        and isinstance(path_stmt.value.args[0], ast.Constant)
+        and type(path_stmt.value.args[0].value) is str
+    ):
+        return None
+    path_name = path_stmt.targets[0].id
+    literal_path = path_stmt.value.args[0].value
+    if not (
+        isinstance(read_stmt, ast.Assign)
+        and read_stmt.type_comment is None
+        and len(read_stmt.targets) == 1
+        and isinstance(read_stmt.targets[0], ast.Name)
+        and isinstance(read_stmt.value, ast.Call)
+        and isinstance(read_stmt.value.func, ast.Attribute)
+        and isinstance(read_stmt.value.func.value, ast.Name)
+        and read_stmt.value.func.value.id == path_name
+        and read_stmt.value.func.attr == "read_text"
+        and not read_stmt.value.args
+        and not read_stmt.value.keywords
+    ):
+        return None
+    text_name = read_stmt.targets[0].id
+    if text_name == path_name:
+        return None
+    if not (
+        isinstance(replace_stmt, ast.Assign)
+        and replace_stmt.type_comment is None
+        and len(replace_stmt.targets) == 1
+        and isinstance(replace_stmt.targets[0], ast.Name)
+        and replace_stmt.targets[0].id == text_name
+        and isinstance(replace_stmt.value, ast.Call)
+        and isinstance(replace_stmt.value.func, ast.Attribute)
+        and isinstance(replace_stmt.value.func.value, ast.Name)
+        and replace_stmt.value.func.value.id == text_name
+        and replace_stmt.value.func.attr == "replace"
+        and len(replace_stmt.value.args) == 3
+        and not replace_stmt.value.keywords
+        and all(isinstance(value, ast.Constant) for value in replace_stmt.value.args)
+        and type(replace_stmt.value.args[0].value) is str
+        and type(replace_stmt.value.args[1].value) is str
+        and type(replace_stmt.value.args[2].value) is int
+        and replace_stmt.value.args[2].value == 1
+    ):
+        return None
+    if not (
+        isinstance(write_stmt, ast.Expr)
+        and isinstance(write_stmt.value, ast.Call)
+        and isinstance(write_stmt.value.func, ast.Attribute)
+        and isinstance(write_stmt.value.func.value, ast.Name)
+        and write_stmt.value.func.value.id == path_name
+        and write_stmt.value.func.attr == "write_text"
+        and len(write_stmt.value.args) == 1
+        and isinstance(write_stmt.value.args[0], ast.Name)
+        and write_stmt.value.args[0].id == text_name
+        and not write_stmt.value.keywords
+    ):
+        return None
+    return literal_path
+
+
 def _mutation_scope(command: str, declared_root: str) -> MutationScope:
     """Classify literal edit operands relative to one declared repository root."""
     root = _scope_path(declared_root, cwd=PurePosixPath("/"))
@@ -1123,6 +1242,8 @@ def _mutation_scope(command: str, declared_root: str) -> MutationScope:
         cwd = resolved_cwd
         start = 1
 
+    literal_python_path = _literal_python_heredoc_path(command)
+
     repository_paths: list[str] = []
     scratch_paths: list[str] = []
     for tokens, _following_operator in fragments[start:]:
@@ -1134,9 +1255,16 @@ def _mutation_scope(command: str, declared_root: str) -> MutationScope:
             return MutationScope((), (), True)
         executable = PurePosixPath(tokens[0]).name
         has_heredoc = "<<" in tokens or "<<-" in tokens
-        if has_heredoc and executable not in {"cat", "tee"}:
+        raw_paths: tuple[str, ...]
+        if has_heredoc and executable == "python3":
+            if literal_python_path is None:
+                return MutationScope((), (), True)
+            raw_paths = (literal_python_path,)
+        elif has_heredoc and executable not in {"cat", "tee"}:
             return MutationScope((), (), True)
-        for raw_path in _fragment_mutation_paths(tokens):
+        else:
+            raw_paths = _fragment_mutation_paths(tokens)
+        for raw_path in raw_paths:
             resolved = _scope_path(raw_path, cwd=cwd)
             if resolved is None:
                 return MutationScope((), (), True)

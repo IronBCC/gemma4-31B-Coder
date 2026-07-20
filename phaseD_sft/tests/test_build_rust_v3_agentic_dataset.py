@@ -644,6 +644,165 @@ def test_mutation_scope_distinguishes_repo_scratch_and_ambiguous(
     assert scope.ambiguous is ambiguous
 
 
+def _python_replace(path: str, *, path_name: str = "p", text_name: str = "s") -> str:
+    return (
+        "python3 - <<'PYEOF'\n"
+        "import pathlib\n"
+        f"{path_name} = pathlib.Path({path!r})\n"
+        f"{text_name} = {path_name}.read_text()\n"
+        f"{text_name} = {text_name}.replace('old', 'new', 1)\n"
+        f"{path_name}.write_text({text_name})\n"
+        "PYEOF"
+    )
+
+
+def _python_heredoc(statements: tuple[str, ...]) -> str:
+    return "python3 - <<'PYEOF'\n" + "\n".join(statements) + "\nPYEOF"
+
+
+_VALID_PYTHON_REPLACE_STATEMENTS = (
+    "import pathlib",
+    "p = pathlib.Path('src/lib.rs')",
+    "s = p.read_text()",
+    "s = s.replace('old', 'new', 1)",
+    "p.write_text(s)",
+)
+
+
+@pytest.mark.parametrize(
+    ("command", "repo", "scratch"),
+    [
+        (_python_replace("/workspace/repo/src/lib.rs"), ("src/lib.rs",), ()),
+        (
+            "cd /workspace/repo && " + _python_replace("src/lib.rs"),
+            ("src/lib.rs",),
+            (),
+        ),
+        (_python_replace("/tmp/repro.rs"), (), ("/tmp/repro.rs",)),
+        (
+            _python_replace("src/lib.rs", path_name="target", text_name="body"),
+            ("src/lib.rs",),
+            (),
+        ),
+    ],
+)
+def test_mutation_scope_accepts_exact_literal_python_replace(
+    command: str, repo: tuple[str, ...], scratch: tuple[str, ...]
+) -> None:
+    scope = rust_v3_builder._mutation_scope(command, "/workspace/repo")
+    assert scope == rust_v3_builder.MutationScope(repo, scratch, False)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        _python_replace("src/lib.rs").replace("<<'PYEOF'", "<<PYEOF", 1),
+        _python_replace("src/lib.rs").replace("python3 -", "python3 -u -", 1),
+        "env " + _python_replace("src/lib.rs"),
+        _python_replace("src/lib.rs") + "\necho done",
+        _python_replace("src/lib.rs").replace("PYEOF", "PYEOF2", 1),
+        _python_replace("src/lib.rs") + " | cat",
+    ],
+)
+def test_literal_python_heredoc_shell_deviations_remain_ambiguous(
+    command: str,
+) -> None:
+    scope = rust_v3_builder._mutation_scope(command, "/workspace/repo")
+    assert scope == rust_v3_builder.MutationScope((), (), True)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        _python_heredoc(
+            ("from pathlib import Path", *_VALID_PYTHON_REPLACE_STATEMENTS[1:])
+        ),
+        _python_heredoc(
+            ("import pathlib as p", *_VALID_PYTHON_REPLACE_STATEMENTS[1:])
+        ),
+        _python_heredoc(
+            (
+                _VALID_PYTHON_REPLACE_STATEMENTS[0],
+                "p = pathlib.Path(PATH)",
+                *_VALID_PYTHON_REPLACE_STATEMENTS[2:],
+            )
+        ),
+        _python_heredoc(_VALID_PYTHON_REPLACE_STATEMENTS[:-1]),
+        _python_heredoc((*_VALID_PYTHON_REPLACE_STATEMENTS, "pass")),
+        _python_heredoc(
+            (
+                *_VALID_PYTHON_REPLACE_STATEMENTS[:2],
+                "s = p.read_bytes()",
+                *_VALID_PYTHON_REPLACE_STATEMENTS[3:],
+            )
+        ),
+        _python_heredoc(
+            (*_VALID_PYTHON_REPLACE_STATEMENTS[:-1], "p.write_bytes(s)")
+        ),
+        _python_heredoc(
+            (
+                *_VALID_PYTHON_REPLACE_STATEMENTS[:2],
+                "s = open(p).read()",
+                *_VALID_PYTHON_REPLACE_STATEMENTS[3:],
+            )
+        ),
+        _python_heredoc(
+            (
+                *_VALID_PYTHON_REPLACE_STATEMENTS[:3],
+                "s = s.replace('old', 'new')",
+                _VALID_PYTHON_REPLACE_STATEMENTS[4],
+            )
+        ),
+        _python_heredoc(
+            (
+                *_VALID_PYTHON_REPLACE_STATEMENTS[:3],
+                "s = s.replace('old', 'new', len('x'))",
+                _VALID_PYTHON_REPLACE_STATEMENTS[4],
+            )
+        ),
+        _python_heredoc(
+            (
+                *_VALID_PYTHON_REPLACE_STATEMENTS[:3],
+                "s = s.replace('old', 'new', True)",
+                _VALID_PYTHON_REPLACE_STATEMENTS[4],
+            )
+        ),
+        _python_heredoc(
+            (
+                *_VALID_PYTHON_REPLACE_STATEMENTS[:3],
+                "s = other.replace('old', 'new', 1)",
+                _VALID_PYTHON_REPLACE_STATEMENTS[4],
+            )
+        ),
+        _python_heredoc(
+            (*_VALID_PYTHON_REPLACE_STATEMENTS[:-1], "p.write_text(other)")
+        ),
+        _python_heredoc(
+            ("import pathlib, os", *_VALID_PYTHON_REPLACE_STATEMENTS[1:])
+        ),
+        _python_heredoc((*_VALID_PYTHON_REPLACE_STATEMENTS, "os.system('true')")),
+        _python_heredoc((*_VALID_PYTHON_REPLACE_STATEMENTS, "subprocess.run([])")),
+        _python_heredoc((*_VALID_PYTHON_REPLACE_STATEMENTS, "for x in ():\n    pass")),
+        _python_heredoc((*_VALID_PYTHON_REPLACE_STATEMENTS, "if True:\n    pass")),
+        _python_heredoc(
+            (
+                *_VALID_PYTHON_REPLACE_STATEMENTS,
+                "try:\n    pass\nexcept Exception:\n    pass",
+            )
+        ),
+        _python_heredoc((*_VALID_PYTHON_REPLACE_STATEMENTS, "lambda: None")),
+        _python_heredoc((*_VALID_PYTHON_REPLACE_STATEMENTS, "[x for x in ()]")),
+        _python_heredoc((*_VALID_PYTHON_REPLACE_STATEMENTS, "eval('1')")),
+        _python_heredoc((*_VALID_PYTHON_REPLACE_STATEMENTS, "exec('pass')")),
+    ],
+)
+def test_literal_python_heredoc_ast_deviations_remain_ambiguous(
+    command: str,
+) -> None:
+    scope = rust_v3_builder._mutation_scope(command, "/workspace/repo")
+    assert scope == rust_v3_builder.MutationScope((), (), True)
+
+
 @pytest.mark.parametrize(
     "path",
     [
@@ -1057,6 +1216,34 @@ def test_decisive_suffix_keeps_gold_edits_through_first_trusted_success_verifica
     assert kept[-2:] == ["cargo test", rust_v3_builder._COMPLETE_COMMAND]
     assert result.final_edit_command_index == 4
     assert result.verification_command_index == 5
+
+
+def test_decisive_suffix_accepts_allowlisted_literal_python_writer() -> None:
+    analyzed, compressed = _decisive_fixture(
+        [(_python_replace("/workspace/repo/src/lib.rs"), 0), ("cargo test", 0)],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-old\n+new")),
+    )
+    result, report = rust_v3_builder._build_decisive_suffix(analyzed, compressed)
+    assert result is not None
+    assert report == {"kept": True}
+
+
+@pytest.mark.parametrize("path", ["tests/case.rs", "Cargo.lock", "README.md"])
+def test_decisive_suffix_keeps_python_writer_path_gates(path: str) -> None:
+    analyzed, compressed = _decisive_fixture(
+        [
+            ("sed -i s/old/new/ src/lib.rs", 0),
+            (_python_replace(f"/workspace/repo/{path}"), 0),
+            ("cargo test", 0),
+        ],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-old\n+new")),
+    )
+    result, report = rust_v3_builder._build_decisive_suffix(analyzed, compressed)
+    assert result is None
+    assert report["reason"] in {
+        "forbidden_mutation_path",
+        "nonallowlisted_repository_mutation",
+    }
 
 
 def test_decisive_suffix_rejects_later_valid_edit_without_later_verification():

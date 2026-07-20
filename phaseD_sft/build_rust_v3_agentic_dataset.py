@@ -138,6 +138,7 @@ class NativeTrajectory:
 class CompressedAgenticRow:
     identity: SourceIdentity
     messages: tuple[dict[str, Any], ...]
+    original_message_indices: tuple[int, ...]
     original_messages: tuple[dict[str, Any], ...]
     original_suffix_start: int
     compressed_suffix_start: int
@@ -1510,11 +1511,56 @@ def _native_message_pairs(
     return pairs, terminal_index
 
 
-def _command_mentions_literal_path(command: str, path: str) -> bool:
+def _repository_mutation_fragment_scratch_inputs(
+    command: str,
+    *,
+    declared_root: str,
+) -> set[str]:
     fragments = _shell_executable_fragments(command)
-    return bool(
-        fragments
-        and any(path in tokens for tokens, _operator in fragments)
+    if not fragments:
+        return set()
+    root = _scope_path(declared_root, cwd=PurePosixPath("/"))
+    if root is None:
+        return set()
+    cd_prefix: tuple[str, ...] | None = None
+    if PurePosixPath(fragments[0][0][0]).name == "cd":
+        cd_prefix = fragments[0][0]
+    scratch_inputs: set[str] = set()
+    for tokens, _operator in fragments:
+        if PurePosixPath(tokens[0]).name == "cd":
+            continue
+        fragment = _render_shell_fragment(tokens)
+        if cd_prefix is not None:
+            fragment = f"{_render_shell_fragment(cd_prefix)} && {fragment}"
+        scope = _mutation_scope(fragment, declared_root)
+        if (
+            not scope.ambiguous
+            and scope.repository_paths
+            and not scope.scratch_paths
+        ):
+            for token in tokens[1:]:
+                if not token.startswith("/") or token == "/dev/null":
+                    continue
+                resolved = _scope_path(token, cwd=root)
+                if resolved is None:
+                    continue
+                try:
+                    resolved.relative_to(root)
+                except ValueError:
+                    scratch_inputs.add(resolved.as_posix())
+    return scratch_inputs
+
+
+def _compressed_provenance_valid(compressed: CompressedAgenticRow) -> bool:
+    indices = compressed.original_message_indices
+    return (
+        len(indices) == len(compressed.messages)
+        and tuple(sorted(set(indices))) == indices
+        and all(0 <= index < len(compressed.original_messages) for index in indices)
+        and all(
+            message == compressed.original_messages[original_index]
+            for message, original_index in zip(compressed.messages, indices)
+        )
     )
 
 
@@ -1569,17 +1615,24 @@ def _build_decisive_suffix(
     analyzed: AnalyzedSourceRow,
     compressed: CompressedAgenticRow,
 ) -> tuple[DecisiveSuffix | None, dict[str, object]]:
-    """Keep the real edit-to-first-success suffix after fail-closed mutation checks."""
+    """Keep the real suffix through the final edit's first trusted verification."""
     allowlist = set(analyzed.patch_paths.textual_paths)
     if any(_forbidden_training_path(path) for path in allowlist):
         return None, _reject("forbidden_patch_path")
 
-    paired = _native_message_pairs(compressed.messages)
-    if paired is None:
+    compressed_pairing = _native_message_pairs(compressed.messages)
+    if compressed_pairing is None:
         return None, _reject("invalid_native_pairing")
-    native_pairs, terminal_index = paired
-    if compressed.compressed_suffix_start >= terminal_index:
+    _compressed_pairs, compressed_terminal_index = compressed_pairing
+    if compressed.compressed_suffix_start >= compressed_terminal_index:
         return None, _reject("invalid_suffix_boundary")
+    if not _compressed_provenance_valid(compressed):
+        return None, _reject("invalid_compressed_provenance")
+
+    original_pairing = _native_message_pairs(compressed.original_messages)
+    if original_pairing is None:
+        return None, _reject("invalid_native_pairing")
+    native_pairs, terminal_index = original_pairing
 
     declared_root = _declared_root(analyzed.trajectory)
     if declared_root is None:
@@ -1588,7 +1641,6 @@ def _build_decisive_suffix(
     classified: list[tuple[int, int, int, str, MutationScope]] = []
     seen_edit_commands: set[str] = set()
     repository_edits: list[tuple[int, int, int, str, MutationScope]] = []
-    verification: tuple[int, int, int, str, MutationScope] | None = None
     for command_index, (assistant_index, observation_index, command) in enumerate(
         native_pairs, start=1
     ):
@@ -1608,18 +1660,17 @@ def _build_decisive_suffix(
         classified.append(entry)
         if scope.repository_paths:
             repository_edits.append(entry)
-        if repository_edits and _trusted_rust_verification(
-            command, compressed.messages[observation_index]
-        ):
-            verification = entry
-            break
 
     if not repository_edits:
         return None, _reject("missing_repository_mutation")
     final_edit = repository_edits[-1]
-    final_edit_command_index, final_edit_assistant_index = final_edit[:2]
+    final_edit_assistant_index = final_edit[1]
 
     scratch_edits = [entry for entry in classified if entry[4].scratch_paths]
+    scratch_inputs = _repository_mutation_fragment_scratch_inputs(
+        final_edit[3],
+        declared_root=declared_root,
+    )
     if scratch_edits:
         valid_scratch = (
             len(scratch_edits) == 1
@@ -1629,10 +1680,21 @@ def _build_decisive_suffix(
         )
         if valid_scratch:
             scratch_path = scratch_edits[0][4].scratch_paths[0]
-            valid_scratch = _command_mentions_literal_path(final_edit[3], scratch_path)
+            valid_scratch = scratch_inputs == {scratch_path}
         if not valid_scratch:
             return None, _reject("invalid_scratch_chain")
+    elif scratch_inputs:
+        return None, _reject("invalid_scratch_chain")
 
+    verification: tuple[int, int, int, str, MutationScope] | None = None
+    for entry in classified:
+        if entry[1] <= final_edit_assistant_index:
+            continue
+        if _trusted_rust_verification(
+            entry[3], compressed.original_messages[entry[2]]
+        ):
+            verification = entry
+            break
     if verification is None:
         return None, _reject("missing_trusted_final_verification")
 
@@ -1651,12 +1713,19 @@ def _build_decisive_suffix(
         ):
             last_retained_index = following[1]
 
-    kept_indices = list(range(compressed.compressed_suffix_start))
-    kept_indices.extend(
-        range(compressed.compressed_suffix_start, last_retained_index + 1)
+    kept_indices = set(
+        compressed.original_message_indices[: compressed.compressed_suffix_start]
     )
-    kept_indices.append(terminal_index)
-    messages = tuple(copy.deepcopy(compressed.messages[index]) for index in kept_indices)
+    kept_indices.update(
+        range(compressed.original_suffix_start, last_retained_index + 1)
+    )
+    if scratch_edits:
+        kept_indices.update((scratch_edits[0][1], scratch_edits[0][2]))
+    kept_indices.add(terminal_index)
+    messages = tuple(
+        copy.deepcopy(compressed.original_messages[index])
+        for index in sorted(kept_indices)
+    )
 
     retained_pairing = _native_message_pairs(messages)
     if retained_pairing is None:
@@ -1671,11 +1740,32 @@ def _build_decisive_suffix(
     ):
         return None, _reject("first_edit_not_grounded")
 
+    retained_final_edit_index = -1
+    retained_verification_index = -1
+    for command_index, (
+        assistant_index,
+        observation_index,
+        command,
+    ) in enumerate(retained_pairs, start=1):
+        scope = _mutation_scope(command, declared_root)
+        if scope.repository_paths:
+            retained_final_edit_index = command_index
+            retained_verification_index = -1
+            continue
+        if (
+            retained_final_edit_index > 0
+            and retained_verification_index < 0
+            and _trusted_rust_verification(command, messages[observation_index])
+        ):
+            retained_verification_index = command_index
+    if retained_final_edit_index < 0 or retained_verification_index < 0:
+        return None, _reject("retained_decisive_indices_invalid")
+
     return (
         DecisiveSuffix(
             messages=messages,
-            final_edit_command_index=final_edit_command_index,
-            verification_command_index=verification[0],
+            final_edit_command_index=retained_final_edit_index,
+            verification_command_index=retained_verification_index,
         ),
         {"kept": True},
     )
@@ -1783,8 +1873,10 @@ def _compress_tracked_source_row_staged(
     kept_indices.update(range(original_suffix_start, len(converted.messages)))
     prefix_indices = sorted(index for index in kept_indices if index < original_suffix_start)
     compressed_suffix_start = len(prefix_indices)
+    original_message_indices = tuple(sorted(kept_indices))
     messages = tuple(
-        copy.deepcopy(converted.messages[index]) for index in sorted(kept_indices)
+        copy.deepcopy(converted.messages[index])
+        for index in original_message_indices
     )
     if messages[compressed_suffix_start:] != converted.messages[original_suffix_start:]:
         return None, _reject("suffix_preservation_failed"), frozenset(stages)
@@ -1793,6 +1885,7 @@ def _compress_tracked_source_row_staged(
         CompressedAgenticRow(
             identity=analyzed.identity,
             messages=messages,
+            original_message_indices=original_message_indices,
             original_messages=converted.messages,
             original_suffix_start=original_suffix_start,
             compressed_suffix_start=compressed_suffix_start,

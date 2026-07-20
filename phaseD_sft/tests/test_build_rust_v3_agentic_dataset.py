@@ -720,6 +720,42 @@ def test_mutation_scope_rejects_interpreter_command_strings(command: str) -> Non
     assert scope.ambiguous is True
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -lc 'rm tests/case.rs'",
+        "sh -ec 'git reset --hard HEAD'",
+        "zsh -fc 'touch Cargo.lock'",
+        "env bash -lc 'rm tests/case.rs'",
+    ],
+)
+def test_mutation_scope_rejects_combined_command_string_flags(
+    command: str,
+) -> None:
+    scope = rust_v3_builder._mutation_scope(command, "/workspace/repo")
+    assert scope.repository_paths == ()
+    assert scope.scratch_paths == ()
+    assert scope.ambiguous is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash script-c",
+        "bash --noprofile script-c",
+        "bash --command script-c",
+        "env bash script-c",
+    ],
+)
+def test_mutation_scope_does_not_treat_long_options_or_operands_as_short_c(
+    command: str,
+) -> None:
+    scope = rust_v3_builder._mutation_scope(command, "/workspace/repo")
+    assert scope.repository_paths == ()
+    assert scope.scratch_paths == ()
+    assert scope.ambiguous is False
+
+
 def _observation(rc: int) -> dict[str, object]:
     return {
         "role": "user",

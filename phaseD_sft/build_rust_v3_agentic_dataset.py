@@ -981,6 +981,22 @@ def _git_subcommand(tokens: Sequence[str]) -> str | None:
     return None
 
 
+def _interpreter_uses_command_string(tokens: Sequence[str]) -> bool:
+    if not tokens or PurePosixPath(tokens[0]).name not in _COMMAND_STRING_INTERPRETERS:
+        return False
+    for token in tokens[1:]:
+        if token == "--":
+            return False
+        if token.startswith("--"):
+            continue
+        if token.startswith("-") and len(token) > 1:
+            if "c" in token[1:]:
+                return True
+            continue
+        return False
+    return False
+
+
 def _unclassified_worktree_mutator(tokens: Sequence[str]) -> bool:
     executable = PurePosixPath(tokens[0]).name
     if executable in _UNCLASSIFIED_FILESYSTEM_MUTATORS:
@@ -991,7 +1007,7 @@ def _unclassified_worktree_mutator(tokens: Sequence[str]) -> bool:
         token in {"-delete", "-exec", "-execdir"} for token in tokens[1:]
     ):
         return True
-    if executable in _COMMAND_STRING_INTERPRETERS and "-c" in tokens[1:]:
+    if _interpreter_uses_command_string(tokens):
         return True
     if executable in _KNOWN_COMMAND_WRAPPERS:
         if any(
@@ -1005,10 +1021,7 @@ def _unclassified_worktree_mutator(tokens: Sequence[str]) -> bool:
                 _git_subcommand(tokens[index:]) in _GIT_WORKTREE_MUTATORS
             ):
                 return True
-            if (
-                nested_executable in _COMMAND_STRING_INTERPRETERS
-                and "-c" in tokens[index + 1 :]
-            ):
+            if _interpreter_uses_command_string(tokens[index:]):
                 return True
     return False
 

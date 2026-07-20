@@ -1164,6 +1164,8 @@ def _literal_python_heredoc_path(command: str) -> str | None:
         return None
     path_name = path_stmt.targets[0].id
     literal_path = path_stmt.value.args[0].value
+    if literal_path != literal_path.strip().strip("'\""):
+        return None
     if not (
         isinstance(read_stmt, ast.Assign)
         and read_stmt.type_comment is None

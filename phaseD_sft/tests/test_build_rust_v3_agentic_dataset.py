@@ -668,6 +668,16 @@ _VALID_PYTHON_REPLACE_STATEMENTS = (
     "p.write_text(s)",
 )
 
+_REINTERPRETED_PYTHON_PATHS = (
+    " src/lib.rs",
+    "src/lib.rs ",
+    "src/lib.rs\n",
+    "'src/lib.rs",
+    "src/lib.rs'",
+    '"src/lib.rs',
+    'src/lib.rs"',
+)
+
 
 @pytest.mark.parametrize(
     ("command", "repo", "scratch"),
@@ -691,6 +701,14 @@ def test_mutation_scope_accepts_exact_literal_python_replace(
 ) -> None:
     scope = rust_v3_builder._mutation_scope(command, "/workspace/repo")
     assert scope == rust_v3_builder.MutationScope(repo, scratch, False)
+
+
+@pytest.mark.parametrize("path", _REINTERPRETED_PYTHON_PATHS)
+def test_literal_python_path_identity_changes_remain_ambiguous(path: str) -> None:
+    scope = rust_v3_builder._mutation_scope(
+        _python_replace(path), "/workspace/repo"
+    )
+    assert scope == rust_v3_builder.MutationScope((), (), True)
 
 
 @pytest.mark.parametrize(
@@ -1226,6 +1244,23 @@ def test_decisive_suffix_accepts_allowlisted_literal_python_writer() -> None:
     result, report = rust_v3_builder._build_decisive_suffix(analyzed, compressed)
     assert result is not None
     assert report == {"kept": True}
+
+
+@pytest.mark.parametrize("path", _REINTERPRETED_PYTHON_PATHS)
+def test_decisive_suffix_rejects_literal_python_path_identity_changes(
+    path: str,
+) -> None:
+    analyzed, compressed = _decisive_fixture(
+        [
+            ("sed -i s/old/new/ src/lib.rs", 0),
+            (_python_replace(path), 0),
+            ("cargo test", 0),
+        ],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-old\n+new")),
+    )
+    result, report = rust_v3_builder._build_decisive_suffix(analyzed, compressed)
+    assert result is None
+    assert report["reason"] == "ambiguous_mutation_path"
 
 
 @pytest.mark.parametrize("path", ["tests/case.rs", "Cargo.lock", "README.md"])

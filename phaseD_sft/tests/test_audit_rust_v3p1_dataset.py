@@ -143,7 +143,17 @@ def _manifest(
         "per_config": {
             "open-swe/cfg/train": {
                 "scanned": row_count,
+                "resolved": row_count,
+                "rust": row_count,
                 "structurally_eligible": row_count,
+                "excluded": 0,
+                "grounding_passed": row_count,
+                "verification_passed": row_count,
+                "pairing_passed": row_count,
+                "repeat_read_streak_passed": row_count,
+                "compressed_eligible": row_count,
+                "task_selected": row_count,
+                "content_dedup_kept": row_count,
                 "token_budget_kept": row_count,
                 "drop_reasons": {},
             }
@@ -528,6 +538,48 @@ def test_auditor_rejects_inconsistent_manifest_telemetry_even_when_top_balances(
         manifest["arithmetic"]["rows_dropped"]
         + manifest["arithmetic"]["rows_output"]
     )
+    assert _audit(dataset)["violations"]["manifest_mismatch"] == 1
+
+
+def test_auditor_reconciles_builder_emitted_excluded_counter(tmp_path: Path) -> None:
+    dataset = _published_fixture(tmp_path, rows=_passing_rows())
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["per_config"]["open-swe/cfg/train"]["excluded"] = 999
+    manifest_path.write_bytes(_canonical(manifest) + b"\n")
+    assert _audit(dataset)["violations"]["manifest_mismatch"] == 1
+
+
+def test_auditor_requires_known_behavior_drop_reason_to_be_reported(
+    tmp_path: Path,
+) -> None:
+    dataset = _published_fixture(tmp_path, rows=_passing_rows())
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    config = manifest["per_config"]["open-swe/cfg/train"]
+    config["scanned"] = 61
+    config["structurally_eligible"] = 61
+    config["resolved"] = 61
+    config["rust"] = 61
+    config["pairing_passed"] = 61
+    config["verification_passed"] = 61
+    config["grounding_passed"] = 61
+    config["repeat_read_streak_passed"] = 61
+    config["compressed_eligible"] = 61
+    config["drop_reasons"] = {"missing_repository_mutation": 1}
+    manifest["drop_reasons"] = {"missing_repository_mutation": 1}
+    manifest["behavior_drop_reasons"] = {}
+    manifest["input_boundary"] = {
+        "expected_pre_exclusion_eligible": 61,
+        "actual_pre_exclusion_eligible": 61,
+    }
+    manifest["arithmetic"] = {
+        "rows_scanned": 61,
+        "rows_dropped": 1,
+        "rows_output": 60,
+        "balanced": True,
+    }
+    manifest_path.write_bytes(_canonical(manifest) + b"\n")
     assert _audit(dataset)["violations"]["manifest_mismatch"] == 1
 
 

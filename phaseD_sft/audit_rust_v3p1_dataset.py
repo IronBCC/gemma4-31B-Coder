@@ -41,6 +41,41 @@ _METADATA_FIELDS = (
     "verification_command_index",
     "max_read_streak",
 )
+_PER_CONFIG_COUNTER_FIELDS = frozenset(
+    {
+        "scanned",
+        "resolved",
+        "rust",
+        "structurally_eligible",
+        "excluded",
+        "grounding_passed",
+        "verification_passed",
+        "pairing_passed",
+        "repeat_read_streak_passed",
+        "compressed_eligible",
+        "task_selected",
+        "content_dedup_kept",
+        "token_budget_kept",
+    }
+)
+_V3P1_BEHAVIOR_DROP_REASONS = frozenset(
+    {
+        "ambiguous_mutation_path",
+        "first_edit_not_grounded",
+        "forbidden_mutation_path",
+        "forbidden_patch_path",
+        "invalid_compressed_provenance",
+        "invalid_native_pairing",
+        "invalid_scratch_chain",
+        "invalid_suffix_boundary",
+        "missing_repository_mutation",
+        "missing_trusted_final_verification",
+        "nonallowlisted_repository_mutation",
+        "repeated_edit_command",
+        "retained_decisive_indices_invalid",
+        "terminal_marker_not_last",
+    }
+)
 
 ZERO_VIOLATIONS = {
     "heldout_overlap": 0,
@@ -295,17 +330,56 @@ def _telemetry_matches(manifest: Mapping[str, Any]) -> bool:
             return False
         if not isinstance(counters, Mapping):
             return False
+        if set(counters) != _PER_CONFIG_COUNTER_FIELDS | {"drop_reasons"}:
+            return False
+        if not all(
+            _nonnegative_int(counters[field])
+            for field in _PER_CONFIG_COUNTER_FIELDS
+        ):
+            return False
         scanned = counters.get("scanned")
+        resolved = counters.get("resolved")
+        rust = counters.get("rust")
         output = counters.get("token_budget_kept")
         structurally_eligible = counters.get("structurally_eligible")
+        excluded = counters.get("excluded")
+        pairing_passed = counters.get("pairing_passed")
+        verification_passed = counters.get("verification_passed")
+        grounding_passed = counters.get("grounding_passed")
+        repeat_read_streak_passed = counters.get("repeat_read_streak_passed")
+        compressed_eligible = counters.get("compressed_eligible")
+        task_selected = counters.get("task_selected")
+        content_dedup_kept = counters.get("content_dedup_kept")
         config_drops = _count_mapping(counters.get("drop_reasons"))
         if (
-            not all(
-                _nonnegative_int(value)
-                for value in (scanned, output, structurally_eligible)
-            )
-            or config_drops is None
+            config_drops is None
             or scanned != output + sum(config_drops.values())
+            or resolved > scanned
+            or rust > scanned
+            or excluded > scanned
+            or structurally_eligible > resolved
+            or structurally_eligible > rust
+            or not (
+                structurally_eligible
+                >= pairing_passed
+                >= verification_passed
+                >= grounding_passed
+                >= repeat_read_streak_passed
+                >= compressed_eligible
+            )
+            or excluded != config_drops.get("excluded_task_id", 0)
+            or compressed_eligible
+            != task_selected
+            + config_drops.get("task_shorter_candidate", 0)
+            + sum(
+                count
+                for reason, count in config_drops.items()
+                if reason in _V3P1_BEHAVIOR_DROP_REASONS
+            )
+            or task_selected
+            != content_dedup_kept + config_drops.get("content_duplicate", 0)
+            or content_dedup_kept
+            != output + config_drops.get("token_budget_exceeded", 0)
         ):
             return False
         scanned_sum += scanned
@@ -315,17 +389,17 @@ def _telemetry_matches(manifest: Mapping[str, Any]) -> bool:
 
     expected_boundary = boundary.get("expected_pre_exclusion_eligible")
     actual_boundary = boundary.get("actual_pre_exclusion_eligible")
+    expected_behavior_drops = {
+        reason: count
+        for reason, count in global_drops.items()
+        if reason in _V3P1_BEHAVIOR_DROP_REASONS
+    }
     return bool(
         scanned_sum == rows_scanned
         and output_sum == rows_output
         and dict(sorted(per_reason.items())) == dict(sorted(global_drops.items()))
         and sum(global_drops.values()) == rows_dropped
-        and all(
-            reason in global_drops
-            and count == global_drops[reason]
-            and count == per_reason[reason]
-            for reason, count in behavior_drops.items()
-        )
+        and behavior_drops == expected_behavior_drops
         and _nonnegative_int(expected_boundary)
         and _nonnegative_int(actual_boundary)
         and expected_boundary == structurally_eligible_sum

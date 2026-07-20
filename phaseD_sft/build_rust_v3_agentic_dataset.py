@@ -859,6 +859,23 @@ _GIT_WORKTREE_MUTATORS = frozenset(
         "worktree",
     }
 )
+_KNOWN_COMMAND_WRAPPERS = frozenset(
+    {"command", "builtin", "env", "sudo", "xargs"}
+)
+_COMMAND_STRING_INTERPRETERS = frozenset(
+    {
+        "bash",
+        "dash",
+        "fish",
+        "ksh",
+        "python",
+        "python3",
+        "pypy",
+        "pypy3",
+        "sh",
+        "zsh",
+    }
+)
 
 
 def _mask_quoted_shell_controls(command: str) -> str:
@@ -974,11 +991,25 @@ def _unclassified_worktree_mutator(tokens: Sequence[str]) -> bool:
         token in {"-delete", "-exec", "-execdir"} for token in tokens[1:]
     ):
         return True
-    if executable in {"command", "builtin", "env", "sudo", "xargs"}:
-        return any(
+    if executable in _COMMAND_STRING_INTERPRETERS and "-c" in tokens[1:]:
+        return True
+    if executable in _KNOWN_COMMAND_WRAPPERS:
+        if any(
             PurePosixPath(token).name in _UNCLASSIFIED_FILESYSTEM_MUTATORS
             for token in tokens[1:]
-        )
+        ):
+            return True
+        for index, token in enumerate(tokens[1:], start=1):
+            nested_executable = PurePosixPath(token).name
+            if nested_executable == "git" and (
+                _git_subcommand(tokens[index:]) in _GIT_WORKTREE_MUTATORS
+            ):
+                return True
+            if (
+                nested_executable in _COMMAND_STRING_INTERPRETERS
+                and "-c" in tokens[index + 1 :]
+            ):
+                return True
     return False
 
 

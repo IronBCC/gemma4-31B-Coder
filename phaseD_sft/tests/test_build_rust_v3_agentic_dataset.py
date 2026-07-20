@@ -685,6 +685,41 @@ def test_mutation_scope_rejects_unclassified_worktree_mutators(
     assert scope.ambiguous is True
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "command git reset --hard HEAD",
+        "env git checkout -- src/lib.rs",
+        "sudo git clean -fd",
+        "xargs git reset --hard HEAD",
+        "env FOO=1 git checkout -- src/lib.rs",
+        "sudo -u root git clean -fd",
+    ],
+)
+def test_mutation_scope_rejects_wrapped_git_worktree_mutators(
+    command: str,
+) -> None:
+    scope = rust_v3_builder._mutation_scope(command, "/workspace/repo")
+    assert scope.repository_paths == ()
+    assert scope.scratch_paths == ()
+    assert scope.ambiguous is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sh -c 'git reset --hard HEAD'",
+        "bash -c 'rm tests/case.rs'",
+        "python3 -c \"import os; os.remove('tests/case.rs')\"",
+    ],
+)
+def test_mutation_scope_rejects_interpreter_command_strings(command: str) -> None:
+    scope = rust_v3_builder._mutation_scope(command, "/workspace/repo")
+    assert scope.repository_paths == ()
+    assert scope.scratch_paths == ()
+    assert scope.ambiguous is True
+
+
 def _observation(rc: int) -> dict[str, object]:
     return {
         "role": "user",

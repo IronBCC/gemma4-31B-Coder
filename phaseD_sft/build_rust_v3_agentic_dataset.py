@@ -85,6 +85,13 @@ _ZERO_V3P1_INVARIANTS = {
     "unbalanced_pairs": 0,
     "terminal_not_last": 0,
 }
+_V3P1_METADATA_FIELDS = (
+    "content_sha256",
+    "first_edit_command_index",
+    "final_edit_command_index",
+    "verification_command_index",
+    "max_read_streak",
+)
 
 
 @dataclass(frozen=True)
@@ -2646,8 +2653,80 @@ def _audit_v3p1_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
     return invariants
 
 
+def _derive_v3p1_row_metadata(
+    row: Mapping[str, Any],
+) -> dict[str, str | int] | None:
+    messages = row.get("messages")
+    declared_root = row.get("declared_root")
+    if not isinstance(messages, list) or not isinstance(declared_root, str):
+        return None
+    pairing = _native_message_pairs(messages)
+    if pairing is None:
+        return None
+    pairs, _terminal_index = pairing
+
+    first_edit_command_index = -1
+    final_edit_command_index = -1
+    for command_index, (_assistant, _observation, command) in enumerate(
+        pairs, start=1
+    ):
+        scope = _mutation_scope(command, declared_root)
+        if scope.ambiguous:
+            return None
+        if scope.repository_paths:
+            if first_edit_command_index < 0:
+                first_edit_command_index = command_index
+            final_edit_command_index = command_index
+    if first_edit_command_index < 0:
+        return None
+
+    verification_command_index = -1
+    for command_index, (_assistant, observation_index, command) in enumerate(
+        pairs, start=1
+    ):
+        if command_index <= final_edit_command_index:
+            continue
+        if _trusted_rust_verification(command, messages[observation_index]):
+            verification_command_index = command_index
+            break
+    if verification_command_index < 0:
+        return None
+
+    return {
+        "content_sha256": _sha256_bytes(_canonical_json(messages)),
+        "first_edit_command_index": first_edit_command_index,
+        "final_edit_command_index": final_edit_command_index,
+        "verification_command_index": verification_command_index,
+        "max_read_streak": _max_read_streak(messages),
+    }
+
+
+def _audit_v3p1_metadata(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    field_mismatches = {field: 0 for field in _V3P1_METADATA_FIELDS}
+    for row in rows:
+        derived = _derive_v3p1_row_metadata(row)
+        if derived is None:
+            for field in _V3P1_METADATA_FIELDS:
+                field_mismatches[field] += 1
+            continue
+        for field in _V3P1_METADATA_FIELDS:
+            expected = derived[field]
+            actual = row.get(field)
+            if type(actual) is not type(expected) or actual != expected:
+                field_mismatches[field] += 1
+    return {
+        "rows_checked": len(rows),
+        "mismatch_count": sum(field_mismatches.values()),
+        "field_mismatches": field_mismatches,
+    }
+
+
 def _v3p1_publication_gate(
-    rows: Sequence[Mapping[str, Any]], invariants: Mapping[str, int]
+    rows: Sequence[Mapping[str, Any]],
+    invariants: Mapping[str, int],
+    metadata: Mapping[str, Any],
 ) -> dict[str, Any]:
     row_count = len(rows)
     repository_count = len({str(row["repository"]) for row in rows})
@@ -2674,9 +2753,16 @@ def _v3p1_publication_gate(
             "required": 0,
             "passed": dict(invariants) == _ZERO_V3P1_INVARIANTS,
         },
+        "metadata_binding": {
+            "required_mismatches": 0,
+            "measured_mismatches": metadata.get("mismatch_count"),
+            "passed": metadata.get("mismatch_count") == 0,
+        },
     }
     if not evidence["post_build_invariants"]["passed"]:
         raise ValueError("post-build invariant gate failed")
+    if not evidence["metadata_binding"]["passed"]:
+        raise ValueError("metadata binding gate failed")
     if not evidence["minimum_rows"]["passed"]:
         raise ValueError("minimum row gate failed")
     if not evidence["minimum_repositories"]["passed"]:
@@ -2813,7 +2899,10 @@ def build_streaming_dataset(
     behavior_manifest: dict[str, Any] = {}
     if inputs.behavior_contract == "v3p1":
         invariants = _audit_v3p1_rows(rows)
-        publication_gates = _v3p1_publication_gate(rows, invariants)
+        metadata = _audit_v3p1_metadata(rows)
+        publication_gates = _v3p1_publication_gate(
+            rows, invariants, metadata
+        )
         behavior_manifest = {
             "final_edit_histogram": dict(
                 sorted(
@@ -2830,6 +2919,7 @@ def build_streaming_dataset(
                 )
             ),
             "post_build_invariants": invariants,
+            "post_build_metadata": metadata,
             "publication_gates": publication_gates,
         }
 

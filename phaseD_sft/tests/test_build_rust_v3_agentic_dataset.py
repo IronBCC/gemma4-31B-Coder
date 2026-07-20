@@ -2249,10 +2249,58 @@ def test_default_v3_matches_explicit_v3_and_omits_v3p1_row_fields(
         payloads.append((output / "dataset.jsonl").read_bytes())
 
     assert payloads[0] == payloads[1]
+    assert len(payloads[0]) == 1_523
+    assert hashlib.sha256(payloads[0]).hexdigest() == (
+        "042b188ecfcf8931b71ef433e918d563863c3222b051937f97e151a917366bf5"
+    )
     assert manifests[0]["per_config"] == manifests[1]["per_config"]
+    assert manifests[0]["per_config"] == {
+        "open-swe/cfg/train": {
+            "compressed_eligible": 1,
+            "content_dedup_kept": 1,
+            "excluded": 0,
+            "grounding_passed": 1,
+            "pairing_passed": 1,
+            "repeat_read_streak_passed": 1,
+            "resolved": 1,
+            "rust": 1,
+            "scanned": 1,
+            "structurally_eligible": 1,
+            "task_selected": 1,
+            "token_budget_kept": 1,
+            "verification_passed": 1,
+            "drop_reasons": {},
+        }
+    }
     assert manifests[0]["drop_reasons"] == manifests[1]["drop_reasons"]
+    assert manifests[0]["arithmetic"] == {
+        "rows_scanned": 1,
+        "rows_dropped": 0,
+        "rows_output": 1,
+        "balanced": True,
+    }
     assert manifests[0]["behavior_contract"] == "v3"
     row = json.loads(payloads[0])
+    assert {
+        key: row[key]
+        for key in (
+            "content_sha256",
+            "first_edit_command_index",
+            "max_read_streak",
+            "task_id",
+            "trajectory_id",
+            "tokens",
+        )
+    } == {
+        "content_sha256": (
+            "1cf1a23873faf3c18da863f324962a7828055b612a10d30215168bd7a12f513b"
+        ),
+        "first_edit_command_index": 2,
+        "max_read_streak": 1,
+        "task_id": "owner__crate-1",
+        "trajectory_id": "trajectory-1",
+        "tokens": 1280,
+    }
     assert "final_edit_command_index" not in row
     assert "verification_command_index" not in row
     assert "textual_patch_allowlist" not in row
@@ -2338,7 +2386,82 @@ def test_v3p1_gates_before_selection_and_safe_longer_candidate_wins(
             "passed": True,
         },
         "post_build_invariants": {"required": 0, "passed": True},
+        "metadata_binding": {
+            "required_mismatches": 0,
+            "measured_mismatches": 0,
+            "passed": True,
+        },
     }
+    assert manifest["post_build_metadata"] == {
+        "rows_checked": 60,
+        "mismatch_count": 0,
+        "field_mismatches": {
+            "content_sha256": 0,
+            "first_edit_command_index": 0,
+            "final_edit_command_index": 0,
+            "verification_command_index": 0,
+            "max_read_streak": 0,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value", "corrupt_all"),
+    [
+        ("content_sha256", "0" * 64, False),
+        ("first_edit_command_index", 1, True),
+        ("final_edit_command_index", 999, False),
+        ("verification_command_index", 999, False),
+        ("max_read_streak", 999, False),
+    ],
+)
+def test_v3p1_final_metadata_mismatch_fails_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    bad_value: object,
+    corrupt_all: bool,
+) -> None:
+    exclusion = _exclusion_file(tmp_path / "exclude.jsonl", [])
+    inputs = BuildInputs(
+        **{
+            **_build_inputs(exclusion, [], boundary=61).__dict__,
+            "behavior_contract": "v3p1",
+        }
+    )
+    original_scan = rust_v3_builder._scan_streams
+
+    def corrupting_scan(*args, **kwargs):
+        scan = original_scan(*args, **kwargs)
+        targets = scan.candidates if corrupt_all else scan.candidates[:1]
+        for candidate in targets:
+            candidate[field] = bad_value
+        return scan
+
+    monkeypatch.setattr(rust_v3_builder, "_scan_streams", corrupting_scan)
+    published = False
+
+    def forbidden_publish(_rows, _path) -> None:
+        nonlocal published
+        published = True
+
+    output = tmp_path / "missing-parent" / "out"
+    with pytest.raises(ValueError, match="metadata binding gate"):
+        build_streaming_dataset(
+            [
+                SourceRowStream(
+                    "open-swe", "cfg", "train", iter(_v3p1_input_rows())
+                )
+            ],
+            output_dir=output,
+            inputs=inputs,
+            count_rendered_tokens=lambda messages: len(json.dumps(messages)),
+            publish_hf=forbidden_publish,
+            progress_every=0,
+        )
+
+    assert not output.parent.exists()
+    assert published is False
 
 
 def test_v3p1_audit_only_runs_behavior_gate_and_counts_drop(
@@ -2396,9 +2519,16 @@ def test_v3p1_publication_gate_fails_closed_for_every_gate(
             row["first_edit_command_index"] = 5
     else:
         invariants["repeated_edit_commands"] = 1
+    metadata = {
+        "rows_checked": len(rows),
+        "mismatch_count": 0,
+        "field_mismatches": {
+            field: 0 for field in rust_v3_builder._V3P1_METADATA_FIELDS
+        },
+    }
 
     with pytest.raises(ValueError, match=message):
-        rust_v3_builder._v3p1_publication_gate(rows, invariants)
+        rust_v3_builder._v3p1_publication_gate(rows, invariants, metadata)
 
 
 def test_streaming_build_selects_shortest_per_task_then_content_dedups_and_budgets(

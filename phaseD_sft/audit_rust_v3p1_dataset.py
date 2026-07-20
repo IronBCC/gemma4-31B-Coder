@@ -30,7 +30,10 @@ from phaseD_sft.build_rust_v3_agentic_dataset import (
 
 RenderedTokenCounter = Callable[[list[dict[str, Any]]], int]
 _COMPLETE_COMMAND = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
-_MAX_TOKENS = 49_152
+MIN_ROWS = 60
+MIN_REPOSITORIES = 35
+MAX_MEDIAN_FIRST_EDIT = 4
+MAX_TOKENS = 49_152
 _METADATA_FIELDS = (
     "content_sha256",
     "first_edit_command_index",
@@ -239,6 +242,97 @@ def _histogram(rows: Sequence[Mapping[str, Any]], field: str) -> dict[str, int]:
         return {}
 
 
+def _nonnegative_int(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _count_mapping(value: object) -> dict[str, int] | None:
+    if not isinstance(value, Mapping):
+        return None
+    counts: dict[str, int] = {}
+    for key, count in value.items():
+        if not isinstance(key, str) or not key or not _nonnegative_int(count):
+            return None
+        counts[key] = count
+    return counts
+
+
+def _telemetry_matches(manifest: Mapping[str, Any]) -> bool:
+    arithmetic = manifest.get("arithmetic")
+    per_config = manifest.get("per_config")
+    global_drops = _count_mapping(manifest.get("drop_reasons"))
+    behavior_drops = _count_mapping(manifest.get("behavior_drop_reasons"))
+    boundary = manifest.get("input_boundary")
+    if (
+        not isinstance(arithmetic, Mapping)
+        or not isinstance(per_config, Mapping)
+        or not per_config
+        or global_drops is None
+        or behavior_drops is None
+        or not isinstance(boundary, Mapping)
+    ):
+        return False
+
+    rows_scanned = arithmetic.get("rows_scanned")
+    rows_dropped = arithmetic.get("rows_dropped")
+    rows_output = arithmetic.get("rows_output")
+    if (
+        not all(
+            _nonnegative_int(value)
+            for value in (rows_scanned, rows_dropped, rows_output)
+        )
+        or arithmetic.get("balanced") is not True
+        or rows_scanned != rows_dropped + rows_output
+    ):
+        return False
+
+    scanned_sum = 0
+    output_sum = 0
+    structurally_eligible_sum = 0
+    per_reason: Counter[str] = Counter()
+    for config_key, counters in per_config.items():
+        if not isinstance(config_key, str) or not config_key:
+            return False
+        if not isinstance(counters, Mapping):
+            return False
+        scanned = counters.get("scanned")
+        output = counters.get("token_budget_kept")
+        structurally_eligible = counters.get("structurally_eligible")
+        config_drops = _count_mapping(counters.get("drop_reasons"))
+        if (
+            not all(
+                _nonnegative_int(value)
+                for value in (scanned, output, structurally_eligible)
+            )
+            or config_drops is None
+            or scanned != output + sum(config_drops.values())
+        ):
+            return False
+        scanned_sum += scanned
+        output_sum += output
+        structurally_eligible_sum += structurally_eligible
+        per_reason.update(config_drops)
+
+    expected_boundary = boundary.get("expected_pre_exclusion_eligible")
+    actual_boundary = boundary.get("actual_pre_exclusion_eligible")
+    return bool(
+        scanned_sum == rows_scanned
+        and output_sum == rows_output
+        and dict(sorted(per_reason.items())) == dict(sorted(global_drops.items()))
+        and sum(global_drops.values()) == rows_dropped
+        and all(
+            reason in global_drops
+            and count == global_drops[reason]
+            and count == per_reason[reason]
+            for reason, count in behavior_drops.items()
+        )
+        and _nonnegative_int(expected_boundary)
+        and _nonnegative_int(actual_boundary)
+        and expected_boundary == structurally_eligible_sum
+        and actual_boundary == structurally_eligible_sum
+    )
+
+
 def _manifest_matches_rows(
     manifest: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]
 ) -> bool:
@@ -283,14 +377,9 @@ def _manifest_matches_rows(
         arithmetic = manifest.get("arithmetic")
         if not isinstance(arithmetic, Mapping):
             return False
-        scanned = arithmetic.get("rows_scanned")
-        dropped = arithmetic.get("rows_dropped")
         arithmetic_matches = (
-            type(scanned) is int
-            and type(dropped) is int
-            and arithmetic.get("rows_output") == row_count
-            and arithmetic.get("balanced") is (scanned == dropped + row_count)
-            and scanned == dropped + row_count
+            arithmetic.get("rows_output") == row_count
+            and _telemetry_matches(manifest)
         )
         rows_digest = _sha256(b"".join(_canonical_json(row) for row in rows))
         task_digest = canonical_id_sha256(str(row["task_id"]) for row in rows)
@@ -319,27 +408,77 @@ def _manifest_matches_rows(
         median_first_edit = _percentile(
             [int(row["first_edit_command_index"]) for row in rows], 50
         )
+        invariants_zero = all(
+            type(value) is int and value == 0
+            for value in expected_invariants.values()
+        )
+        metadata_zero = (
+            metadata["mismatch_count"] == 0
+            and all(
+                type(value) is int and value == 0
+                for value in metadata["field_mismatches"].values()
+            )
+        )
+        manifest_invariants = manifest.get("post_build_invariants")
+        manifest_metadata = manifest.get("post_build_metadata")
+        manifest_invariants_typed = (
+            isinstance(manifest_invariants, Mapping)
+            and set(manifest_invariants) == set(expected_invariants)
+            and all(
+                type(value) is int and value == 0
+                for value in manifest_invariants.values()
+            )
+        )
+        manifest_metadata_typed = (
+            isinstance(manifest_metadata, Mapping)
+            and type(manifest_metadata.get("rows_checked")) is int
+            and manifest_metadata.get("rows_checked") == row_count
+            and type(manifest_metadata.get("mismatch_count")) is int
+            and manifest_metadata.get("mismatch_count") == 0
+            and isinstance(manifest_metadata.get("field_mismatches"), Mapping)
+            and set(manifest_metadata["field_mismatches"]) == set(_METADATA_FIELDS)
+            and all(
+                type(value) is int and value == 0
+                for value in manifest_metadata["field_mismatches"].values()
+            )
+        )
         gate_matches = (
-            minimum_rows.get("measured") == row_count
-            and minimum_rows.get("passed")
-            is (row_count >= int(minimum_rows.get("threshold")))
+            type(minimum_rows.get("threshold")) is int
+            and minimum_rows.get("threshold") == MIN_ROWS
+            and type(minimum_rows.get("measured")) is int
+            and minimum_rows.get("measured") == row_count
+            and minimum_rows.get("passed") is True
+            and row_count >= MIN_ROWS
+            and type(minimum_repositories.get("threshold")) is int
+            and minimum_repositories.get("threshold") == MIN_REPOSITORIES
+            and type(minimum_repositories.get("measured")) is int
             and minimum_repositories.get("measured") == repository_count
-            and minimum_repositories.get("passed")
-            is (repository_count >= int(minimum_repositories.get("threshold")))
+            and minimum_repositories.get("passed") is True
+            and repository_count >= MIN_REPOSITORIES
+            and type(median_gate.get("threshold")) is int
+            and median_gate.get("threshold") == MAX_MEDIAN_FIRST_EDIT
+            and type(median_gate.get("measured")) is int
             and median_gate.get("measured") == median_first_edit
-            and median_gate.get("passed")
-            is (median_first_edit <= int(median_gate.get("threshold")))
+            and median_gate.get("passed") is True
+            and median_first_edit <= MAX_MEDIAN_FIRST_EDIT
+            and type(invariant_gate.get("required")) is int
             and invariant_gate.get("required") == 0
-            and invariant_gate.get("passed") is (not any(expected_invariants.values()))
+            and invariant_gate.get("passed") is True
+            and invariants_zero
+            and type(metadata_gate.get("required_mismatches")) is int
             and metadata_gate.get("required_mismatches") == 0
-            and metadata_gate.get("measured_mismatches")
-            == metadata["mismatch_count"]
-            and metadata_gate.get("passed") is (metadata["mismatch_count"] == 0)
+            and type(metadata_gate.get("measured_mismatches")) is int
+            and metadata_gate.get("measured_mismatches") == 0
+            and metadata_gate.get("passed") is True
+            and metadata_zero
+            and manifest_invariants_typed
+            and manifest_metadata_typed
         )
         return bool(
             manifest.get("schema_version") == 1
             and manifest.get("behavior_contract") == "v3p1"
-            and manifest.get("max_tokens") == _MAX_TOKENS
+            and type(manifest.get("max_tokens")) is int
+            and manifest.get("max_tokens") == MAX_TOKENS
             and manifest.get("rows_output") == row_count
             and arithmetic_matches
             and manifest.get("output_rows_sha256") == rows_digest
@@ -355,8 +494,8 @@ def _manifest_matches_rows(
             == _histogram(rows, "final_edit_command_index")
             and manifest.get("verification_histogram")
             == _histogram(rows, "verification_command_index")
-            and manifest.get("post_build_invariants") == expected_invariants
-            and manifest.get("post_build_metadata") == metadata
+            and manifest_invariants == expected_invariants
+            and manifest_metadata == metadata
             and gate_matches
         )
     except (KeyError, TypeError, ValueError):
@@ -405,7 +544,7 @@ def audit_published_dataset(
         )
         violations["token_overflow"] += (
             type(actual_tokens) is not int
-            or not 0 < actual_tokens <= _MAX_TOKENS
+            or not 0 < actual_tokens <= MAX_TOKENS
         )
     manifest_matches = (
         manifest.get("output_jsonl_sha256") == _sha256(dataset_bytes)

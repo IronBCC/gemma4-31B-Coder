@@ -1275,6 +1275,73 @@ def test_decisive_suffix_rejects_token_only_false_scratch_consume_after_real_com
     ] == "invalid_scratch_chain"
 
 
+def test_decisive_suffix_rejects_path_printed_into_repo_as_scratch_consume():
+    analyzed, compressed = _real_compressed_decisive_fixture(
+        [
+            ("cat > /tmp/fix.sed <<'EOF'\ns/a/b/\nEOF", 0),
+            ("printf %s /tmp/fix.sed > src/lib.rs", 0),
+            ("cargo test", 0),
+        ],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    assert rust_v3_builder._build_decisive_suffix(analyzed, compressed)[1][
+        "reason"
+    ] == "invalid_scratch_chain"
+
+
+def test_decisive_suffix_rejects_scratch_edit_that_requires_preexisting_state():
+    analyzed, compressed = _real_compressed_decisive_fixture(
+        [
+            ("sed -i s/x/y/ /tmp/fix.sed", 0),
+            ("sed -i -f /tmp/fix.sed src/lib.rs", 0),
+            ("cargo test", 0),
+        ],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    assert rust_v3_builder._build_decisive_suffix(analyzed, compressed)[1][
+        "reason"
+    ] == "invalid_scratch_chain"
+
+
+def test_decisive_suffix_rejects_failed_literal_scratch_creator():
+    analyzed, compressed = _real_compressed_decisive_fixture(
+        [
+            ("cat > /tmp/fix.sed <<'EOF'\ns/a/b/\nEOF", 1),
+            ("sed -i -f /tmp/fix.sed src/lib.rs", 0),
+            ("cargo test", 0),
+        ],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    assert rust_v3_builder._build_decisive_suffix(analyzed, compressed)[1][
+        "reason"
+    ] == "invalid_scratch_chain"
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        "sed -i -f /tmp/fix.sed src/lib.rs",
+        "sed -i -f/tmp/fix.sed src/lib.rs",
+        "sed -i --file /tmp/fix.sed src/lib.rs",
+        "sed -i --file=/tmp/fix.sed src/lib.rs",
+    ],
+)
+def test_decisive_suffix_accepts_supported_sed_scratch_input_options(
+    edit: str,
+) -> None:
+    analyzed, compressed = _real_compressed_decisive_fixture(
+        [
+            ("cat > /tmp/fix.sed <<'EOF'\ns/a/b/\nEOF", 0),
+            (edit, 0),
+            ("cargo test", 0),
+        ],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    result, report = rust_v3_builder._build_decisive_suffix(analyzed, compressed)
+    assert report == {"kept": True}
+    assert result is not None
+
+
 def test_decisive_suffix_rejects_literal_scratch_input_without_original_creator():
     analyzed, compressed = _decisive_fixture(
         [
@@ -1300,6 +1367,67 @@ def test_decisive_suffix_scans_dropped_pre_edit_nonallowlisted_mutation():
     assert rust_v3_builder._build_decisive_suffix(analyzed, compressed)[1][
         "reason"
     ] == "nonallowlisted_repository_mutation"
+
+
+def test_decisive_suffix_rejects_safe_compressed_messages_for_unsafe_analyzed_row():
+    safe_analyzed, safe_compressed = _real_compressed_decisive_fixture(
+        [("sed -i s/a/b/ src/lib.rs", 0), ("cargo test", 0)],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    unsafe_analyzed, _unsafe_compressed = _real_compressed_decisive_fixture(
+        [
+            ("cat > README_FIX.md <<'EOF'\nsummary\nEOF", 0),
+            ("sed -i s/a/b/ src/lib.rs", 0),
+            ("cargo test", 0),
+        ],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    assert safe_analyzed.identity == unsafe_analyzed.identity
+    assert rust_v3_builder._build_decisive_suffix(
+        unsafe_analyzed, safe_compressed
+    )[1]["reason"] == "invalid_compressed_provenance"
+
+
+def test_decisive_suffix_rejects_unsafe_compressed_messages_for_safe_analyzed_row():
+    safe_analyzed, _safe_compressed = _real_compressed_decisive_fixture(
+        [("sed -i s/a/b/ src/lib.rs", 0), ("cargo test", 0)],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    _unsafe_analyzed, unsafe_compressed = _real_compressed_decisive_fixture(
+        [
+            ("cat > README_FIX.md <<'EOF'\nsummary\nEOF", 0),
+            ("sed -i s/a/b/ src/lib.rs", 0),
+            ("cargo test", 0),
+        ],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    assert rust_v3_builder._build_decisive_suffix(
+        safe_analyzed, unsafe_compressed
+    )[1]["reason"] == "invalid_compressed_provenance"
+
+
+def test_decisive_suffix_rejects_compressed_identity_mismatch():
+    analyzed, compressed = _real_compressed_decisive_fixture(
+        [("sed -i s/a/b/ src/lib.rs", 0), ("cargo test", 0)],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    mismatched = rust_v3_builder.CompressedAgenticRow(
+        identity=rust_v3_builder.SourceIdentity(
+            task_id=compressed.identity.task_id,
+            repository=compressed.identity.repository,
+            trajectory_id="different-trajectory",
+            config=compressed.identity.config,
+            split=compressed.identity.split,
+        ),
+        messages=compressed.messages,
+        original_message_indices=compressed.original_message_indices,
+        original_messages=compressed.original_messages,
+        original_suffix_start=compressed.original_suffix_start,
+        compressed_suffix_start=compressed.compressed_suffix_start,
+    )
+    assert rust_v3_builder._build_decisive_suffix(analyzed, mismatched)[1][
+        "reason"
+    ] == "invalid_compressed_provenance"
 
 
 @pytest.mark.parametrize(

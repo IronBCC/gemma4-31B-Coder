@@ -1511,6 +1511,27 @@ def _native_message_pairs(
     return pairs, terminal_index
 
 
+def _sed_script_operands(tokens: Sequence[str]) -> tuple[str, ...]:
+    if not tokens or PurePosixPath(tokens[0]).name != "sed":
+        return ()
+    operands: list[str] = []
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"-f", "--file"}:
+            if index + 1 >= len(tokens):
+                return ()
+            operands.append(tokens[index + 1])
+            index += 2
+            continue
+        if token.startswith("--file="):
+            operands.append(token.removeprefix("--file="))
+        elif token.startswith("-f") and token != "-f":
+            operands.append(token[2:])
+        index += 1
+    return tuple(operands)
+
+
 def _repository_mutation_fragment_scratch_inputs(
     command: str,
     *,
@@ -1538,10 +1559,10 @@ def _repository_mutation_fragment_scratch_inputs(
             and scope.repository_paths
             and not scope.scratch_paths
         ):
-            for token in tokens[1:]:
-                if not token.startswith("/") or token == "/dev/null":
+            for operand in _sed_script_operands(tokens):
+                if not operand.startswith("/") or operand == "/dev/null":
                     continue
-                resolved = _scope_path(token, cwd=root)
+                resolved = _scope_path(operand, cwd=root)
                 if resolved is None:
                     continue
                 try:
@@ -1549,6 +1570,36 @@ def _repository_mutation_fragment_scratch_inputs(
                 except ValueError:
                     scratch_inputs.add(resolved.as_posix())
     return scratch_inputs
+
+
+def _literal_scratch_creator(command: str, path: str) -> bool:
+    fragments = _shell_executable_fragments(command)
+    if not fragments or len(fragments) != 1:
+        return False
+    tokens = fragments[0][0]
+    if PurePosixPath(tokens[0]).name != "cat" or tokens.count(">") != 1:
+        return False
+    redirect_index = tokens.index(">")
+    if redirect_index + 1 >= len(tokens) or tokens[redirect_index + 1] != path:
+        return False
+    heredoc_indices = [
+        index for index, token in enumerate(tokens) if token in {"<<", "<<-"}
+    ]
+    if len(heredoc_indices) != 1 or heredoc_indices[0] + 1 >= len(tokens):
+        return False
+    allowed_indices = {
+        0,
+        redirect_index,
+        redirect_index + 1,
+        heredoc_indices[0],
+        heredoc_indices[0] + 1,
+    }
+    return allowed_indices == set(range(len(tokens)))
+
+
+def _observation_succeeded(message: Mapping[str, Any]) -> bool:
+    matches = list(_RETURN_CODE_RE.finditer(_observation_body(message)))
+    return bool(matches) and int(matches[-1].group("rc")) == 0
 
 
 def _compressed_provenance_valid(compressed: CompressedAgenticRow) -> bool:
@@ -1616,6 +1667,12 @@ def _build_decisive_suffix(
     compressed: CompressedAgenticRow,
 ) -> tuple[DecisiveSuffix | None, dict[str, object]]:
     """Keep the real suffix through the final edit's first trusted verification."""
+    if compressed.identity != analyzed.identity:
+        return None, _reject("invalid_compressed_provenance")
+    converted, _conversion_report = convert_rich_trajectory(analyzed.trajectory)
+    if converted is None or converted.messages != compressed.original_messages:
+        return None, _reject("invalid_compressed_provenance")
+
     allowlist = set(analyzed.patch_paths.textual_paths)
     if any(_forbidden_training_path(path) for path in allowlist):
         return None, _reject("forbidden_patch_path")
@@ -1680,7 +1737,13 @@ def _build_decisive_suffix(
         )
         if valid_scratch:
             scratch_path = scratch_edits[0][4].scratch_paths[0]
-            valid_scratch = scratch_inputs == {scratch_path}
+            valid_scratch = (
+                _literal_scratch_creator(scratch_edits[0][3], scratch_path)
+                and _observation_succeeded(
+                    compressed.original_messages[scratch_edits[0][2]]
+                )
+                and scratch_inputs == {scratch_path}
+            )
         if not valid_scratch:
             return None, _reject("invalid_scratch_chain")
     elif scratch_inputs:

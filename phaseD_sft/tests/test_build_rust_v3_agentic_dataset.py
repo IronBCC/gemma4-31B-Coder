@@ -653,6 +653,38 @@ def test_mutation_scope_rejects_unsupported_working_directory_changes(
     assert scope.ambiguous is True
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm tests/case.rs",
+        "rm -rf src",
+        "touch Cargo.lock",
+        "cp /tmp/fixed.rs src/lib.rs",
+        "cp src/lib.rs tests/case.rs",
+        "mv src/lib.rs tests/case.rs",
+        "install /tmp/fixed.rs src/lib.rs",
+        "truncate -s 0 src/lib.rs",
+        "chmod +x src/lib.rs",
+        "ln -sf /tmp/fixed.rs src/lib.rs",
+        "git checkout -- src/lib.rs",
+        "git restore src/lib.rs",
+        "git reset --hard HEAD",
+        "git clean -fd",
+        "rm src/*.rs",
+        "touch $TARGET",
+        "cp /tmp/fixed.rs $TARGET",
+        "git checkout -- .",
+    ],
+)
+def test_mutation_scope_rejects_unclassified_worktree_mutators(
+    command: str,
+) -> None:
+    scope = rust_v3_builder._mutation_scope(command, "/workspace/repo")
+    assert scope.repository_paths == ()
+    assert scope.scratch_paths == ()
+    assert scope.ambiguous is True
+
+
 def _observation(rc: int) -> dict[str, object]:
     return {
         "role": "user",

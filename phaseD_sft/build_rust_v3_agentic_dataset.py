@@ -817,6 +817,48 @@ _QUOTED_SHELL_CONTROL_UNMASK = {
 }
 _SHELL_CONTROL_OPERATORS = frozenset({"&&", "||", ";", "\n", "|", "|&", "&"})
 _SHELL_GROUP_TOKENS = frozenset({"(", ")", "{", "}"})
+_UNCLASSIFIED_FILESYSTEM_MUTATORS = frozenset(
+    {
+        "chmod",
+        "chown",
+        "chgrp",
+        "cp",
+        "dd",
+        "install",
+        "ln",
+        "mkdir",
+        "mkfifo",
+        "mknod",
+        "mv",
+        "patch",
+        "rm",
+        "rmdir",
+        "rsync",
+        "setfacl",
+        "touch",
+        "truncate",
+        "unlink",
+    }
+)
+_GIT_WORKTREE_MUTATORS = frozenset(
+    {
+        "am",
+        "apply",
+        "checkout",
+        "cherry-pick",
+        "clean",
+        "merge",
+        "pull",
+        "rebase",
+        "reset",
+        "restore",
+        "revert",
+        "stash",
+        "submodule",
+        "switch",
+        "worktree",
+    }
+)
 
 
 def _mask_quoted_shell_controls(command: str) -> str:
@@ -907,6 +949,39 @@ def _unsupported_cwd_change(tokens: Sequence[str]) -> bool:
     return any(PurePosixPath(token).name == "cd" for token in tokens)
 
 
+def _git_subcommand(tokens: Sequence[str]) -> str | None:
+    index = 1
+    options_with_values = {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}
+    while index < len(tokens):
+        token = tokens[index]
+        if token in options_with_values:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token
+    return None
+
+
+def _unclassified_worktree_mutator(tokens: Sequence[str]) -> bool:
+    executable = PurePosixPath(tokens[0]).name
+    if executable in _UNCLASSIFIED_FILESYSTEM_MUTATORS:
+        return True
+    if executable == "git":
+        return _git_subcommand(tokens) in _GIT_WORKTREE_MUTATORS
+    if executable == "find" and any(
+        token in {"-delete", "-exec", "-execdir"} for token in tokens[1:]
+    ):
+        return True
+    if executable in {"command", "builtin", "env", "sudo", "xargs"}:
+        return any(
+            PurePosixPath(token).name in _UNCLASSIFIED_FILESYSTEM_MUTATORS
+            for token in tokens[1:]
+        )
+    return False
+
+
 def _fragment_mutation_paths(tokens: Sequence[str]) -> tuple[str, ...]:
     fragment = _render_shell_fragment(tokens).replace("pathlib.Path(", "Path(")
     visible = _shell_visible_text(fragment)
@@ -951,7 +1026,7 @@ def _mutation_scope(command: str, declared_root: str) -> MutationScope:
     repository_paths: list[str] = []
     scratch_paths: list[str] = []
     for tokens, _following_operator in fragments[start:]:
-        if _unsupported_cwd_change(tokens):
+        if _unsupported_cwd_change(tokens) or _unclassified_worktree_mutator(tokens):
             return MutationScope((), (), True)
         executable = PurePosixPath(tokens[0]).name
         has_heredoc = "<<" in tokens or "<<-" in tokens

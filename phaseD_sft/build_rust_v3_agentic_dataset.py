@@ -144,6 +144,13 @@ class CompressedAgenticRow:
 
 
 @dataclass(frozen=True)
+class DecisiveSuffix:
+    messages: tuple[dict[str, Any], ...]
+    final_edit_command_index: int
+    verification_command_index: int
+
+
+@dataclass(frozen=True)
 class SourceRowStream:
     """One single-pass source partition and its immutable provenance."""
 
@@ -1455,6 +1462,223 @@ def _observation_body(message: Mapping[str, Any]) -> str:
 
 def _normalized_command(command: str) -> str:
     return " ".join(command.split())
+
+
+def _native_command(message: Mapping[str, Any]) -> str | None:
+    calls = message.get("tool_calls")
+    if not isinstance(calls, list) or len(calls) != 1:
+        return None
+    call = calls[0]
+    if not isinstance(call, dict):
+        return None
+    function = call.get("function")
+    if not isinstance(function, Mapping) or function.get("name") != "bash":
+        return None
+    arguments = _parse_tc_args(call)
+    command = arguments.get("command") if isinstance(arguments, Mapping) else None
+    return command if isinstance(command, str) and command.strip() else None
+
+
+def _native_message_pairs(
+    messages: Sequence[Mapping[str, Any]],
+) -> tuple[list[tuple[int, int, str]], int] | None:
+    pairs: list[tuple[int, int, str]] = []
+    terminal_index = -1
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if message.get("role") != "assistant":
+            if pairs or terminal_index >= 0:
+                return None
+            index += 1
+            continue
+        command = _native_command(message)
+        if command is None:
+            return None
+        if command == _COMPLETE_COMMAND:
+            if index != len(messages) - 1 or terminal_index >= 0:
+                return None
+            terminal_index = index
+            index += 1
+            continue
+        if index + 1 >= len(messages) or messages[index + 1].get("role") != "user":
+            return None
+        pairs.append((index, index + 1, command))
+        index += 2
+    if terminal_index < 0:
+        return None
+    return pairs, terminal_index
+
+
+def _command_mentions_literal_path(command: str, path: str) -> bool:
+    fragments = _shell_executable_fragments(command)
+    return bool(
+        fragments
+        and any(path in tokens for tokens, _operator in fragments)
+    )
+
+
+def _read_only_git_diff_or_status(command: str) -> bool:
+    fragments = _shell_executable_fragments(command)
+    if not fragments:
+        return False
+    executable = [
+        tokens
+        for tokens, _operator in fragments
+        if PurePosixPath(tokens[0]).name != "cd"
+    ]
+    return (
+        len(executable) == 1
+        and PurePosixPath(executable[0][0]).name == "git"
+        and _git_subcommand(executable[0]) in {"diff", "status"}
+    )
+
+
+def _first_repository_edit_is_grounded(
+    messages: Sequence[Mapping[str, Any]],
+    pairs: Sequence[tuple[int, int, str]],
+    *,
+    declared_root: str,
+) -> bool:
+    first_edit: tuple[int, set[str]] | None = None
+    for assistant_index, _observation_index, command in pairs:
+        scope = _mutation_scope(command, declared_root)
+        if scope.repository_paths:
+            first_edit = assistant_index, set(scope.repository_paths)
+            break
+    if first_edit is None:
+        return False
+    first_edit_index, required_paths = first_edit
+    grounded: set[str] = set()
+    for assistant_index, observation_index, command in pairs:
+        if assistant_index >= first_edit_index:
+            break
+        if not _is_read_command(command):
+            continue
+        if not _observation_body(messages[observation_index]):
+            continue
+        grounded.update(
+            required_paths.intersection(
+                _command_target_paths(command, declared_root=declared_root)
+            )
+        )
+    return grounded == required_paths
+
+
+def _build_decisive_suffix(
+    analyzed: AnalyzedSourceRow,
+    compressed: CompressedAgenticRow,
+) -> tuple[DecisiveSuffix | None, dict[str, object]]:
+    """Keep the real edit-to-first-success suffix after fail-closed mutation checks."""
+    allowlist = set(analyzed.patch_paths.textual_paths)
+    if any(_forbidden_training_path(path) for path in allowlist):
+        return None, _reject("forbidden_patch_path")
+
+    paired = _native_message_pairs(compressed.messages)
+    if paired is None:
+        return None, _reject("invalid_native_pairing")
+    native_pairs, terminal_index = paired
+    if compressed.compressed_suffix_start >= terminal_index:
+        return None, _reject("invalid_suffix_boundary")
+
+    declared_root = _declared_root(analyzed.trajectory)
+    if declared_root is None:
+        return None, _reject("ambiguous_mutation_path")
+
+    classified: list[tuple[int, int, int, str, MutationScope]] = []
+    seen_edit_commands: set[str] = set()
+    repository_edits: list[tuple[int, int, int, str, MutationScope]] = []
+    verification: tuple[int, int, int, str, MutationScope] | None = None
+    for command_index, (assistant_index, observation_index, command) in enumerate(
+        native_pairs, start=1
+    ):
+        scope = _mutation_scope(command, declared_root)
+        if scope.ambiguous:
+            return None, _reject("ambiguous_mutation_path")
+        if scope.repository_paths or scope.scratch_paths:
+            normalized = _normalized_command(command)
+            if normalized in seen_edit_commands:
+                return None, _reject("repeated_edit_command")
+            seen_edit_commands.add(normalized)
+        if any(_forbidden_training_path(path) for path in scope.repository_paths):
+            return None, _reject("forbidden_mutation_path")
+        if any(path not in allowlist for path in scope.repository_paths):
+            return None, _reject("nonallowlisted_repository_mutation")
+        entry = (command_index, assistant_index, observation_index, command, scope)
+        classified.append(entry)
+        if scope.repository_paths:
+            repository_edits.append(entry)
+        if repository_edits and _trusted_rust_verification(
+            command, compressed.messages[observation_index]
+        ):
+            verification = entry
+            break
+
+    if not repository_edits:
+        return None, _reject("missing_repository_mutation")
+    final_edit = repository_edits[-1]
+    final_edit_command_index, final_edit_assistant_index = final_edit[:2]
+
+    scratch_edits = [entry for entry in classified if entry[4].scratch_paths]
+    if scratch_edits:
+        valid_scratch = (
+            len(scratch_edits) == 1
+            and len(scratch_edits[0][4].scratch_paths) == 1
+            and not scratch_edits[0][4].repository_paths
+            and scratch_edits[0][1] < final_edit_assistant_index
+        )
+        if valid_scratch:
+            scratch_path = scratch_edits[0][4].scratch_paths[0]
+            valid_scratch = _command_mentions_literal_path(final_edit[3], scratch_path)
+        if not valid_scratch:
+            return None, _reject("invalid_scratch_chain")
+
+    if verification is None:
+        return None, _reject("missing_trusted_final_verification")
+
+    last_retained_index = verification[2]
+    verification_position = native_pairs.index(
+        (verification[1], verification[2], verification[3])
+    )
+    if verification_position + 1 < len(native_pairs):
+        following = native_pairs[verification_position + 1]
+        following_scope = _mutation_scope(following[2], declared_root)
+        if (
+            not following_scope.ambiguous
+            and not following_scope.repository_paths
+            and not following_scope.scratch_paths
+            and _read_only_git_diff_or_status(following[2])
+        ):
+            last_retained_index = following[1]
+
+    kept_indices = list(range(compressed.compressed_suffix_start))
+    kept_indices.extend(
+        range(compressed.compressed_suffix_start, last_retained_index + 1)
+    )
+    kept_indices.append(terminal_index)
+    messages = tuple(copy.deepcopy(compressed.messages[index]) for index in kept_indices)
+
+    retained_pairing = _native_message_pairs(messages)
+    if retained_pairing is None:
+        return None, _reject("invalid_native_pairing")
+    retained_pairs, retained_terminal_index = retained_pairing
+    if retained_terminal_index != len(messages) - 1:
+        return None, _reject("terminal_marker_not_last")
+    if not _first_repository_edit_is_grounded(
+        messages,
+        retained_pairs,
+        declared_root=declared_root,
+    ):
+        return None, _reject("first_edit_not_grounded")
+
+    return (
+        DecisiveSuffix(
+            messages=messages,
+            final_edit_command_index=final_edit_command_index,
+            verification_command_index=verification[0],
+        ),
+        {"kept": True},
+    )
 
 
 def compress_tracked_source_row(

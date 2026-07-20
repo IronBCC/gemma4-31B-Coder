@@ -159,6 +159,87 @@ def _patch(*sections: tuple[str, str]) -> str:
     )
 
 
+def _command(message: dict[str, object]) -> str:
+    calls = message["tool_calls"]
+    assert isinstance(calls, list) and len(calls) == 1
+    call = calls[0]
+    assert isinstance(call, dict)
+    function = call["function"]
+    assert isinstance(function, dict)
+    arguments = json.loads(str(function["arguments"]))
+    return str(arguments["command"])
+
+
+def _decisive_fixture(
+    commands: list[tuple[str, int]],
+    *,
+    patch: str,
+) -> tuple[
+    rust_v3_builder.AnalyzedSourceRow,
+    rust_v3_builder.CompressedAgenticRow,
+]:
+    """Build a rich trajectory whose paired observations expose the given rc values."""
+    trajectory: list[dict[str, object]] = [
+        {"role": "system", "content": "system contract"},
+        {
+            "role": "user",
+            "content": (
+                "<uploaded_files>\n/workspace/repo\n</uploaded_files>\n"
+                "Fix the Rust bug."
+            ),
+        },
+        _assistant(
+            "ground-0",
+            "execute_bash",
+            {"command": "cat src/lib.rs"},
+            reasoning="grounding-reasoning-verbatim",
+        ),
+        _result("ground-0", "old source\n<returncode>0</returncode>"),
+    ]
+    for index, (command, returncode) in enumerate(commands):
+        call_id = f"command-{index}"
+        trajectory.extend(
+            [
+                _assistant(
+                    call_id,
+                    "execute_bash",
+                    {"command": command},
+                    reasoning=f"reasoning-{index}-verbatim",
+                ),
+                _result(
+                    call_id,
+                    f"output-{index}-verbatim\n<returncode>{returncode}</returncode>",
+                ),
+            ]
+        )
+    trajectory.append(
+        _assistant(
+            "finish-decisive",
+            "finish",
+            {"message": "done"},
+            reasoning="finish-reasoning-verbatim",
+        )
+    )
+    row = _row(command="unused")
+    row["metadata"] = {"model_patch": {"patch": patch}}
+    row["trajectory"] = trajectory
+    analyzed = _analyzed_rich(row)
+    converted, conversion_report = convert_rich_trajectory(analyzed.trajectory)
+    assert conversion_report == {"kept": True}
+    assert converted is not None
+    first_command_pair = next(
+        pair for pair in converted.tool_pairs if pair.command == commands[0][0]
+    )
+    compressed = rust_v3_builder.CompressedAgenticRow(
+        identity=analyzed.identity,
+        messages=converted.messages,
+        original_messages=converted.messages,
+        original_suffix_start=first_command_pair.assistant_index,
+        compressed_suffix_start=first_command_pair.assistant_index,
+    )
+    return analyzed, compressed
+
+
 def test_same_row_patch_is_never_cross_joined_between_equal_task_ids() -> None:
     first = _row(trajectory_id="t-a", patch_path="src/a.rs", command="sed -i s/x/y/ src/a.rs")
     second = _row(trajectory_id="t-b", patch_path="src/b.rs", command="sed -i s/x/y/ src/a.rs")
@@ -935,6 +1016,284 @@ def test_compression_keeps_last_three_relevant_reads_and_exact_suffix() -> None:
     assert compressed.messages[compressed.compressed_suffix_start] == (
         converted.messages[compressed.original_suffix_start]
     )
+
+
+def test_decisive_suffix_keeps_gold_edits_through_first_trusted_success_verification():
+    analyzed, compressed = _decisive_fixture(
+        [
+            ("sed -i s/old/new/ src/lib.rs", 0),
+            ("cargo check", 1),
+            ("sed -i s/new/fixed/ src/lib.rs", 0),
+            ("cargo test", 0),
+            ("cargo test", 0),
+            ("cat > IMPLEMENTATION_SUMMARY.md <<'EOF'\nsummary\nEOF", 0),
+        ],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-old\n+fixed")),
+    )
+    result, report = rust_v3_builder._build_decisive_suffix(analyzed, compressed)
+    assert report == {"kept": True}
+    assert result is not None
+    kept = [
+        _command(message)
+        for message in result.messages
+        if message["role"] == "assistant"
+    ]
+    assert kept[-2:] == ["cargo test", rust_v3_builder._COMPLETE_COMMAND]
+    assert result.final_edit_command_index == 4
+    assert result.verification_command_index == 5
+
+
+def test_decisive_suffix_rejects_repo_test_edit_even_when_final_patch_contains_it():
+    analyzed, compressed = _decisive_fixture(
+        [
+            ("sed -i s/a/b/ src/lib.rs", 0),
+            ("sed -i s/a/b/ tests/case.rs", 0),
+            ("cargo test", 0),
+        ],
+        patch=_patch(
+            ("src/lib.rs", "@@ -1 +1 @@\n-a\n+b"),
+            ("tests/case.rs", "@@ -1 +1 @@\n-a\n+b"),
+        ),
+    )
+    result, report = rust_v3_builder._build_decisive_suffix(analyzed, compressed)
+    assert result is None
+    assert report["reason"] == "forbidden_patch_path"
+
+
+def test_decisive_suffix_rejects_forbidden_repository_mutation():
+    analyzed, compressed = _decisive_fixture(
+        [
+            ("sed -i s/a/b/ src/lib.rs", 0),
+            ("cat > tests/case.rs <<'EOF'\nrepro\nEOF", 0),
+            ("cargo test", 0),
+        ],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    assert rust_v3_builder._build_decisive_suffix(analyzed, compressed)[1][
+        "reason"
+    ] == "forbidden_mutation_path"
+
+
+def test_decisive_suffix_rejects_nonallowlisted_repo_mutation():
+    analyzed, compressed = _decisive_fixture(
+        [
+            ("sed -i s/a/b/ src/lib.rs", 0),
+            ("cat > README_FIX.md <<'EOF'\nsummary\nEOF", 0),
+            ("cargo test", 0),
+        ],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    assert rust_v3_builder._build_decisive_suffix(analyzed, compressed)[1][
+        "reason"
+    ] == "nonallowlisted_repository_mutation"
+
+
+def test_decisive_suffix_allows_final_patch_tracked_nonrust_source_file():
+    analyzed, compressed = _decisive_fixture(
+        [
+            ("sed -i s/a/b/ src/lib.rs", 0),
+            ("sed -i s/a/b/ include/api.hpp", 0),
+            ("cargo test", 0),
+        ],
+        patch=_patch(
+            ("src/lib.rs", "@@ -1 +1 @@\n-a\n+b"),
+            ("include/api.hpp", "@@ -1 +1 @@\n-a\n+b"),
+        ),
+    )
+    result, report = rust_v3_builder._build_decisive_suffix(analyzed, compressed)
+    assert result is not None and report["kept"] is True
+
+
+def test_decisive_suffix_rejects_nonconsecutive_identical_edit_commands():
+    edit = "sed -i s/a/b/ src/lib.rs"
+    analyzed, compressed = _decisive_fixture(
+        [(edit, 0), ("sed -n 1,20p src/lib.rs", 0), (edit, 0), ("cargo test", 0)],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    assert rust_v3_builder._build_decisive_suffix(analyzed, compressed)[1][
+        "reason"
+    ] == "repeated_edit_command"
+
+
+def test_decisive_suffix_rejects_missing_trusted_verify_after_final_edit():
+    analyzed, compressed = _decisive_fixture(
+        [("sed -i s/a/b/ src/lib.rs", 0), ("cargo test 2>&1 | tail -20", 0)],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    assert rust_v3_builder._build_decisive_suffix(analyzed, compressed)[1][
+        "reason"
+    ] == "missing_trusted_final_verification"
+
+
+def test_decisive_suffix_retains_one_consumed_scratch_chain_before_final_edit():
+    analyzed, compressed = _decisive_fixture(
+        [
+            ("cat > /tmp/fix.sed <<'EOF'\ns/a/b/\nEOF", 0),
+            ("sed -i -f /tmp/fix.sed src/lib.rs", 0),
+            ("cargo test", 0),
+        ],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    result, report = rust_v3_builder._build_decisive_suffix(analyzed, compressed)
+    assert report == {"kept": True}
+    assert result is not None
+    assert [_command(message) for message in result.messages if message["role"] == "assistant"] == [
+        "cat src/lib.rs",
+        "cat > /tmp/fix.sed <<'EOF'\ns/a/b/\nEOF",
+        "sed -i -f /tmp/fix.sed src/lib.rs",
+        "cargo test",
+        rust_v3_builder._COMPLETE_COMMAND,
+    ]
+
+
+@pytest.mark.parametrize(
+    "commands",
+    [
+        [
+            ("cat > /tmp/fix.sed <<'EOF'\ns/a/b/\nEOF", 0),
+            ("cat > /tmp/fix.sed <<'EOF'\ns/a/c/\nEOF", 0),
+            ("sed -i -f /tmp/fix.sed src/lib.rs", 0),
+            ("cargo test", 0),
+        ],
+        [
+            ("cat > /tmp/unused.sed <<'EOF'\ns/a/b/\nEOF", 0),
+            ("sed -i s/a/b/ src/lib.rs", 0),
+            ("cargo test", 0),
+        ],
+        [
+            ("sed -i s/a/b/ src/lib.rs", 0),
+            ("cat > /tmp/late.sed <<'EOF'\ns/a/b/\nEOF", 0),
+            ("cargo test", 0),
+        ],
+        [
+            ("cat > /tmp/one.sed <<'EOF'\ns/a/b/\nEOF", 0),
+            ("cat > /tmp/two.sed <<'EOF'\ns/b/c/\nEOF", 0),
+            ("sed -i -f /tmp/one.sed -f /tmp/two.sed src/lib.rs", 0),
+            ("cargo test", 0),
+        ],
+    ],
+)
+def test_decisive_suffix_rejects_invalid_scratch_chains(
+    commands: list[tuple[str, int]],
+) -> None:
+    analyzed, compressed = _decisive_fixture(
+        commands,
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    assert rust_v3_builder._build_decisive_suffix(analyzed, compressed)[1][
+        "reason"
+    ] == "invalid_scratch_chain"
+
+
+def test_decisive_suffix_rejects_ambiguous_scratch_mutation():
+    analyzed, compressed = _decisive_fixture(
+        [
+            ("cat > $SCRATCH <<'EOF'\ns/a/b/\nEOF", 0),
+            ("sed -i s/a/b/ src/lib.rs", 0),
+            ("cargo test", 0),
+        ],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    assert rust_v3_builder._build_decisive_suffix(analyzed, compressed)[1][
+        "reason"
+    ] == "ambiguous_mutation_path"
+
+
+def test_decisive_suffix_preserves_exact_pairs_marker_and_one_following_git_read():
+    analyzed, compressed = _decisive_fixture(
+        [
+            ("sed -i s/a/b/ src/lib.rs", 0),
+            ("cargo test", 0),
+            ("git diff -- src/lib.rs", 0),
+            ("git status --short", 0),
+        ],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    result, report = rust_v3_builder._build_decisive_suffix(analyzed, compressed)
+    assert report == {"kept": True}
+    assert result is not None
+    expected = compressed.messages[: compressed.compressed_suffix_start + 6] + (
+        compressed.messages[-1],
+    )
+    assert result.messages == expected
+    assert result.messages is not compressed.messages
+    for actual, original in zip(result.messages, expected):
+        assert actual == original
+        assert actual is not original
+
+
+def test_decisive_suffix_does_not_retain_redirected_following_git_read():
+    analyzed, compressed = _decisive_fixture(
+        [
+            ("sed -i s/a/b/ src/lib.rs", 0),
+            ("cargo test", 0),
+            ("git diff -- src/lib.rs > /tmp/final.diff", 0),
+        ],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    result, report = rust_v3_builder._build_decisive_suffix(analyzed, compressed)
+    assert report == {"kept": True}
+    assert result is not None
+    assert [
+        _command(message)
+        for message in result.messages
+        if message["role"] == "assistant"
+    ][-2:] == ["cargo test", rust_v3_builder._COMPLETE_COMMAND]
+
+
+def test_decisive_suffix_reruns_balanced_pairing_on_retained_messages():
+    analyzed, compressed = _decisive_fixture(
+        [("sed -i s/a/b/ src/lib.rs", 0), ("cargo test", 0)],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    messages = list(compressed.messages)
+    messages.insert(-3, {"role": "user", "content": "stray", "tool_calls": []})
+    corrupted = rust_v3_builder.CompressedAgenticRow(
+        identity=compressed.identity,
+        messages=tuple(messages),
+        original_messages=compressed.original_messages,
+        original_suffix_start=compressed.original_suffix_start,
+        compressed_suffix_start=compressed.compressed_suffix_start,
+    )
+    assert rust_v3_builder._build_decisive_suffix(analyzed, corrupted)[1][
+        "reason"
+    ] == "invalid_native_pairing"
+
+
+def test_decisive_suffix_reruns_terminal_last_invariant():
+    analyzed, compressed = _decisive_fixture(
+        [("sed -i s/a/b/ src/lib.rs", 0), ("cargo test", 0)],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    corrupted = rust_v3_builder.CompressedAgenticRow(
+        identity=compressed.identity,
+        messages=compressed.messages
+        + ({"role": "user", "content": "late", "tool_calls": []},),
+        original_messages=compressed.original_messages,
+        original_suffix_start=compressed.original_suffix_start,
+        compressed_suffix_start=compressed.compressed_suffix_start,
+    )
+    assert rust_v3_builder._build_decisive_suffix(analyzed, corrupted)[1][
+        "reason"
+    ] == "invalid_native_pairing"
+
+
+def test_decisive_suffix_reruns_first_edit_grounding_invariant():
+    analyzed, compressed = _decisive_fixture(
+        [("sed -i s/a/b/ src/lib.rs", 0), ("cargo test", 0)],
+        patch=_patch(("src/lib.rs", "@@ -1 +1 @@\n-a\n+b")),
+    )
+    messages = compressed.messages[:2] + compressed.messages[4:]
+    corrupted = rust_v3_builder.CompressedAgenticRow(
+        identity=compressed.identity,
+        messages=messages,
+        original_messages=compressed.original_messages,
+        original_suffix_start=compressed.original_suffix_start,
+        compressed_suffix_start=2,
+    )
+    assert rust_v3_builder._build_decisive_suffix(analyzed, corrupted)[1][
+        "reason"
+    ] == "first_edit_not_grounded"
 
 
 def test_first_edit_requires_every_tracked_edited_path_to_be_grounded() -> None:

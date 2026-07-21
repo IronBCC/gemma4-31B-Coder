@@ -1200,6 +1200,13 @@ class ExclusionRecord:
 
 
 @dataclass(frozen=True)
+class ConversionAssessment:
+    converted: dict[str, Any]
+    content_sha256: str
+    decontamination_reason: str | None
+
+
+@dataclass(frozen=True)
 class ReplayCandidate:
     trajectory_id: str
     source_terminal_sha256: str
@@ -1812,6 +1819,32 @@ def _excluded(
     return None
 
 
+def assess_converted_trajectory(
+    selected: SelectedTrajectory,
+    *,
+    protected_paths: Iterable[str],
+    verify_cmd: str,
+    exclusions: Sequence[ExclusionRecord],
+) -> ConversionAssessment:
+    """Convert once and apply the importer's exact messages-only exclusion rule."""
+
+    converted = convert_trajectory(
+        selected,
+        frozenset(protected_paths),
+        trusted_verifier_commands=frozenset({verify_cmd}),
+    )
+    content_sha256 = _sha256_bytes(
+        _canonical_json_bytes(converted["messages"])
+    )
+    return ConversionAssessment(
+        converted=converted,
+        content_sha256=content_sha256,
+        decontamination_reason=_excluded(
+            selected, content_sha256, tuple(exclusions)
+        ),
+    )
+
+
 def _replay_matches(
     candidate: ReplayCandidate, evidence: ReplayEvidence | None
 ) -> bool:
@@ -2209,10 +2242,11 @@ def build_fable5_pilot(
                 operations = _source_operations(
                     selected, seed, tool_names, argument_keys
                 )
-                converted = convert_trajectory(
+                assessment = assess_converted_trajectory(
                     selected,
-                    frozenset(seed.protected_paths),
-                    trusted_verifier_commands=frozenset({seed.verify_cmd}),
+                    protected_paths=seed.protected_paths,
+                    verify_cmd=seed.verify_cmd,
+                    exclusions=config.exclusions,
                 )
             except (RowRejected, UnsupportedTrajectoryTool, ValueError) as exc:
                 counts["unsupported_tool"] += 1
@@ -2223,6 +2257,7 @@ def build_fable5_pilot(
                     _stable_conversion_subreason(exc),
                 )
                 continue
+            converted = assessment.converted
             converted["instance_id"] = trajectory_id
             converted["source_instance_id"] = selected.task
             converted["source"] = (
@@ -2230,8 +2265,8 @@ def build_fable5_pilot(
             )
             converted["trajectory_id"] = trajectory_id
             converted["replay_pending"] = config.skip_replay
-            content_sha = _sha256_bytes(_canonical_json_bytes(converted["messages"]))
-            contamination = _excluded(selected, content_sha, config.exclusions)
+            content_sha = assessment.content_sha256
+            contamination = assessment.decontamination_reason
             if contamination is not None:
                 counts["contamination_drop"] += 1
                 _record_rejection(
@@ -2884,17 +2919,22 @@ def _load_seed_contract(root: Path, task: str) -> SeedContract:
     )
 
 
-def _load_exclusion(path: Path) -> ExclusionRecord:
+def parse_exclusion_artifact(raw: bytes) -> ExclusionRecord:
+    """Parse one exact exclusion artifact from already provenance-bound bytes."""
+
     instance_ids: set[str] = set()
     content_hashes: set[str] = set()
     texts: list[str] = []
-    raw = path.read_text(encoding="utf-8")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("exclusion artifact is not UTF-8") from exc
     payloads: list[Any]
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(text)
         payloads = parsed if isinstance(parsed, list) else [parsed]
     except json.JSONDecodeError:
-        payloads = [json.loads(line) for line in raw.splitlines() if line.strip()]
+        payloads = [json.loads(line) for line in text.splitlines() if line.strip()]
     for payload in payloads:
         if not isinstance(payload, Mapping):
             continue
@@ -2918,6 +2958,10 @@ def _load_exclusion(path: Path) -> ExclusionRecord:
         content_sha256s=frozenset(content_hashes),
         texts=tuple(texts),
     )
+
+
+def _load_exclusion(path: Path) -> ExclusionRecord:
+    return parse_exclusion_artifact(path.read_bytes())
 
 
 def _load_replay_ledger(

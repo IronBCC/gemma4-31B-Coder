@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import fable5_import as importer  # noqa: E402
 import fable5_replay as replay_module  # noqa: E402
 from fable5_import import (  # noqa: E402
     AUDITED_CODE_CATEGORIES,
@@ -110,6 +111,31 @@ def fable_row(**updates: object) -> dict[str, object]:
     }
     row.update(updates)
     return row
+
+
+def test_conversion_assessment_uses_messages_hash_and_shared_exclusion_semantics() -> None:
+    selected = select_terminal_row(fable_row())
+    assessment = importer.assess_converted_trajectory(
+        selected,
+        protected_paths=(),
+        verify_cmd="true",
+        exclusions=(),
+    )
+    expected = hashlib.sha256(
+        importer._canonical_json_bytes(assessment.converted["messages"])
+    ).hexdigest()
+    assert assessment.content_sha256 == expected
+    assert assessment.decontamination_reason is None
+
+    excluded = importer.assess_converted_trajectory(
+        selected,
+        protected_paths=(),
+        verify_cmd="true",
+        exclusions=(
+            ExclusionRecord(content_sha256s=frozenset({expected})),
+        ),
+    )
+    assert excluded.decontamination_reason == "exact_content_sha256"
 
 
 def test_source_contract_is_exact_and_frozen() -> None:

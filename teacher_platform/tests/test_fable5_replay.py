@@ -24,7 +24,9 @@ from fable5_import import (  # noqa: E402
     FableWriteOp,
     UnsupportedTrajectoryTool,
     VerifierEvidenceOp,
+    convert_trajectory,
     parse_fable_tool_call,
+    select_terminal_row,
 )
 from fable5_replay import (  # noqa: E402
     MOONSHINER_REVISION,
@@ -2627,6 +2629,7 @@ def test_inventory_arithmetic_and_explicit_smoke_manifest_are_exhaustive() -> No
         sidecar_sha256="9" * 64,
         policy_sha256="a" * 64,
         admission_sha256="b" * 64,
+        exclusion_artifacts=(("evaluation.json", "e" * 64),),
         seed_evidence_sha256="d" * 64,
         seed_commit_sha=MOONSHINER_REVISION,
         seed_tree_sha="c" * 40,
@@ -2805,6 +2808,55 @@ def test_eligibility_candidate_requires_all_six_explicit_gates() -> None:
         replay.EligibilityCandidate("1" * 64, "py", "python")
 
 
+def test_eligibility_binds_canonical_ordered_exclusion_artifacts() -> None:
+    candidate = replay.EligibilityCandidate(
+        "1" * 64,
+        "py",
+        "python",
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+    )
+    common = {
+        "source_sha256": "8" * 64,
+        "sidecar_sha256": "9" * 64,
+        "policy_sha256": "a" * 64,
+        "admission_sha256": "b" * 64,
+        "seed_evidence_sha256": "d" * 64,
+        "seed_commit_sha": MOONSHINER_REVISION,
+        "seed_tree_sha": "c" * 40,
+    }
+    first = replay.build_eligibility_inventory(
+        [candidate],
+        replay.EligibilityBindings(
+            **common,
+            exclusion_artifacts=(("evaluation.json", "e" * 64),),
+        ),
+    )
+    changed = replay.build_eligibility_inventory(
+        [candidate],
+        replay.EligibilityBindings(
+            **common,
+            exclusion_artifacts=(("evaluation.json", "f" * 64),),
+        ),
+    )
+    assert first["inventory_sha256"] != changed["inventory_sha256"]
+    with pytest.raises(ReplayContractError, match="exclusion artifact"):
+        replay.build_eligibility_inventory(
+            [candidate],
+            replay.EligibilityBindings(
+                **common,
+                exclusion_artifacts=(
+                    ("z.json", "e" * 64),
+                    ("a.json", "f" * 64),
+                ),
+            ),
+        )
+
+
 @pytest.mark.parametrize(
     "digest",
     [
@@ -2868,6 +2920,399 @@ def test_inventory_cli_rejects_nonexact_policy_digest(
                 "--inventory-only",
             ]
         )
+
+
+def _inventory_cli_row(task: str, language: str) -> dict[str, object]:
+    edit_id = f"edit-{task}"
+    verify_id = f"verify-{task}"
+    messages: list[dict[str, object]] = [
+        {"role": "system", "content": "Work carefully."},
+        {"role": "user", "content": f"Fix {task}."},
+        {
+            "role": "assistant",
+            "content": "Apply the narrow fix.",
+            "tool_calls": [
+                {
+                    "id": edit_id,
+                    "type": "function",
+                    "function": {
+                        "name": "Edit",
+                        "arguments": {
+                            "file_path": "src.txt",
+                            "old_string": "old",
+                            "new_string": "new",
+                            "replace_all": False,
+                        },
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": edit_id, "content": "updated"},
+        {
+            "role": "assistant",
+            "content": "Verify the fix.",
+            "tool_calls": [
+                {
+                    "id": verify_id,
+                    "type": "function",
+                    "function": {
+                        "name": "Bash",
+                        "arguments": {"command": "true"},
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": verify_id, "content": "ok"},
+        {"role": "assistant", "content": "Implemented and verified."},
+    ]
+    return {
+        "task": task,
+        "lang": language,
+        "category": "debug",
+        "split": "train",
+        "assistant_step": 3,
+        "assistant_steps": 3,
+        "messages": messages,
+        "tools": "[]",
+    }
+
+
+def _write_inventory_seed(
+    repository: Path,
+    task: str,
+    language: str,
+    *,
+    include_patch: bool = True,
+) -> None:
+    seed = repository / "tasks" / "seeds" / task
+    files = seed / "files"
+    files.mkdir(parents=True)
+    (seed / "task.json").write_text(
+        json.dumps(
+            {
+                "id": task,
+                "lang": language,
+                "verify_cmd": "true",
+                "test_files": ["test.txt"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    if include_patch:
+        (seed / "reference_fix.patch").write_text(
+            "diff --git a/src.txt b/src.txt\n"
+            "--- a/src.txt\n"
+            "+++ b/src.txt\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n",
+            encoding="utf-8",
+        )
+    (files / "src.txt").write_text("old\n", encoding="utf-8")
+    (files / "test.txt").write_text("ok\n", encoding="utf-8")
+
+
+def _inventory_cli_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    include_extra: bool = False,
+    missing_patch_task: str | None = None,
+    invalid_task: tuple[str, str] | None = None,
+    source_language_override: tuple[str, str] | None = None,
+    exclusion_payload: object = (),
+    out_name: str = "out",
+) -> tuple[list[str], Path, Path]:
+    tasks = [
+        ("py-one", "python"),
+        ("py-two", "python"),
+        ("rs-one", "rust"),
+        ("rs-two", "rust"),
+        ("cpp-one", "cpp"),
+    ]
+    if include_extra:
+        tasks.append(("py-extra", "python"))
+    rows = [_inventory_cli_row(task, language) for task, language in tasks]
+    if source_language_override is not None:
+        task, language = source_language_override
+        next(item for item in rows if item["task"] == task)["lang"] = language
+    if invalid_task is not None:
+        task, kind = invalid_task
+        row = next(item for item in rows if item["task"] == task)
+        if kind == "selection":
+            del row["category"]
+        elif kind == "conversion":
+            calls = row["messages"][2]["tool_calls"]  # type: ignore[index]
+            calls[0]["function"]["name"] = "Unsupported"  # type: ignore[index]
+        else:  # pragma: no cover - fixture guard
+            raise AssertionError(kind)
+
+    repository = tmp_path / "seed-repo"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=repository, check=True
+    )
+    for task, language in tasks:
+        _write_inventory_seed(
+            repository,
+            task,
+            language,
+            include_patch=task != missing_patch_task,
+        )
+    subprocess.run(["git", "add", "tasks"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixtures"], cwd=repository, check=True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    monkeypatch.setattr(replay, "MOONSHINER_REVISION", commit)
+
+    source = tmp_path / "source.jsonl"
+    source.write_text(
+        "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        replay,
+        "SOURCE_LFS_SHA256",
+        hashlib.sha256(source.read_bytes()).hexdigest(),
+    )
+    sidecar = tmp_path / "sidecar.jsonl"
+    sidecar.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "trajectory_id": replay.trajectory_identity(row["task"], row),
+                    "source_instance_id": row["task"],
+                    "source_terminal_sha256": hashlib.sha256(
+                        replay._canonical_json(row)
+                    ).hexdigest(),
+                    "row": row,
+                },
+                separators=(",", ":"),
+            )
+            + "\n"
+            for row in rows
+        ),
+        encoding="utf-8",
+    )
+    policy = dataclasses.replace(
+        _docker_policy(),
+        images=(
+            ("python", "example.invalid/python@sha256:" + "1" * 64),
+            ("rust", "example.invalid/rust@sha256:" + "2" * 64),
+            ("cpp", "example.invalid/cpp@sha256:" + "3" * 64),
+        ),
+    )
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps(replay.docker_policy_artifact(policy)))
+    admission_path = tmp_path / "admission.json"
+    admission_path.write_text(
+        json.dumps(
+            replay.admission_artifact(
+                policy,
+                [
+                    _admission_for(policy, language)
+                    for language in ("python", "rust", "cpp")
+                ],
+            )
+        )
+    )
+    exclusion = tmp_path / "evaluation-exclusions.json"
+    exclusion.write_text(json.dumps(exclusion_payload), encoding="utf-8")
+    smoke_ids = [replay.trajectory_identity(row["task"], row) for row in rows[:5]]
+    smoke = tmp_path / "smoke-input.json"
+    smoke.write_text(json.dumps(smoke_ids), encoding="utf-8")
+    out = tmp_path / out_name
+    argv = [
+        "--source",
+        str(source),
+        "--sidecar",
+        str(sidecar),
+        "--seed-repo",
+        str(repository),
+        "--policy",
+        str(policy_path),
+        "--admission",
+        str(admission_path),
+        "--smoke-manifest",
+        str(smoke),
+        "--exclusion",
+        str(exclusion),
+        "--ledger",
+        str(tmp_path / "replay.jsonl"),
+        "--logs",
+        str(tmp_path / "logs"),
+        "--out",
+        str(out),
+        "--inventory-only",
+    ]
+    return argv, out, exclusion
+
+
+def test_inventory_cli_happy_path_publishes_bound_manifests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv, out, _exclusion = _inventory_cli_fixture(tmp_path, monkeypatch)
+
+    assert replay.main(argv) == 0
+
+    inventory = json.loads((out / "eligibility.json").read_text())
+    smoke = json.loads((out / "smoke.json").read_text())
+    assert inventory["total"] == inventory["eligible_ceiling"] == 5
+    assert inventory["exclusions"] == {
+        "unsupported_operations": 0,
+        "contamination": 0,
+        "invalid_git_seed": 0,
+        "invalid_reference_patch": 0,
+        "missing_language_digest": 0,
+        "functional_admission_failed": 0,
+    }
+    assert smoke["eligibility_sha256"] == inventory["inventory_sha256"]
+    assert [row["language"] for row in smoke["trajectories"]] == [
+        "python",
+        "python",
+        "rust",
+        "rust",
+        "cpp",
+    ]
+    assert stat.S_IMODE((out / "eligibility.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((out / "smoke.json").stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected_gate"),
+    [
+        ("selection", "unsupported_operations"),
+        ("conversion", "unsupported_operations"),
+    ],
+)
+def test_inventory_cli_conversion_failures_are_explicit_gate_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    expected_gate: str,
+) -> None:
+    argv, out, _exclusion = _inventory_cli_fixture(
+        tmp_path,
+        monkeypatch,
+        include_extra=True,
+        invalid_task=("py-extra", kind),
+    )
+
+    assert replay.main(argv) == 0
+
+    inventory = json.loads((out / "eligibility.json").read_text())
+    assert inventory["total"] == 6
+    assert inventory["eligible_ceiling"] == 5
+    assert inventory["exclusions"][expected_gate] == 1
+
+
+def test_inventory_cli_missing_reference_patch_fails_reference_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv, out, _exclusion = _inventory_cli_fixture(
+        tmp_path,
+        monkeypatch,
+        include_extra=True,
+        missing_patch_task="py-extra",
+    )
+
+    assert replay.main(argv) == 0
+
+    inventory = json.loads((out / "eligibility.json").read_text())
+    assert inventory["eligible_ceiling"] == 5
+    assert inventory["exclusions"]["invalid_reference_patch"] == 1
+
+
+def test_inventory_cli_rejects_source_language_mismatched_to_pinned_seed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv, out, _exclusion = _inventory_cli_fixture(
+        tmp_path,
+        monkeypatch,
+        include_extra=True,
+        source_language_override=("py-extra", "rust"),
+    )
+
+    assert replay.main(argv) == 0
+
+    inventory = json.loads((out / "eligibility.json").read_text())
+    assert inventory["eligible_ceiling"] == 5
+    assert inventory["exclusions"]["invalid_git_seed"] == 1
+    assert all(row["task"] != "py-extra" for row in inventory["eligible"])
+
+
+def test_inventory_cli_uses_converted_messages_content_hash_for_exclusion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = _inventory_cli_row("py-extra", "python")
+    selected = select_terminal_row(row)
+    converted = convert_trajectory(
+        selected,
+        frozenset({"test.txt"}),
+        trusted_verifier_commands=frozenset({"true"}),
+    )
+    content_sha = hashlib.sha256(
+        replay._canonical_json(converted["messages"])
+    ).hexdigest()
+    argv, out, _exclusion = _inventory_cli_fixture(
+        tmp_path,
+        monkeypatch,
+        include_extra=True,
+        exclusion_payload=[{"content_sha256": content_sha}],
+    )
+
+    assert replay.main(argv) == 0
+
+    inventory = json.loads((out / "eligibility.json").read_text())
+    assert inventory["eligible_ceiling"] == 5
+    assert inventory["exclusions"]["contamination"] == 1
+
+
+def test_exclusion_bytes_are_bound_even_when_gate_outcomes_do_not_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv, out_a, exclusion = _inventory_cli_fixture(
+        tmp_path,
+        monkeypatch,
+        exclusion_payload=[{"irrelevant": "a"}],
+        out_name="out-a",
+    )
+    assert replay.main(argv) == 0
+    first = json.loads((out_a / "eligibility.json").read_text())
+
+    exclusion.write_text(json.dumps([{"irrelevant": "b"}]), encoding="utf-8")
+    out_b = tmp_path / "out-b"
+    argv[argv.index(str(out_a))] = str(out_b)
+    assert replay.main(argv) == 0
+    second = json.loads((out_b / "eligibility.json").read_text())
+
+    assert first["eligible"] == second["eligible"]
+    assert first["exclusions"] == second["exclusions"]
+    assert first["bindings"]["exclusion_artifacts"] != second["bindings"][
+        "exclusion_artifacts"
+    ]
+    assert first["inventory_sha256"] != second["inventory_sha256"]
+
+
+def test_inventory_cli_rejects_missing_exclusion_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv, _out, exclusion = _inventory_cli_fixture(tmp_path, monkeypatch)
+    exclusion.unlink()
+
+    with pytest.raises(ReplayContractError, match="exclusion.*missing"):
+        replay.main(argv)
 
 
 class FakeRestrictedExecutor:

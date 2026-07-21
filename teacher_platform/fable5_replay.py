@@ -40,7 +40,10 @@ if __package__:  # Support both ``python -m teacher_platform...`` and local test
         ReadOnlyBashOp,
         VerifierEvidenceOp,
         _rejected_mutation_family,
+        assess_converted_trajectory,
+        parse_exclusion_artifact,
         parse_fable_tool_call,
+        select_terminal_row,
     )
 else:  # pragma: no cover - the branch is exercised by local tests.
     from fable5_import import (  # type: ignore[no-redef]
@@ -51,7 +54,10 @@ else:  # pragma: no cover - the branch is exercised by local tests.
         ReadOnlyBashOp,
         VerifierEvidenceOp,
         _rejected_mutation_family,
+        assess_converted_trajectory,
+        parse_exclusion_artifact,
         parse_fable_tool_call,
+        select_terminal_row,
     )
 
 
@@ -410,6 +416,7 @@ class EligibilityBindings:
     sidecar_sha256: str
     policy_sha256: str
     admission_sha256: str
+    exclusion_artifacts: tuple[tuple[str, str], ...]
     seed_evidence_sha256: str
     seed_commit_sha: str
     seed_tree_sha: str
@@ -576,6 +583,15 @@ def _validate_archive(
             parts = PurePosixPath(name).parts
             if any(part == ".." for part in parts):
                 raise ReplayContractError("archive member contains parent traversal")
+            if (
+                len(parts) < len(prefix.parts)
+                and tuple(parts) == prefix.parts[: len(parts)]
+            ):
+                if not member.isdir():
+                    raise ReplayContractError(
+                        "archive task ancestor must be a directory"
+                    )
+                continue
             if tuple(parts[:3]) != prefix.parts:
                 raise ReplayContractError("archive member escapes task prefix")
             relative_parts = parts[3:]
@@ -4218,6 +4234,25 @@ def build_eligibility_inventory(
         or _OID_RE.fullmatch(bindings.seed_tree_sha) is None
     ):
         raise ReplayContractError("eligibility seed binding is invalid")
+    exclusion_artifacts = bindings.exclusion_artifacts
+    if (
+        type(exclusion_artifacts) is not tuple
+        or not exclusion_artifacts
+        or any(
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not str
+            or _TASK_RE.fullmatch(item[0]) is None
+            or type(item[1]) is not str
+            or not _is_sha256(item[1])
+            for item in exclusion_artifacts
+        )
+        or exclusion_artifacts
+        != tuple(sorted(exclusion_artifacts, key=lambda item: item[0].encode("utf-8")))
+        or len({label for label, _digest in exclusion_artifacts})
+        != len(exclusion_artifacts)
+    ):
+        raise ReplayContractError("eligibility exclusion artifact binding is invalid")
     seen: set[str] = set()
     exclusions = {reason: 0 for _, reason in _ELIGIBILITY_GATES}
     eligible: list[dict[str, str]] = []
@@ -4328,6 +4363,38 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _load_bound_exclusion_inputs(
+    paths: Sequence[Path],
+) -> tuple[tuple[Any, ...], tuple[tuple[str, str], ...]]:
+    loaded: list[tuple[str, str, Any]] = []
+    seen: set[str] = set()
+    for path in paths:
+        label = Path(path).name
+        if not label or _TASK_RE.fullmatch(label) is None or label in seen:
+            raise ReplayContractError(
+                "exclusion artifacts require unique stable filename labels"
+            )
+        seen.add(label)
+        try:
+            raw, _mode = _read_regular_no_follow(Path(path))
+        except ReplayContractError as exc:
+            raise ReplayContractError(
+                f"exclusion artifact {label!r} is missing or unsafe"
+            ) from exc
+        try:
+            record = parse_exclusion_artifact(raw)
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise ReplayContractError(
+                f"exclusion artifact {label!r} is invalid"
+            ) from exc
+        loaded.append((label, _sha256(raw), record))
+    loaded.sort(key=lambda item: item[0].encode("utf-8"))
+    return (
+        tuple(item[2] for item in loaded),
+        tuple((item[0], item[1]) for item in loaded),
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Publish only an explicit precomputed inventory in this code-only phase."""
 
@@ -4337,6 +4404,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     for name in ("source", "sidecar", "seed_repo", "policy", "admission", "smoke_manifest"):
         if not getattr(args, name).exists():
             raise ReplayContractError(f"explicit --{name.replace('_', '-')} input is missing")
+    exclusions, exclusion_artifacts = _load_bound_exclusion_inputs(args.exclusion)
     if _sha256_path(args.source) != SOURCE_LFS_SHA256:
         raise ReplayContractError("explicit source artifact does not match the pinned hash")
     try:
@@ -4371,27 +4439,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     structural = validate_structural_sidecar(source_rows(), sidecar_rows)
     seed_source = GitSeedSource(args.seed_repo, MOONSHINER_REVISION)
     seed_evidence = validate_seed_repository(seed_source)
-    if __package__:
-        from .fable5_import import (
-            _decontamination_reason,
-            _load_exclusion,
-            convert_trajectory,
-            select_terminal_row,
-        )
-    else:  # pragma: no cover
-        from fable5_import import (  # type: ignore[no-redef]
-            _decontamination_reason,
-            _load_exclusion,
-            convert_trajectory,
-            select_terminal_row,
-        )
-    exclusions = tuple(_load_exclusion(path) for path in args.exclusion)
     candidates: list[EligibilityCandidate] = []
     with tempfile.TemporaryDirectory(prefix="fable-inventory-") as temporary:
         workspace = Path(temporary)
         for index, record in enumerate(structural):
-            selected = select_terminal_row(record["row"])
             language = record["language"]
+            selected = None
+            operations_supported = True
+            try:
+                selected = select_terminal_row(record["row"])
+            except Exception:
+                operations_supported = False
             try:
                 contract = materialize_seed(
                     seed_source,
@@ -4404,9 +4462,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                         trajectory_id=record["trajectory_id"],
                         task=record["task"],
                         language=language,
-                        # Earlier gates are neutral so the exclusive partition
-                        # records this row at the first provable seed failure.
-                        operations_supported=True,
+                        operations_supported=operations_supported,
+                        decontaminated=True,
+                        git_seed_valid=False,
+                        reference_patch_valid=False,
+                        language_digest_present=language in dict(policy.images),
+                        admission_valid=language in admitted,
+                    )
+                )
+                continue
+            if (
+                selected is None
+                or selected.language != language
+                or contract.language != language
+            ):
+                candidates.append(
+                    EligibilityCandidate(
+                        trajectory_id=record["trajectory_id"],
+                        task=record["task"],
+                        language=language,
+                        operations_supported=operations_supported,
                         decontaminated=True,
                         git_seed_valid=False,
                         reference_patch_valid=False,
@@ -4422,23 +4497,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     contract.verify_cmd,
                 )
                 operations_supported = bool(plan.operations)
-            except (ReplayContractError, ValueError):
+            except Exception:
                 operations_supported = False
-            reference_ok = True
+            reference_ok = preflight_reference_patch(contract).eligible
+            contaminated = None
             try:
-                preflight_reference_patch(contract, workspace / f"reference-{index}")
-            except ReplayContractError:
-                reference_ok = False
-            try:
-                converted = convert_trajectory(selected, contract)
-                content_sha = _sha256(_canonical_json(converted))
-                contaminated = _decontamination_reason(
-                    selected, content_sha, exclusions
+                assessment = assess_converted_trajectory(
+                    selected,
+                    protected_paths=contract.protected_paths,
+                    verify_cmd=contract.verify_cmd,
+                    exclusions=exclusions,
                 )
-            except (ReplayContractError, ValueError):
-                # Conversion failures are already operation failures; avoid
-                # misclassifying them as contamination in the exclusive sum.
-                contaminated = None
+                contaminated = assessment.decontamination_reason
+            except Exception:
+                operations_supported = False
             candidates.append(
                 EligibilityCandidate(
                     trajectory_id=record["trajectory_id"],
@@ -4457,6 +4529,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sidecar_sha256=_sha256_path(args.sidecar),
         policy_sha256=policy_sha,
         admission_sha256=admission_document["admission_sha256"],
+        exclusion_artifacts=exclusion_artifacts,
         seed_evidence_sha256=seed_evidence["seed_evidence_sha256"],
         seed_commit_sha=seed_evidence["source_commit_sha"],
         seed_tree_sha=seed_evidence["tasks_seed_tree_sha"],

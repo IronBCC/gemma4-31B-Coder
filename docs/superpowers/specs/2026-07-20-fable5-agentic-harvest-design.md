@@ -170,28 +170,44 @@ The tokenizer loads once in the main process. Parallel token counting may use a
 ## Independent replay contract
 
 Publisher verification is useful provenance but is not accepted as our final
-execution evidence. Every retained task must be independently replayed from the
-pinned `tasks/seeds/<task>` fixture.
+execution evidence. The published legacy rows omit the publisher's candidate
+diff, seed fingerprint, protected hashes, verifier identity, and acceptance
+ledger. Every retained task therefore needs a candidate reconstructed from
+declarative source mutations and independently verified from the pinned
+`tasks/seeds/<task>` fixture. A trajectory whose final state depends on an
+arbitrary Bash mutation is not reconstructable and is rejected.
 
 1. Copy the seed `files/` tree into a fresh disposable workspace.
 2. Record hashes for `test_files` and every fixture file before replay.
 3. Run the seed's exact `verify_cmd` with `verify_timeout`; require the baseline
    to fail when the task contract declares a failing baseline.
-4. Replay only the normalized command stream in an isolated, network-disabled,
+4. Reconstruct the candidate only from exact `Write`, `Edit`, or equivalent
+   declarative patch operations. Do not execute transcript Bash, tests, package
+   managers, scripts, interpreters, or command substitutions to build the
+   candidate. Any unproven Bash source mutation rejects the task.
+5. Apply the reconstructed candidate in an isolated, network-disabled,
    resource-bounded environment. Never execute a Fable command on the host.
-5. Require all declared protected/test files to remain byte-identical.
-6. Run the exact verification command again and require success.
-7. Capture a binary source diff; require it to be nonempty and free of rejected
+6. Require all declared protected/test files to remain byte-identical.
+7. Run the exact verification command twice in fresh candidate states and
+   require identical successful return codes and output hashes.
+8. Capture a binary source diff; require it to be nonempty and free of rejected
    paths.
-8. Record task/revision/fixture/command/diff hashes, return codes, durations,
+9. Record task/revision/fixture/command/diff hashes, return codes, durations,
    bounded log paths, and cleanup status.
 
 The first runtime gate is five tasks: two Python, two Rust, and one C++ when a
-clean C++ candidate exists. No image pull is automatic. The gate uses only
-already-present execution environments; a missing environment stops with an
-inventory report. Docker operations, if required later, inherit the 40-GiB
-free-space floor, exact-CID cleanup, no broad prune, and no production-port
-changes.
+clean C++ candidate exists. Each task runs three controls: the reconstructed
+Fable candidate must pass, the pinned `reference_fix.patch` must pass as a
+separate harness-positive control, and a deliberately corrupted candidate must
+fail. Control artifacts are tagged and cannot enter training output.
+
+Linux `bwrap` with a read-only host root, isolated PID namespace, temporary home
+and `/tmp`, clear environment, disabled network, and only the fixture workspace
+writable is preferred. No image pull is automatic. If Docker is required, the
+gate uses only an already-cached immutable digest and inherits the 40-GiB
+free-space floor, non-root execution, CPU/memory/PID limits, exact-CID cleanup,
+no host mounts or Docker socket, no broad prune, and no production-port changes.
+A missing safe environment stops with an inventory report.
 
 ## Outputs and manifest
 

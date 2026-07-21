@@ -1899,6 +1899,49 @@ def _tmpfs_policy(policy: DockerPolicy) -> dict[str, str]:
     }
 
 
+_REQUIRED_MASKED_PATHS: Final = frozenset(
+    {
+        "/proc/acpi",
+        "/proc/asound",
+        "/proc/kcore",
+        "/proc/keys",
+        "/proc/latency_stats",
+        "/proc/timer_list",
+        "/proc/timer_stats",
+        "/proc/scsi",
+        "/sys/firmware",
+    }
+)
+_REQUIRED_READONLY_PATHS: Final = frozenset(
+    {
+        "/proc/bus",
+        "/proc/fs",
+        "/proc/irq",
+        "/proc/sys",
+        "/proc/sysrq-trigger",
+    }
+)
+
+
+def _safe_moby_restriction_paths(
+    value: object, required: frozenset[str]
+) -> bool:
+    """Require stable Moby restrictions while allowing extra restrictive paths."""
+
+    if type(value) is not list or any(type(path) is not str for path in value):
+        return False
+    if len(value) != len(set(value)):
+        return False
+    if any(
+        re.fullmatch(r"/(?:[A-Za-z0-9._-]+)(?:/[A-Za-z0-9._-]+)*", path)
+        is None
+        or PurePosixPath(path).as_posix() != path
+        for path in value
+    ):
+        return False
+    return required <= set(value)
+
+
 _QUIESCE_VERIFIER_SCRIPT: Final = """set -eu
 self=$$
 parent=$PPID
@@ -2047,6 +2090,17 @@ class DockerExecutor:
             or host.get("Devices") not in (None, [], ())
             or host.get("DeviceRequests") not in (None, [], ())
             or host.get("DeviceCgroupRules") not in (None, [], ())
+            or host.get("VolumesFrom") not in (None, [], ())
+            or host.get("Links") not in (None, [], ())
+            or host.get("GroupAdd") not in (None, [], ())
+            or host.get("Sysctls") not in (None, {})
+            or host.get("ExtraHosts") not in (None, [], ())
+            or not _safe_moby_restriction_paths(
+                host.get("MaskedPaths"), _REQUIRED_MASKED_PATHS
+            )
+            or not _safe_moby_restriction_paths(
+                host.get("ReadonlyPaths"), _REQUIRED_READONLY_PATHS
+            )
             or host.get("PidMode") != ""
             or host.get("IpcMode") != "private"
             or host.get("UTSMode") != ""

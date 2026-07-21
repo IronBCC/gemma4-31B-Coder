@@ -990,6 +990,24 @@ def test_reference_patch_strips_transport_prefix_exactly_once(
 
 IMAGE_DIGEST = "example.invalid/fable-python@sha256:" + "1" * 64
 CID = "c" * 64
+CAPTURED_MOBY_MASKED_PATHS = [
+    "/proc/acpi",
+    "/proc/asound",
+    "/proc/kcore",
+    "/proc/keys",
+    "/proc/latency_stats",
+    "/proc/timer_list",
+    "/proc/timer_stats",
+    "/proc/scsi",
+    "/sys/firmware",
+]
+CAPTURED_MOBY_READONLY_PATHS = [
+    "/proc/bus",
+    "/proc/fs",
+    "/proc/irq",
+    "/proc/sys",
+    "/proc/sysrq-trigger",
+]
 
 
 def _captured_moby_tmpfs_mounts(tmpfs: dict[str, str]) -> list[dict[str, object]]:
@@ -1160,6 +1178,13 @@ class FakeDockerRuntime:
                     "Runtime": "runc",
                     "CgroupnsMode": "private",
                     "Isolation": "",
+                    "VolumesFrom": None,
+                    "Links": None,
+                    "GroupAdd": None,
+                    "Sysctls": None,
+                    "ExtraHosts": None,
+                    "MaskedPaths": list(CAPTURED_MOBY_MASKED_PATHS),
+                    "ReadonlyPaths": list(CAPTURED_MOBY_READONLY_PATHS),
                 },
                 "Mounts": _captured_moby_tmpfs_mounts(tmpfs) if self.started else [],
                 "NetworkSettings": {"Ports": {}, "Networks": {"none": {}}},
@@ -1849,6 +1874,13 @@ def test_docker_executor_rejects_effective_container_policy_drift(tmp_path: Path
         ("HostConfig", "Runtime", "nvidia"),
         ("HostConfig", "CgroupnsMode", "host"),
         ("HostConfig", "Isolation", "hyperv"),
+        ("HostConfig", "VolumesFrom", ["victim:rw"]),
+        ("HostConfig", "Links", ["/victim:/target"]),
+        ("HostConfig", "GroupAdd", ["0"]),
+        ("HostConfig", "Sysctls", {"kernel.core_pattern": "/host/pwn"}),
+        ("HostConfig", "ExtraHosts", ["metadata:169.254.169.254"]),
+        ("HostConfig", "MaskedPaths", []),
+        ("HostConfig", "ReadonlyPaths", []),
         (
             "HostConfig",
             "Ulimits",
@@ -1893,6 +1925,40 @@ def test_docker_executor_rejects_security_policy_drift_before_start(
     argvs = [call[0] for call in runtime.calls]
 
     assert not any(argv[1] == "start" for argv in argvs)
+
+
+@pytest.mark.parametrize(
+    ("field", "unsafe"),
+    [
+        ("MaskedPaths", CAPTURED_MOBY_MASKED_PATHS + ["relative/path"]),
+        ("ReadonlyPaths", CAPTURED_MOBY_READONLY_PATHS + ["/proc/sys"]),
+    ],
+)
+def test_moby_proc_restriction_invariant_rejects_relative_or_duplicate_paths(
+    tmp_path: Path, field: str, unsafe: list[str]
+) -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["HostConfig"][field] = unsafe
+
+    runtime = FakeDockerRuntime(inspect_mutator=mutate)
+    with pytest.raises(ReplayContractError, match="policy"):
+        _docker_execute(runtime, tmp_path)
+
+    assert not any(call[0][1] == "start" for call in runtime.calls)
+
+
+def test_moby_proc_restriction_invariant_allows_additional_safe_masks(
+    tmp_path: Path,
+) -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["HostConfig"]["MaskedPaths"].append("/sys/devices/virtual/powercap")
+        payload["HostConfig"]["ReadonlyPaths"].append("/proc/pressure")
+
+    evidence = _docker_execute(
+        FakeDockerRuntime(inspect_mutator=mutate), tmp_path
+    )
+
+    assert evidence.resolved is True
 
 
 @pytest.mark.parametrize("drift", ["missing_mount", "wrong_mount_options", "zero_pid"])

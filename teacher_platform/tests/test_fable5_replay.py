@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -2629,6 +2630,9 @@ def test_inventory_arithmetic_and_explicit_smoke_manifest_are_exhaustive() -> No
         sidecar_sha256="9" * 64,
         policy_sha256="a" * 64,
         admission_sha256="b" * 64,
+        policy_artifact_sha256="1" * 64,
+        admission_artifact_sha256="2" * 64,
+        smoke_manifest_sha256="3" * 64,
         exclusion_artifacts=(("evaluation.json", "e" * 64),),
         seed_evidence_sha256="d" * 64,
         seed_commit_sha=MOONSHINER_REVISION,
@@ -2825,6 +2829,9 @@ def test_eligibility_binds_canonical_ordered_exclusion_artifacts() -> None:
         "sidecar_sha256": "9" * 64,
         "policy_sha256": "a" * 64,
         "admission_sha256": "b" * 64,
+        "policy_artifact_sha256": "1" * 64,
+        "admission_artifact_sha256": "2" * 64,
+        "smoke_manifest_sha256": "3" * 64,
         "seed_evidence_sha256": "d" * 64,
         "seed_commit_sha": MOONSHINER_REVISION,
         "seed_tree_sha": "c" * 40,
@@ -2844,6 +2851,17 @@ def test_eligibility_binds_canonical_ordered_exclusion_artifacts() -> None:
         ),
     )
     assert first["inventory_sha256"] != changed["inventory_sha256"]
+    changed_smoke_input = replay.build_eligibility_inventory(
+        [candidate],
+        replay.EligibilityBindings(
+            **{
+                **common,
+                "smoke_manifest_sha256": "4" * 64,
+            },
+            exclusion_artifacts=(("evaluation.json", "e" * 64),),
+        ),
+    )
+    assert first["inventory_sha256"] != changed_smoke_input["inventory_sha256"]
     with pytest.raises(ReplayContractError, match="exclusion artifact"):
         replay.build_eligibility_inventory(
             [candidate],
@@ -2876,6 +2894,9 @@ def test_inventory_cli_rejects_nonexact_policy_digest(
         replay,
         "SOURCE_LFS_SHA256",
         hashlib.sha256(source.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setattr(
+        replay, "SOURCE_BYTES", source.stat().st_size, raising=False
     )
     sidecar = tmp_path / "sidecar.jsonl"
     sidecar.write_text("")
@@ -3085,6 +3106,9 @@ def _inventory_cli_fixture(
         replay,
         "SOURCE_LFS_SHA256",
         hashlib.sha256(source.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setattr(
+        replay, "SOURCE_BYTES", source.stat().st_size, raising=False
     )
     sidecar = tmp_path / "sidecar.jsonl"
     sidecar.write_text(
@@ -3313,6 +3337,93 @@ def test_inventory_cli_rejects_missing_exclusion_artifact(
 
     with pytest.raises(ReplayContractError, match="exclusion.*missing"):
         replay.main(argv)
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        "--source",
+        "--sidecar",
+        "--exclusion",
+        "--policy",
+        "--admission",
+        "--smoke-manifest",
+    ],
+)
+def test_inventory_cli_rejects_input_replacement_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    argument: str,
+) -> None:
+    argv, out, _exclusion = _inventory_cli_fixture(tmp_path, monkeypatch)
+    target = Path(argv[argv.index(argument) + 1])
+    original_build = replay.build_smoke_manifest
+
+    def replace_after_all_inputs_are_parsed(
+        inventory: dict[str, object], trajectory_ids: list[str]
+    ) -> dict[str, object]:
+        target.rename(target.with_name(target.name + ".original"))
+        target.write_text("{}\n", encoding="utf-8")
+        return original_build(inventory, trajectory_ids)
+
+    monkeypatch.setattr(
+        replay, "build_smoke_manifest", replace_after_all_inputs_are_parsed
+    )
+    with pytest.raises(ReplayContractError, match="input.*identity"):
+        replay.main(argv)
+    assert not out.exists()
+
+
+def test_inventory_cli_requires_exact_pinned_source_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv, out, _exclusion = _inventory_cli_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(replay, "SOURCE_BYTES", replay.SOURCE_BYTES + 1)
+
+    with pytest.raises(ReplayContractError, match="source.*size"):
+        replay.main(argv)
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("mode", [0o664, 0o755, 0o4644])
+def test_inventory_cli_rejects_unsafe_input_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int
+) -> None:
+    argv, out, _exclusion = _inventory_cli_fixture(tmp_path, monkeypatch)
+    policy = Path(argv[argv.index("--policy") + 1])
+    policy.chmod(mode)
+
+    with pytest.raises(ReplayContractError, match="input.*mode"):
+        replay.main(argv)
+    assert not out.exists()
+
+
+def test_inventory_cli_opens_each_mutable_input_once_with_nofollow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv, _out, _exclusion = _inventory_cli_fixture(tmp_path, monkeypatch)
+    arguments = (
+        "--source",
+        "--sidecar",
+        "--exclusion",
+        "--policy",
+        "--admission",
+        "--smoke-manifest",
+    )
+    names = {Path(argv[argv.index(argument) + 1]).name for argument in arguments}
+    opens: Counter[str] = Counter()
+    original_open = os.open
+
+    def recording_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        name = Path(os.fspath(path)).name
+        if name in names and not flags & os.O_DIRECTORY:
+            assert flags & os.O_NOFOLLOW
+            opens[name] += 1
+        return original_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(replay.os, "open", recording_open)
+    assert replay.main(argv) == 0
+    assert opens == Counter({name: 1 for name in names})
 
 
 class FakeRestrictedExecutor:

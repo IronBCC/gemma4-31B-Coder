@@ -26,7 +26,7 @@ import tempfile
 import time
 import unicodedata
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, Protocol
@@ -34,6 +34,7 @@ from typing import Any, Final, Protocol
 if __package__:  # Support both ``python -m teacher_platform...`` and local tests.
     from .fable5_import import (
         DATASET_REVISION,
+        SOURCE_BYTES,
         SOURCE_LFS_SHA256,
         FableEditOp,
         FableWriteOp,
@@ -48,6 +49,7 @@ if __package__:  # Support both ``python -m teacher_platform...`` and local test
 else:  # pragma: no cover - the branch is exercised by local tests.
     from fable5_import import (  # type: ignore[no-redef]
         DATASET_REVISION,
+        SOURCE_BYTES,
         SOURCE_LFS_SHA256,
         FableEditOp,
         FableWriteOp,
@@ -416,6 +418,9 @@ class EligibilityBindings:
     sidecar_sha256: str
     policy_sha256: str
     admission_sha256: str
+    policy_artifact_sha256: str
+    admission_artifact_sha256: str
+    smoke_manifest_sha256: str
     exclusion_artifacts: tuple[tuple[str, str], ...]
     seed_evidence_sha256: str
     seed_commit_sha: str
@@ -3584,6 +3589,215 @@ def validate_replay_evidence_payload(payload: object) -> ReplayEvidence:
     return evidence
 
 
+def _open_real_input_directory(path: Path) -> int:
+    """Open one user-owned, non-writable-by-others directory without symlinks."""
+
+    absolute = Path(os.path.abspath(path))
+    parts = absolute.parts
+    descriptor = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for component in parts[1:]:
+            try:
+                child = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+            except OSError as exc:
+                raise ReplayContractError(
+                    "input parent has a symlink or non-directory component"
+                ) from exc
+            os.close(descriptor)
+            descriptor = child
+        status = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(status.st_mode)
+            or status.st_uid != os.getuid()
+            or stat.S_IMODE(status.st_mode) & 0o022
+        ):
+            raise ReplayContractError(
+                "input parent must be user-owned and not writable by others"
+            )
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _input_file_snapshot(status: os.stat_result) -> tuple[int, ...]:
+    return (
+        status.st_dev,
+        status.st_ino,
+        status.st_nlink,
+        status.st_uid,
+        stat.S_IMODE(status.st_mode),
+        status.st_size,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
+
+
+@dataclass
+class _BoundInput:
+    path: Path
+    label: str
+    parent_fd: int
+    descriptor: int
+    parent_identity: tuple[int, int]
+    file_snapshot: tuple[int, ...]
+    size: int
+    max_bytes: int
+    _consumed: bool = False
+    _sha256: str | None = None
+
+    @classmethod
+    def open(
+        cls,
+        path: Path,
+        *,
+        label: str,
+        max_bytes: int,
+        exact_bytes: int | None = None,
+    ) -> _BoundInput:
+        absolute = Path(os.path.abspath(path))
+        if not absolute.name or absolute.name in {".", ".."}:
+            raise ReplayContractError(f"{label} input path is not confined")
+        parent_fd = _open_real_input_directory(absolute.parent)
+        descriptor = -1
+        try:
+            try:
+                named = os.stat(
+                    absolute.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                descriptor = os.open(
+                    absolute.name,
+                    os.O_RDONLY
+                    | os.O_NOFOLLOW
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=parent_fd,
+                )
+            except (FileNotFoundError, OSError) as exc:
+                raise ReplayContractError(
+                    f"{label} input is missing or unsafe"
+                ) from exc
+            opened = os.fstat(descriptor)
+            mode = stat.S_IMODE(opened.st_mode)
+            if (
+                not stat.S_ISREG(named.st_mode)
+                or not stat.S_ISREG(opened.st_mode)
+                or named.st_nlink != 1
+                or opened.st_nlink != 1
+                or opened.st_uid != os.getuid()
+                or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+            ):
+                raise ReplayContractError(f"{label} input identity is unsafe")
+            if not mode & 0o400 or mode & 0o7133:
+                raise ReplayContractError(f"{label} input mode is unsafe")
+            if type(max_bytes) is not int or max_bytes <= 0:
+                raise ReplayContractError(f"{label} input size bound is invalid")
+            if opened.st_size > max_bytes:
+                raise ReplayContractError(f"{label} input size exceeds its bound")
+            if exact_bytes is not None and opened.st_size != exact_bytes:
+                raise ReplayContractError(f"{label} input size does not match its pin")
+            parent_status = os.fstat(parent_fd)
+            return cls(
+                absolute,
+                label,
+                parent_fd,
+                descriptor,
+                (parent_status.st_dev, parent_status.st_ino),
+                _input_file_snapshot(opened),
+                opened.st_size,
+                max_bytes,
+            )
+        except Exception:
+            if descriptor >= 0:
+                os.close(descriptor)
+            os.close(parent_fd)
+            raise
+
+    def _finish_read(self, digest: Any, byte_count: int) -> None:
+        if byte_count != self.size:
+            raise ReplayContractError(f"{self.label} input changed while reading")
+        if _input_file_snapshot(os.fstat(self.descriptor)) != self.file_snapshot:
+            raise ReplayContractError(f"{self.label} input identity changed while reading")
+        self._sha256 = digest.hexdigest()
+
+    def read_bytes(self) -> bytes:
+        if self._consumed:
+            raise ReplayContractError(f"{self.label} input was consumed more than once")
+        self._consumed = True
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        byte_count = 0
+        while chunk := os.read(self.descriptor, min(1024 * 1024, self.max_bytes + 1)):
+            byte_count += len(chunk)
+            if byte_count > self.max_bytes:
+                raise ReplayContractError(f"{self.label} input size exceeds its bound")
+            digest.update(chunk)
+            chunks.append(chunk)
+        self._finish_read(digest, byte_count)
+        return b"".join(chunks)
+
+    def iter_lines(self) -> Iterable[tuple[int, bytes]]:
+        if self._consumed:
+            raise ReplayContractError(f"{self.label} input was consumed more than once")
+        self._consumed = True
+        digest = hashlib.sha256()
+        buffer = b""
+        byte_count = 0
+        line_number = 0
+        while chunk := os.read(self.descriptor, 1024 * 1024):
+            byte_count += len(chunk)
+            if byte_count > self.max_bytes:
+                raise ReplayContractError(f"{self.label} input size exceeds its bound")
+            digest.update(chunk)
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                line_number += 1
+                yield line_number, line
+            if len(buffer) > 64 * 1024**2:
+                raise ReplayContractError(f"{self.label} input has an oversized line")
+        if buffer:
+            line_number += 1
+            yield line_number, buffer
+        self._finish_read(digest, byte_count)
+
+    @property
+    def sha256(self) -> str:
+        if self._sha256 is None:
+            raise ReplayContractError(f"{self.label} input was not fully consumed")
+        return self._sha256
+
+    def assert_identity(self) -> None:
+        if _input_file_snapshot(os.fstat(self.descriptor)) != self.file_snapshot:
+            raise ReplayContractError(f"{self.label} input identity changed")
+        try:
+            named = os.stat(
+                self.path.name,
+                dir_fd=self.parent_fd,
+                follow_symlinks=False,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            raise ReplayContractError(f"{self.label} input identity changed") from exc
+        if _input_file_snapshot(named) != self.file_snapshot:
+            raise ReplayContractError(f"{self.label} input identity changed")
+        reopened = _open_real_input_directory(self.path.parent)
+        try:
+            status = os.fstat(reopened)
+            if (status.st_dev, status.st_ino) != self.parent_identity:
+                raise ReplayContractError(f"{self.label} input identity changed")
+        finally:
+            os.close(reopened)
+
+    def close(self) -> None:
+        os.close(self.descriptor)
+        os.close(self.parent_fd)
+
+
 def _open_real_private_directory(path: Path, *, create: bool = False) -> int:
     """Open a real owner-private directory without following any component."""
 
@@ -4225,6 +4439,9 @@ def build_eligibility_inventory(
         "sidecar_sha256",
         "policy_sha256",
         "admission_sha256",
+        "policy_artifact_sha256",
+        "admission_artifact_sha256",
+        "smoke_manifest_sha256",
         "seed_evidence_sha256",
     ):
         if not _is_sha256(getattr(bindings, field_name)):
@@ -4363,31 +4580,54 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+_MAX_JSON_INPUT_BYTES: Final = 64 * 1024**2
+_MAX_EXCLUSION_INPUT_BYTES: Final = 256 * 1024**2
+_MAX_SIDECAR_INPUT_BYTES: Final = 2 * 1024**3
+
+
+def _bound_json_document(bound: _BoundInput) -> Any:
+    try:
+        return json.loads(bound.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReplayContractError(f"{bound.label} input is invalid JSON") from exc
+
+
+def _bound_jsonl_rows(bound: _BoundInput) -> Iterable[Mapping[str, Any]]:
+    for line_number, line in bound.iter_lines():
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ReplayContractError(
+                f"{bound.label} input line {line_number} is invalid JSON"
+            ) from exc
+        if type(value) is not dict:
+            raise ReplayContractError(
+                f"{bound.label} input line {line_number} is not an object"
+            )
+        yield value
+
+
 def _load_bound_exclusion_inputs(
-    paths: Sequence[Path],
+    inputs: Sequence[tuple[str, _BoundInput]],
 ) -> tuple[tuple[Any, ...], tuple[tuple[str, str], ...]]:
     loaded: list[tuple[str, str, Any]] = []
     seen: set[str] = set()
-    for path in paths:
-        label = Path(path).name
+    for label, bound in inputs:
         if not label or _TASK_RE.fullmatch(label) is None or label in seen:
             raise ReplayContractError(
                 "exclusion artifacts require unique stable filename labels"
             )
         seen.add(label)
         try:
-            raw, _mode = _read_regular_no_follow(Path(path))
-        except ReplayContractError as exc:
-            raise ReplayContractError(
-                f"exclusion artifact {label!r} is missing or unsafe"
-            ) from exc
-        try:
+            raw = bound.read_bytes()
             record = parse_exclusion_artifact(raw)
         except (ValueError, json.JSONDecodeError) as exc:
             raise ReplayContractError(
                 f"exclusion artifact {label!r} is invalid"
             ) from exc
-        loaded.append((label, _sha256(raw), record))
+        loaded.append((label, bound.sha256, record))
     loaded.sort(key=lambda item: item[0].encode("utf-8"))
     return (
         tuple(item[2] for item in loaded),
@@ -4401,173 +4641,242 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if not args.inventory_only:
         raise ReplayContractError("live replay is disabled; use --inventory-only")
-    for name in ("source", "sidecar", "seed_repo", "policy", "admission", "smoke_manifest"):
-        if not getattr(args, name).exists():
-            raise ReplayContractError(f"explicit --{name.replace('_', '-')} input is missing")
-    exclusions, exclusion_artifacts = _load_bound_exclusion_inputs(args.exclusion)
-    if _sha256_path(args.source) != SOURCE_LFS_SHA256:
-        raise ReplayContractError("explicit source artifact does not match the pinned hash")
-    try:
-        policy_document = json.loads(args.policy.read_text(encoding="utf-8"))
-        admission_document = json.loads(args.admission.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ReplayContractError("policy/admission input is invalid JSON") from exc
-    policy, policy_sha = _policy_from_artifact(policy_document)
-    admitted = validate_admission_artifact(policy_document, admission_document)
-    try:
-        sidecar_rows = [
-            json.loads(line)
-            for line in args.sidecar.read_text(encoding="utf-8").splitlines()
-            if line
-        ]
-    except json.JSONDecodeError as exc:
-        raise ReplayContractError("structural sidecar is invalid JSONL") from exc
+    bound_inputs: list[_BoundInput] = []
 
-    def source_rows() -> Iterable[Mapping[str, Any]]:
-        with args.source.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                try:
-                    value = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise ReplayContractError(
-                        f"source line {line_number} is invalid JSON"
-                    ) from exc
-                if type(value) is not dict:
-                    raise ReplayContractError(f"source line {line_number} is not an object")
-                yield value
+    def bind(
+        path: Path,
+        *,
+        label: str,
+        max_bytes: int,
+        exact_bytes: int | None = None,
+    ) -> _BoundInput:
+        bound = _BoundInput.open(
+            path,
+            label=label,
+            max_bytes=max_bytes,
+            exact_bytes=exact_bytes,
+        )
+        bound_inputs.append(bound)
+        return bound
 
-    structural = validate_structural_sidecar(source_rows(), sidecar_rows)
-    seed_source = GitSeedSource(args.seed_repo, MOONSHINER_REVISION)
-    seed_evidence = validate_seed_repository(seed_source)
-    candidates: list[EligibilityCandidate] = []
-    with tempfile.TemporaryDirectory(prefix="fable-inventory-") as temporary:
-        workspace = Path(temporary)
-        for index, record in enumerate(structural):
-            language = record["language"]
-            selected = None
-            operations_supported = True
-            try:
-                selected = select_terminal_row(record["row"])
-            except Exception:
-                operations_supported = False
-            try:
-                contract = materialize_seed(
-                    seed_source,
-                    record["task"],
-                    workspace / f"seed-{index}",
-                )
-            except ReplayContractError:
-                candidates.append(
-                    EligibilityCandidate(
-                        trajectory_id=record["trajectory_id"],
-                        task=record["task"],
-                        language=language,
-                        operations_supported=operations_supported,
-                        decontaminated=True,
-                        git_seed_valid=False,
-                        reference_patch_valid=False,
-                        language_digest_present=language in dict(policy.images),
-                        admission_valid=language in admitted,
-                    )
-                )
-                continue
+    try:
+        source_input = bind(
+            args.source,
+            label="source",
+            max_bytes=SOURCE_BYTES,
+            exact_bytes=SOURCE_BYTES,
+        )
+        sidecar_input = bind(
+            args.sidecar,
+            label="sidecar",
+            max_bytes=_MAX_SIDECAR_INPUT_BYTES,
+        )
+        policy_input = bind(
+            args.policy,
+            label="policy",
+            max_bytes=_MAX_JSON_INPUT_BYTES,
+        )
+        admission_input = bind(
+            args.admission,
+            label="admission",
+            max_bytes=_MAX_JSON_INPUT_BYTES,
+        )
+        smoke_input = bind(
+            args.smoke_manifest,
+            label="smoke manifest",
+            max_bytes=_MAX_JSON_INPUT_BYTES,
+        )
+        exclusion_inputs: list[tuple[str, _BoundInput]] = []
+        exclusion_labels: set[str] = set()
+        for path in args.exclusion:
+            label = Path(path).name
             if (
-                selected is None
-                or selected.language != language
-                or contract.language != language
+                not label
+                or _TASK_RE.fullmatch(label) is None
+                or label in exclusion_labels
             ):
-                candidates.append(
-                    EligibilityCandidate(
-                        trajectory_id=record["trajectory_id"],
-                        task=record["task"],
-                        language=language,
-                        operations_supported=operations_supported,
-                        decontaminated=True,
-                        git_seed_valid=False,
-                        reference_patch_valid=False,
-                        language_digest_present=language in dict(policy.images),
-                        admission_valid=language in admitted,
-                    )
+                raise ReplayContractError(
+                    "exclusion artifacts require unique stable filename labels"
                 )
-                continue
-            try:
-                plan = canonical_mutation_plan(
-                    selected.messages,
-                    frozenset(contract.protected_paths),
-                    contract.verify_cmd,
-                )
-                operations_supported = bool(plan.operations)
-            except Exception:
-                operations_supported = False
-            reference_ok = preflight_reference_patch(contract).eligible
-            contaminated = None
-            try:
-                assessment = assess_converted_trajectory(
-                    selected,
-                    protected_paths=contract.protected_paths,
-                    verify_cmd=contract.verify_cmd,
-                    exclusions=exclusions,
-                )
-                contaminated = assessment.decontamination_reason
-            except Exception:
-                operations_supported = False
-            candidates.append(
-                EligibilityCandidate(
-                    trajectory_id=record["trajectory_id"],
-                    task=record["task"],
-                    language=language,
-                    operations_supported=operations_supported,
-                    decontaminated=contaminated is None,
-                    git_seed_valid=True,
-                    reference_patch_valid=reference_ok,
-                    language_digest_present=language in dict(policy.images),
-                    admission_valid=language in admitted,
+            exclusion_labels.add(label)
+            exclusion_inputs.append(
+                (
+                    label,
+                    bind(
+                        path,
+                        label=f"exclusion {label}",
+                        max_bytes=_MAX_EXCLUSION_INPUT_BYTES,
+                    ),
                 )
             )
-    bindings = EligibilityBindings(
-        source_sha256=_sha256_path(args.source),
-        sidecar_sha256=_sha256_path(args.sidecar),
-        policy_sha256=policy_sha,
-        admission_sha256=admission_document["admission_sha256"],
-        exclusion_artifacts=exclusion_artifacts,
-        seed_evidence_sha256=seed_evidence["seed_evidence_sha256"],
-        seed_commit_sha=seed_evidence["source_commit_sha"],
-        seed_tree_sha=seed_evidence["tasks_seed_tree_sha"],
-    )
-    inventory = build_eligibility_inventory(candidates, bindings)
-    smoke_payload = json.loads(args.smoke_manifest.read_text(encoding="utf-8"))
-    if type(smoke_payload) is not list or any(type(value) is not str for value in smoke_payload):
-        raise ReplayContractError("smoke manifest input must be an explicit trajectory ID list")
-    smoke = build_smoke_manifest(inventory, smoke_payload)
-    output_fd = _open_real_private_directory(args.out, create=True)
-    output_identity = _private_directory_identity(
-        output_fd, label="output directory"
-    )
 
-    def assert_output_identity() -> None:
-        _assert_path_directory_identity(
-            args.out,
-            output_fd,
-            output_identity,
-            label="output directory",
+        policy_document = _bound_json_document(policy_input)
+        admission_document = _bound_json_document(admission_input)
+        smoke_payload = _bound_json_document(smoke_input)
+        exclusions, exclusion_artifacts = _load_bound_exclusion_inputs(
+            exclusion_inputs
+        )
+        policy, policy_sha = _policy_from_artifact(policy_document)
+        admitted = validate_admission_artifact(
+            policy_document, admission_document
+        )
+        sidecar_rows = list(_bound_jsonl_rows(sidecar_input))
+        structural = validate_structural_sidecar(
+            _bound_jsonl_rows(source_input), sidecar_rows
+        )
+        if source_input.sha256 != SOURCE_LFS_SHA256:
+            raise ReplayContractError(
+                "source input hash does not match its pin"
+            )
+
+        seed_source = GitSeedSource(args.seed_repo, MOONSHINER_REVISION)
+        seed_evidence = validate_seed_repository(seed_source)
+        candidates: list[EligibilityCandidate] = []
+        with tempfile.TemporaryDirectory(prefix="fable-inventory-") as temporary:
+            workspace = Path(temporary)
+            for index, record in enumerate(structural):
+                language = record["language"]
+                selected = None
+                operations_supported = True
+                try:
+                    selected = select_terminal_row(record["row"])
+                except Exception:
+                    operations_supported = False
+                try:
+                    contract = materialize_seed(
+                        seed_source,
+                        record["task"],
+                        workspace / f"seed-{index}",
+                    )
+                except ReplayContractError:
+                    candidates.append(
+                        EligibilityCandidate(
+                            trajectory_id=record["trajectory_id"],
+                            task=record["task"],
+                            language=language,
+                            operations_supported=operations_supported,
+                            decontaminated=True,
+                            git_seed_valid=False,
+                            reference_patch_valid=False,
+                            language_digest_present=language in dict(policy.images),
+                            admission_valid=language in admitted,
+                        )
+                    )
+                    continue
+                if (
+                    selected is None
+                    or selected.language != language
+                    or contract.language != language
+                ):
+                    candidates.append(
+                        EligibilityCandidate(
+                            trajectory_id=record["trajectory_id"],
+                            task=record["task"],
+                            language=language,
+                            operations_supported=operations_supported,
+                            decontaminated=True,
+                            git_seed_valid=False,
+                            reference_patch_valid=False,
+                            language_digest_present=language in dict(policy.images),
+                            admission_valid=language in admitted,
+                        )
+                    )
+                    continue
+                try:
+                    plan = canonical_mutation_plan(
+                        selected.messages,
+                        frozenset(contract.protected_paths),
+                        contract.verify_cmd,
+                    )
+                    operations_supported = bool(plan.operations)
+                except Exception:
+                    operations_supported = False
+                reference_ok = preflight_reference_patch(contract).eligible
+                contaminated = None
+                try:
+                    assessment = assess_converted_trajectory(
+                        selected,
+                        protected_paths=contract.protected_paths,
+                        verify_cmd=contract.verify_cmd,
+                        exclusions=exclusions,
+                    )
+                    contaminated = assessment.decontamination_reason
+                except Exception:
+                    operations_supported = False
+                candidates.append(
+                    EligibilityCandidate(
+                        trajectory_id=record["trajectory_id"],
+                        task=record["task"],
+                        language=language,
+                        operations_supported=operations_supported,
+                        decontaminated=contaminated is None,
+                        git_seed_valid=True,
+                        reference_patch_valid=reference_ok,
+                        language_digest_present=language in dict(policy.images),
+                        admission_valid=language in admitted,
+                    )
+                )
+
+        bindings = EligibilityBindings(
+            source_sha256=source_input.sha256,
+            sidecar_sha256=sidecar_input.sha256,
+            policy_sha256=policy_sha,
+            admission_sha256=admission_document["admission_sha256"],
+            policy_artifact_sha256=policy_input.sha256,
+            admission_artifact_sha256=admission_input.sha256,
+            smoke_manifest_sha256=smoke_input.sha256,
+            exclusion_artifacts=exclusion_artifacts,
+            seed_evidence_sha256=seed_evidence["seed_evidence_sha256"],
+            seed_commit_sha=seed_evidence["source_commit_sha"],
+            seed_tree_sha=seed_evidence["tasks_seed_tree_sha"],
+        )
+        inventory = build_eligibility_inventory(candidates, bindings)
+        if type(smoke_payload) is not list or any(
+            type(value) is not str for value in smoke_payload
+        ):
+            raise ReplayContractError(
+                "smoke manifest input must be an explicit trajectory ID list"
+            )
+        smoke = build_smoke_manifest(inventory, smoke_payload)
+
+        def assert_input_identities() -> None:
+            for bound in bound_inputs:
+                bound.assert_identity()
+
+        assert_input_identities()
+        output_fd = _open_real_private_directory(args.out, create=True)
+        output_identity = _private_directory_identity(
+            output_fd, label="output directory"
         )
 
-    try:
-        for name, payload in (
-            ("eligibility.json", inventory),
-            ("smoke.json", smoke),
-        ):
-            _atomic_write_0600_at(
+        def assert_publication_boundaries() -> None:
+            assert_input_identities()
+            _assert_path_directory_identity(
+                args.out,
                 output_fd,
-                name,
-                _canonical_json(payload) + b"\n",
-                before_rename=assert_output_identity,
-                after_rename=lambda _fd, _name: assert_output_identity(),
+                output_identity,
+                label="output directory",
             )
-            assert_output_identity()
+
+        try:
+            for name, payload in (
+                ("eligibility.json", inventory),
+                ("smoke.json", smoke),
+            ):
+                _atomic_write_0600_at(
+                    output_fd,
+                    name,
+                    _canonical_json(payload) + b"\n",
+                    before_rename=assert_publication_boundaries,
+                    after_rename=lambda _fd, _name: assert_publication_boundaries(),
+                )
+                assert_publication_boundaries()
+        finally:
+            os.close(output_fd)
+        return 0
     finally:
-        os.close(output_fd)
-    return 0
+        for bound in reversed(bound_inputs):
+            bound.close()
 
 
 __all__ = [

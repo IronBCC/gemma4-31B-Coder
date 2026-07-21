@@ -625,6 +625,40 @@ def test_bash_translation_fails_closed_for_mutation_and_ambiguous_construction(
         )
 
 
+@pytest.mark.parametrize(
+    ("command", "expected_fragment"),
+    [
+        ("cat escape.txt", "SECRET"),
+        ("ls escape-dir/", "secret.txt"),
+        ("rg SECRET escape.txt", "SECRET"),
+    ],
+)
+def test_ordinary_bash_rejects_relative_symlink_disclosure(
+    tmp_path: Path, command: str, expected_fragment: str
+) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-bash-outside"
+    outside.mkdir(exist_ok=True)
+    secret = outside / "secret.txt"
+    secret.write_text("SECRET\n", encoding="utf-8")
+    (tmp_path / "escape.txt").symlink_to(secret)
+    (tmp_path / "escape-dir").symlink_to(outside, target_is_directory=True)
+
+    raw = subprocess.run(
+        ["bash", "-c", command],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert raw.returncode == 0
+    assert expected_fragment in raw.stdout
+
+    with pytest.raises(ValueError, match="ambiguous_bash_mutation"):
+        parse_fable_tool_call(
+            fable_tool_call("Bash", {"command": command}), frozenset()
+        )
+
+
 def test_file_compile_mode_is_proven_mutating_and_rejected(tmp_path: Path) -> None:
     (tmp_path / "magic").write_text("0 string TEST test-value\n", encoding="utf-8")
     raw = subprocess.run(
@@ -648,20 +682,59 @@ def test_file_compile_mode_is_proven_mutating_and_rejected(tmp_path: Path) -> No
     "command",
     [
         "pwd",
-        "ls -la src",
-        "rg -n parser src | head -n 20",
-        "sed -n '1,20p' src/lib.rs",
+        "ls",
+        "ls .",
+        "ls -la",
+        "ls -la .",
         "git status --short",
+        "git diff",
+        "git diff --stat",
         "git diff -- src/lib.rs",
     ],
 )
-def test_bash_translation_preserves_narrow_read_only_policy(command: str) -> None:
+def test_bash_translation_preserves_exact_read_only_grammar(command: str) -> None:
     assert (
         translate_fable_tool_call(
             fable_tool_call("Bash", {"command": command}), frozenset()
         )
         == command
     )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat src/lib.rs",
+        "cut -d: -f1 src/lib.rs",
+        "echo hello",
+        "grep parser src/lib.rs",
+        "head src/lib.rs",
+        "jq . manifest.json",
+        "ls src",
+        "printf hello",
+        "realpath src/lib.rs",
+        "rg -n parser src",
+        "sed -n 1p -- src/lib.rs",
+        "sed -n 1p src/lib.rs -e 'w output'",
+        "sed -n 1p src/lib.rs --file=commands.sed",
+        "stat src/lib.rs",
+        "tail src/lib.rs",
+        "tree src",
+        "tr a b",
+        "wc src/lib.rs",
+        "which python3",
+        "git log --oneline",
+        "git show HEAD",
+        "git grep parser src",
+        "git diff -- src/lib.rs src/main.rs",
+    ],
+)
+def test_bash_translation_rejects_every_non_grammar_utility(command: str) -> None:
+    with pytest.raises(ValueError, match="ambiguous_bash_mutation"):
+        parse_fable_tool_call(
+            fable_tool_call("Bash", {"command": command}), frozenset()
+        )
+
 
 
 @pytest.mark.parametrize(
@@ -818,6 +891,62 @@ def test_mutation_translation_rejects_hardlink_identity_of_protected_file(
 
     assert result.returncode != 0
     assert protected.read_text(encoding="utf-8") == "SAFE"
+
+
+@pytest.mark.parametrize("tool_name", ["Write", "Edit"])
+def test_mutation_translation_rejects_outside_hardlink_before_io(
+    tmp_path: Path, tool_name: str
+) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-{tool_name.lower()}-outside-hardlink"
+    outside.mkdir()
+    secret = outside / "secret.py"
+    secret.write_text("SAFE", encoding="utf-8")
+    alias = tmp_path / "alias.py"
+    alias.hardlink_to(secret)
+    arguments: dict[str, object]
+    if tool_name == "Write":
+        arguments = {"file_path": "alias.py", "content": "PWN"}
+    else:
+        arguments = {
+            "file_path": "alias.py",
+            "old_string": "SAFE",
+            "new_string": "PWN",
+        }
+
+    command = translate_fable_tool_call(
+        fable_tool_call(tool_name, arguments), frozenset()
+    )
+    result = _run_in_testbed(command, tmp_path)
+
+    assert result.returncode != 0
+    assert "hardlink" in result.stderr
+    assert secret.read_text(encoding="utf-8") == "SAFE"
+
+
+@pytest.mark.parametrize("tool_name", ["Write", "Edit"])
+def test_mutation_translation_uses_inode_stable_no_follow_descriptor(
+    tool_name: str,
+) -> None:
+    arguments: dict[str, object]
+    if tool_name == "Write":
+        arguments = {"file_path": "src/lib.rs", "content": "after"}
+    else:
+        arguments = {
+            "file_path": "src/lib.rs",
+            "old_string": "before",
+            "new_string": "after",
+        }
+
+    command = translate_fable_tool_call(
+        fable_tool_call(tool_name, arguments), frozenset()
+    )
+
+    assert "os.O_NOFOLLOW" in command
+    assert "os.fstat(fd)" in command
+    assert "opened.st_dev != pre_stat.st_dev" in command
+    assert "opened.st_ino != pre_stat.st_ino" in command
+    assert "path.write_text" not in command
+    assert "path.read_text" not in command
 
 
 @pytest.mark.parametrize("tool_name", ["Write", "Edit"])

@@ -588,7 +588,21 @@ def _runtime_confinement_lines(
             ]
         )
     if kind == "mutation":
-        lines.append("path = candidate")
+        lines.extend(
+            [
+                "path = candidate",
+                "import os",
+                "import stat",
+                "try:",
+                "    pre_stat = os.stat(path, follow_symlinks=False)",
+                "except FileNotFoundError:",
+                "    pre_stat = None",
+                "if pre_stat is not None and not stat.S_ISREG(pre_stat.st_mode):",
+                "    raise SystemExit('mutation target is not a regular file')",
+                "if pre_stat is not None and pre_stat.st_nlink != 1:",
+                "    raise SystemExit('mutation target has a hardlink alias')",
+            ]
+        )
     return lines
 
 
@@ -631,31 +645,17 @@ _BASH_REDIRECTIONS: Final = frozenset(
 _BASH_MUTATORS: Final = frozenset(
     {"rm", "mv", "cp", "install", "touch", "tee", "patch", "perl"}
 )
-_BASH_ALLOWED_SIMPLE: Final = frozenset(
+_BASH_EXACT_READ_ONLY_ARGV: Final = frozenset(
     {
-        "cat",
-        "cut",
-        "diff",
-        "echo",
-        "grep",
-        "head",
-        "jq",
-        "ls",
-        "printf",
-        "pwd",
-        "realpath",
-        "rg",
-        "sed",
-        "stat",
-        "tail",
-        "tree",
-        "tr",
-        "wc",
-        "which",
+        ("pwd",),
+        ("ls",),
+        ("ls", "."),
+        ("ls", "-la"),
+        ("ls", "-la", "."),
+        ("git", "status", "--short"),
+        ("git", "diff"),
+        ("git", "diff", "--stat"),
     }
-)
-_READ_ONLY_GIT_SUBCOMMANDS: Final = frozenset(
-    {"diff", "grep", "log", "ls-files", "rev-parse", "show", "status"}
 )
 
 
@@ -712,68 +712,33 @@ def _audit_read_only_bash(command: str) -> str:
     if any(_token_has_external_absolute_path(token) for token in tokens):
         raise UnsupportedTrajectoryTool("Bash path is outside /testbed")
 
-    for segment in _bash_segments(tokens):
-        executable = segment[0]
-        if "=" in executable or executable.startswith("/"):
-            raise UnsupportedTrajectoryTool("Bash has an unsupported executable prefix")
-        if executable in _BASH_MUTATORS:
-            raise UnsupportedTrajectoryTool(f"Bash uses mutating command {executable}")
-        if executable == "sed":
-            if any(
-                token.startswith("--in-place") or token.startswith("-i")
-                for token in segment[1:]
-            ):
-                raise UnsupportedTrajectoryTool("Bash uses mutating command sed")
-            if (
-                len(segment) < 4
-                or segment[1] != "-n"
-                or not re.fullmatch(r"\d+(,\d+)?p", segment[2])
-            ):
-                raise UnsupportedTrajectoryTool("Bash sed form is not provably read-only")
-            continue
-        if executable == "rg" and any(
-            token in {"--pre", "--pre-glob"}
-            or token.startswith("--pre=")
-            or token.startswith("--pre-glob=")
-            for token in segment[1:]
-        ):
-            raise UnsupportedTrajectoryTool("Bash rg preprocessor is not read-only")
-        if executable == "diff" and any(
-            token == "-o" or token.startswith("--output")
-            for token in segment[1:]
-        ):
-            raise UnsupportedTrajectoryTool("Bash diff output is mutating")
-        if executable == "printf" and "-v" in segment[1:]:
-            raise UnsupportedTrajectoryTool("Bash printf -v is ambiguous")
-        if executable == "tree" and any(
-            token == "-o" or token.startswith("--output")
-            for token in segment[1:]
-        ):
-            raise UnsupportedTrajectoryTool("Bash tree output is mutating")
-        if executable == "git":
-            if len(segment) < 2 or segment[1] not in _READ_ONLY_GIT_SUBCOMMANDS:
-                raise UnsupportedTrajectoryTool("Bash uses mutating git command")
-            if any(
-                token.startswith("-O")
-                or token in {"--ext-diff", "--textconv"}
-                or token.startswith("--open-files-in-pager")
-                or token.startswith("--output")
-                for token in segment[2:]
-            ):
-                raise UnsupportedTrajectoryTool("Bash uses mutating git command")
-            continue
-        if executable in {"python", "python3"}:
-            raise UnsupportedTrajectoryTool("Bash uses interpreter dynamic execution")
-        if executable == "cd":
-            if len(segment) != 2:
-                raise UnsupportedTrajectoryTool("Bash cd must have exactly one path")
-            continue
-        if executable in _BASH_ALLOWED_SIMPLE:
-            continue
-        raise UnsupportedTrajectoryTool(
-            f"unsupported Bash executable: {executable}"
-        )
-    return command
+    segments = _bash_segments(tokens)
+    if len(segments) != 1:
+        raise UnsupportedTrajectoryTool("Bash command composition is unsupported")
+    segment = segments[0]
+    executable = segment[0]
+    if "=" in executable or executable.startswith("/"):
+        raise UnsupportedTrajectoryTool("Bash has an unsupported executable prefix")
+    if executable in _BASH_MUTATORS:
+        raise UnsupportedTrajectoryTool(f"Bash uses mutating command {executable}")
+    if executable == "sed" and any(
+        token.startswith("--in-place") or token.startswith("-i")
+        for token in segment[1:]
+    ):
+        raise UnsupportedTrajectoryTool("Bash uses mutating command sed")
+    if executable in {"python", "python3"}:
+        raise UnsupportedTrajectoryTool("Bash uses interpreter dynamic execution")
+    if executable == "bash":
+        raise UnsupportedTrajectoryTool("unsupported Bash executable: bash")
+    argv = tuple(segment)
+    if argv in _BASH_EXACT_READ_ONLY_ARGV:
+        return command
+    if len(segment) == 4 and segment[:3] == ["git", "diff", "--"]:
+        _normalize_fable_path(segment[3])
+        return command
+    if executable == "git" and (len(segment) < 2 or segment[1] not in {"diff", "status"}):
+        raise UnsupportedTrajectoryTool("Bash uses mutating git command")
+    raise UnsupportedTrajectoryTool("Bash command is outside the exact read-only grammar")
 
 
 def _normalize_trusted_verifier_commands(
@@ -968,7 +933,28 @@ def lower_fable_operation(operation: FableOperation) -> str:
             + [
                 "import base64",
                 f"content = base64.b64decode({payload!r}).decode('utf-8')",
-                "path.write_text(content, encoding='utf-8')",
+                "flags = os.O_WRONLY | os.O_NOFOLLOW",
+                "if pre_stat is None:",
+                "    flags |= os.O_CREAT | os.O_EXCL",
+                "fd = os.open(path, flags, 0o666)",
+                "try:",
+                "    opened = os.fstat(fd)",
+                "    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:",
+                "        raise SystemExit('opened mutation target is not a unique regular file')",
+                "    if pre_stat is not None and (",
+                "        opened.st_dev != pre_stat.st_dev",
+                "        or opened.st_ino != pre_stat.st_ino",
+                "        or opened.st_nlink != pre_stat.st_nlink",
+                "    ):",
+                "        raise SystemExit('mutation target identity changed before write')",
+                "    os.ftruncate(fd, 0)",
+                "    handle = os.fdopen(fd, 'w', encoding='utf-8')",
+                "    fd = None",
+                "    with handle:",
+                "        handle.write(content)",
+                "finally:",
+                "    if fd is not None:",
+                "        os.close(fd)",
             ]
         )
     if isinstance(operation, FableEditOp):
@@ -986,25 +972,48 @@ def lower_fable_operation(operation: FableOperation) -> str:
             "import base64",
             f"old_string = base64.b64decode({old_payload!r}).decode('utf-8')",
             f"new_string = base64.b64decode({new_payload!r}).decode('utf-8')",
-            "text = path.read_text(encoding='utf-8')",
-            "matches = text.count(old_string)",
+            "if pre_stat is None:",
+            "    raise SystemExit('edit target does not exist')",
+            "fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)",
+            "try:",
+            "    opened = os.fstat(fd)",
+            "    if (",
+            "        not stat.S_ISREG(opened.st_mode)",
+            "        or opened.st_nlink != 1",
+            "        or opened.st_dev != pre_stat.st_dev",
+            "        or opened.st_ino != pre_stat.st_ino",
+            "        or opened.st_nlink != pre_stat.st_nlink",
+            "    ):",
+            "        raise SystemExit('edit target identity changed before read')",
+            "    handle = os.fdopen(fd, 'r+', encoding='utf-8')",
+            "    fd = None",
+            "    with handle:",
+            "        text = handle.read()",
+            "        matches = text.count(old_string)",
         ]
         if operation.replace_all:
             lines.extend(
                 [
-                    "if matches == 0:",
-                    "    raise SystemExit('expected at least one old_string match, found 0')",
+                    "        if matches == 0:",
+                    "            raise SystemExit('expected at least one old_string match, found 0')",
                 ]
             )
         else:
             lines.extend(
                 [
-                    "if matches != 1:",
-                    "    raise SystemExit(f'expected exactly one old_string match, found {matches}')",
+                    "        if matches != 1:",
+                    "            raise SystemExit(f'expected exactly one old_string match, found {matches}')",
                 ]
             )
-        lines.append(
-            "path.write_text(text.replace(old_string, new_string), encoding='utf-8')"
+        lines.extend(
+            [
+                "        handle.seek(0)",
+                "        handle.truncate(0)",
+                "        handle.write(text.replace(old_string, new_string))",
+                "finally:",
+                "    if fd is not None:",
+                "        os.close(fd)",
+            ]
         )
         return _quoted_python_editor(lines)
     if isinstance(operation, FableGlobOp):

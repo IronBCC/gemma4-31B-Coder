@@ -3209,6 +3209,7 @@ def test_inventory_cli_happy_path_publishes_bound_manifests(
         "rust",
         "cpp",
     ]
+    assert stat.S_IMODE(out.stat().st_mode) == 0o700
     assert stat.S_IMODE((out / "eligibility.json").stat().st_mode) == 0o600
     assert stat.S_IMODE((out / "smoke.json").stat().st_mode) == 0o600
 
@@ -3424,6 +3425,87 @@ def test_inventory_cli_opens_each_mutable_input_once_with_nofollow(
     monkeypatch.setattr(replay.os, "open", recording_open)
     assert replay.main(argv) == 0
     assert opens == Counter({name: 1 for name in names})
+
+
+def test_inventory_cli_mid_publication_input_replacement_leaves_no_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv, out, _exclusion = _inventory_cli_fixture(tmp_path, monkeypatch)
+    source = Path(argv[argv.index("--source") + 1])
+    original_write = replay._atomic_write_0600_at
+    replaced = False
+
+    def replace_after_first_manifest(
+        directory_fd: int,
+        name: str,
+        data: bytes,
+        **kwargs: object,
+    ) -> None:
+        nonlocal replaced
+        original_write(directory_fd, name, data, **kwargs)
+        if name == "eligibility.json" and not replaced:
+            replaced = True
+            source.rename(source.with_name(source.name + ".original"))
+            source.write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(replay, "_atomic_write_0600_at", replace_after_first_manifest)
+    with pytest.raises(ReplayContractError, match="source input identity"):
+        replay.main(argv)
+    assert not out.exists()
+
+
+def test_inventory_cli_refuses_existing_output_without_modifying_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv, out, _exclusion = _inventory_cli_fixture(tmp_path, monkeypatch)
+    out.mkdir(mode=0o700)
+    marker = out / "owned-by-caller"
+    marker.write_text("unchanged", encoding="utf-8")
+
+    with pytest.raises(ReplayContractError, match="output.*already exists"):
+        replay.main(argv)
+    assert marker.read_text(encoding="utf-8") == "unchanged"
+    assert sorted(path.name for path in out.iterdir()) == ["owned-by-caller"]
+
+
+def test_inventory_cli_rename_race_preserves_victim_and_leaves_no_owned_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv, out, _exclusion = _inventory_cli_fixture(tmp_path, monkeypatch)
+    victim = tmp_path / "victim"
+    victim.mkdir(mode=0o700)
+    marker = victim / "marker"
+    marker.write_text("unchanged", encoding="utf-8")
+    original_rename = replay._rename_directory_noreplace
+
+    def create_target_then_rename(
+        parent_fd: int, staging_name: str, output_name: str
+    ) -> None:
+        os.symlink(victim, output_name, dir_fd=parent_fd)
+        original_rename(parent_fd, staging_name, output_name)
+
+    monkeypatch.setattr(replay, "_rename_directory_noreplace", create_target_then_rename)
+    with pytest.raises(ReplayContractError, match="output.*already exists"):
+        replay.main(argv)
+    assert marker.read_text(encoding="utf-8") == "unchanged"
+    assert out.is_symlink()
+    assert not any(path.name.startswith(".out.") for path in tmp_path.iterdir())
+
+
+def test_inventory_cli_refuses_symlink_output_without_touching_victim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv, out, _exclusion = _inventory_cli_fixture(tmp_path, monkeypatch)
+    victim = tmp_path / "victim"
+    victim.mkdir(mode=0o700)
+    marker = victim / "marker"
+    marker.write_text("unchanged", encoding="utf-8")
+    out.symlink_to(victim, target_is_directory=True)
+
+    with pytest.raises(ReplayContractError, match="output.*already exists"):
+        replay.main(argv)
+    assert marker.read_text(encoding="utf-8") == "unchanged"
+    assert out.is_symlink()
 
 
 class FakeRestrictedExecutor:

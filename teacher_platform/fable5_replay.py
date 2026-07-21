@@ -8,7 +8,9 @@ shared typed parser, and reconstructs only declarative Write/Edit mutations.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import dataclasses
+import errno
 import fcntl
 import hashlib
 import json
@@ -4043,6 +4045,216 @@ def _atomic_write_0600(
         os.close(directory_fd)
 
 
+def _rename_directory_noreplace(
+    parent_fd: int, staging_name: str, output_name: str
+) -> None:
+    """Atomically rename a directory only when the destination is absent."""
+
+    library = ctypes.CDLL(None, use_errno=True)
+    source = os.fsencode(staging_name)
+    destination = os.fsencode(output_name)
+    if os.uname().sysname == "Darwin":
+        operation = getattr(library, "renameatx_np", None)
+        flags = 0x00000004  # RENAME_EXCL
+    else:
+        operation = getattr(library, "renameat2", None)
+        flags = 0x00000001  # RENAME_NOREPLACE
+    if operation is None:
+        raise ReplayContractError("atomic no-replace directory rename is unavailable")
+    operation.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    operation.restype = ctypes.c_int
+    if operation(parent_fd, source, parent_fd, destination, flags) == 0:
+        return
+    error = ctypes.get_errno()
+    if error in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise ReplayContractError("output already exists")
+    raise ReplayContractError(
+        f"atomic output directory rename failed with errno {error}"
+    )
+
+
+def _directory_entry_identity(status: os.stat_result) -> tuple[int, int]:
+    return status.st_dev, status.st_ino
+
+
+def _assert_owned_manifest_directory(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+    identity: tuple[int, int],
+    *,
+    label: str,
+) -> None:
+    held = os.fstat(directory_fd)
+    try:
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except (FileNotFoundError, OSError) as exc:
+        raise ReplayContractError(f"{label} identity changed") from exc
+    if (
+        not stat.S_ISDIR(held.st_mode)
+        or not stat.S_ISDIR(named.st_mode)
+        or held.st_uid != os.getuid()
+        or named.st_uid != os.getuid()
+        or stat.S_IMODE(held.st_mode) != 0o700
+        or stat.S_IMODE(named.st_mode) != 0o700
+        or _directory_entry_identity(held) != identity
+        or _directory_entry_identity(named) != identity
+    ):
+        raise ReplayContractError(f"{label} identity changed")
+
+
+def _remove_owned_manifest_directory(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+    identity: tuple[int, int],
+    expected_files: Mapping[str, bytes],
+) -> None:
+    for filename, expected in expected_files.items():
+        try:
+            current = _read_bound_file_at(directory_fd, filename)
+        except ReplayContractError:
+            continue
+        if current != expected:
+            continue
+        try:
+            os.unlink(filename, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+    try:
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except (FileNotFoundError, OSError):
+        return
+    if stat.S_ISDIR(named.st_mode) and _directory_entry_identity(named) == identity:
+        try:
+            os.rmdir(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except OSError:
+            pass
+
+
+def _publish_manifest_directory(
+    output: Path,
+    payloads: Mapping[str, bytes],
+    *,
+    validate_inputs: Callable[[], None],
+) -> None:
+    """Publish a complete manifest directory atomically or leave none visible."""
+
+    absolute = Path(os.path.abspath(output))
+    output_name = absolute.name
+    if not output_name or output_name in {".", ".."}:
+        raise ReplayContractError("output path is not confined")
+    if set(payloads) != {"eligibility.json", "smoke.json"}:
+        raise ReplayContractError("output manifest set is not exact")
+    parent_fd = _open_real_input_directory(absolute.parent)
+    staging_fd = -1
+    staging_name = f".{output_name}.{secrets.token_hex(16)}.staging"
+    staging_identity: tuple[int, int] | None = None
+    published = False
+    try:
+        try:
+            fcntl.flock(parent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ReplayContractError("output parent is already locked") from exc
+        parent_status = os.fstat(parent_fd)
+        parent_identity = _directory_entry_identity(parent_status)
+
+        def assert_parent_identity() -> None:
+            reopened = _open_real_input_directory(absolute.parent)
+            try:
+                if _directory_entry_identity(os.fstat(reopened)) != parent_identity:
+                    raise ReplayContractError("output parent identity changed")
+            finally:
+                os.close(reopened)
+
+        try:
+            os.stat(output_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ReplayContractError("output already exists")
+        os.mkdir(staging_name, mode=0o700, dir_fd=parent_fd)
+        staging_fd = os.open(
+            staging_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        staging_identity = _directory_entry_identity(os.fstat(staging_fd))
+
+        def validate_staging() -> None:
+            validate_inputs()
+            assert_parent_identity()
+            assert staging_identity is not None
+            _assert_owned_manifest_directory(
+                parent_fd,
+                staging_name,
+                staging_fd,
+                staging_identity,
+                label="output staging directory",
+            )
+
+        for filename in ("eligibility.json", "smoke.json"):
+            _atomic_write_0600_at(
+                staging_fd,
+                filename,
+                payloads[filename],
+                before_rename=validate_staging,
+                after_rename=lambda _fd, _name: validate_staging(),
+            )
+            validate_staging()
+        os.fsync(staging_fd)
+        for filename, expected in payloads.items():
+            if _read_bound_file_at(staging_fd, filename) != expected:
+                raise ReplayContractError("staged manifest hash mismatch")
+        validate_staging()
+        try:
+            os.stat(output_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ReplayContractError("output already exists")
+        _rename_directory_noreplace(parent_fd, staging_name, output_name)
+        published = True
+        os.fsync(parent_fd)
+
+        validate_inputs()
+        assert_parent_identity()
+        assert staging_identity is not None
+        _assert_owned_manifest_directory(
+            parent_fd,
+            output_name,
+            staging_fd,
+            staging_identity,
+            label="output directory",
+        )
+        for filename, expected in payloads.items():
+            if _read_bound_file_at(staging_fd, filename) != expected:
+                raise ReplayContractError("published manifest hash mismatch")
+        os.fsync(staging_fd)
+    except Exception:
+        if staging_fd >= 0 and staging_identity is not None:
+            _remove_owned_manifest_directory(
+                parent_fd,
+                output_name if published else staging_name,
+                staging_fd,
+                staging_identity,
+                payloads,
+            )
+        raise
+    finally:
+        if staging_fd >= 0:
+            os.close(staging_fd)
+        fcntl.flock(parent_fd, fcntl.LOCK_UN)
+        os.close(parent_fd)
+
+
 class ReplayLedger:
     """Exclusive, fully validated, atomically published replay attempt ledger."""
 
@@ -4844,35 +5056,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 bound.assert_identity()
 
         assert_input_identities()
-        output_fd = _open_real_private_directory(args.out, create=True)
-        output_identity = _private_directory_identity(
-            output_fd, label="output directory"
+        _publish_manifest_directory(
+            args.out,
+            {
+                "eligibility.json": _canonical_json(inventory) + b"\n",
+                "smoke.json": _canonical_json(smoke) + b"\n",
+            },
+            validate_inputs=assert_input_identities,
         )
-
-        def assert_publication_boundaries() -> None:
-            assert_input_identities()
-            _assert_path_directory_identity(
-                args.out,
-                output_fd,
-                output_identity,
-                label="output directory",
-            )
-
-        try:
-            for name, payload in (
-                ("eligibility.json", inventory),
-                ("smoke.json", smoke),
-            ):
-                _atomic_write_0600_at(
-                    output_fd,
-                    name,
-                    _canonical_json(payload) + b"\n",
-                    before_rename=assert_publication_boundaries,
-                    after_rename=lambda _fd, _name: assert_publication_boundaries(),
-                )
-                assert_publication_boundaries()
-        finally:
-            os.close(output_fd)
         return 0
     finally:
         for bound in reversed(bound_inputs):

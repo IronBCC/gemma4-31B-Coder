@@ -992,6 +992,22 @@ IMAGE_DIGEST = "example.invalid/fable-python@sha256:" + "1" * 64
 CID = "c" * 64
 
 
+def _captured_moby_tmpfs_mounts(tmpfs: dict[str, str]) -> list[dict[str, object]]:
+    """Top-level MountPoint shape emitted by Moby for running tmpfs mounts."""
+
+    return [
+        {
+            "Type": "tmpfs",
+            "Source": "",
+            "Destination": destination,
+            "Mode": "",
+            "RW": True,
+            "Propagation": "",
+        }
+        for destination in sorted(tmpfs)
+    ]
+
+
 def test_task2_interfaces_are_explicit_public_exports() -> None:
     assert {
         "AdmissionEvidence",
@@ -1040,6 +1056,7 @@ class FakeDockerRuntime:
         output_truncated: bool = False,
         result_mode: int = 0o600,
         inspect_mutator: object | None = None,
+        create_output: bytes | None = None,
     ) -> None:
         self.verifier_rc = verifier_rc
         self.fail_verb = fail_verb
@@ -1049,6 +1066,7 @@ class FakeDockerRuntime:
         self.output_truncated = output_truncated
         self.result_mode = result_mode
         self.inspect_mutator = inspect_mutator
+        self.create_output = create_output or (CID + "\n").encode()
         self.free_values = iter(free_bytes)
         self.calls: list[tuple[tuple[str, ...], int, int, Path | None]] = []
         self._failed = False
@@ -1057,6 +1075,7 @@ class FakeDockerRuntime:
         self.input_modes: dict[str, int] = {}
         self.stage_mode = 0
         self.container_cmd = ["/seed/wrapper.sh", "test_src.py"]
+        self.started = False
 
     def disk_free_bytes(self) -> int:
         return next(self.free_values)
@@ -1085,7 +1104,7 @@ class FakeDockerRuntime:
                 index for index, value in enumerate(argv) if "@sha256:" in value
             )
             self.container_cmd = list(argv[image_index + 1 :])
-            return replay.RuntimeCommandResult(0, (CID + "\n").encode(), 0.01)
+            return replay.RuntimeCommandResult(0, self.create_output, 0.01)
         if verb == "inspect":
             tmpfs = {
                 "/work": "rw,nosuid,nodev,size=4294967296,uid=65532,gid=65532,mode=0700",
@@ -1098,13 +1117,18 @@ class FakeDockerRuntime:
                 "Id": CID,
                 "Name": "/fable-replay-" + "a" * 32,
                 "Image": "sha256:" + "1" * 64,
-                "State": {"Status": "running", "Running": True, "Pid": 1234},
+                "State": {
+                    "Status": "running" if self.started else "created",
+                    "Running": self.started,
+                    "Pid": 1234 if self.started else 0,
+                },
                 "Config": {
                     "Labels": {"fable.replay.owner": "a" * 32},
                     "User": "0:0",
                     "Entrypoint": ["/bin/sh"],
                     "Cmd": self.container_cmd,
                     "Volumes": None,
+                    "ExposedPorts": None,
                 },
                 "HostConfig": {
                     "NetworkMode": "none",
@@ -1120,8 +1144,25 @@ class FakeDockerRuntime:
                         {"Name": "fsize", "Soft": 1_048_576, "Hard": 1_048_576}
                     ],
                     "Binds": None,
+                    "Mounts": [],
+                    "Privileged": False,
+                    "CapAdd": None,
+                    "Devices": None,
+                    "DeviceRequests": None,
+                    "DeviceCgroupRules": None,
+                    "PidMode": "",
+                    "IpcMode": "private",
+                    "UTSMode": "",
+                    "UsernsMode": "",
+                    "PortBindings": {},
+                    "PublishAllPorts": False,
+                    "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
+                    "Runtime": "runc",
+                    "CgroupnsMode": "private",
+                    "Isolation": "",
                 },
-                "Mounts": [],
+                "Mounts": _captured_moby_tmpfs_mounts(tmpfs) if self.started else [],
+                "NetworkSettings": {"Ports": {}, "Networks": {"none": {}}},
             }
             if self.inspect_mutator is not None:
                 self.inspect_mutator(payload)
@@ -1137,6 +1178,12 @@ class FakeDockerRuntime:
                     timed_out=self.timed_out,
                     truncated=self.output_truncated,
                 )
+            return replay.RuntimeCommandResult(0, b"", 0.01)
+        if verb == "start":
+            self.started = True
+            return replay.RuntimeCommandResult(0, b"", 0.01)
+        if verb == "stop":
+            self.started = False
             return replay.RuntimeCommandResult(0, b"", 0.01)
         if verb == "cp" and argv[3] == f"{CID}:/seed":
             candidate = Path(argv[2]) / "candidate"
@@ -1278,6 +1325,10 @@ def test_docker_executor_uses_the_complete_restricted_state_machine(tmp_path: Pa
     assert "--read-only" in create
     assert "--cap-drop=ALL" in create
     assert "--security-opt=no-new-privileges:true" in create
+    assert "--ipc=private" in create
+    assert "--cgroupns=private" in create
+    assert "--runtime=runc" in create
+    assert "--restart=no" in create
     assert "--entrypoint=/bin/sh" in create
     assert "--pids-limit=256" in create
     assert any(value.startswith("--memory=") for value in create)
@@ -1307,9 +1358,10 @@ def test_docker_executor_uses_the_complete_restricted_state_machine(tmp_path: Pa
         "inspect",
         "cp",
         "inspect",
-        "logs",
         "inspect",
+        "logs",
         "stop",
+        "inspect",
         "rm",
         "ps",
         "ps",
@@ -1336,12 +1388,31 @@ def test_docker_executor_uses_the_complete_restricted_state_machine(tmp_path: Pa
     assert runtime.stage_mode == 0o555
 
 
+def test_running_inspect_accepts_captured_real_moby_tmpfs_mount_shape(
+    tmp_path: Path,
+) -> None:
+    captured = _captured_moby_tmpfs_mounts(
+        replay._tmpfs_policy(_docker_policy())
+    )
+    assert all(
+        set(mount)
+        == {"Type", "Source", "Destination", "Mode", "RW", "Propagation"}
+        and mount["Mode"] == ""
+        for mount in captured
+    )
+
+    evidence = _docker_execute(FakeDockerRuntime(), tmp_path)
+
+    assert evidence.resolved is True
+
+
 def test_trusted_wrapper_quotes_hashes_as_json_and_never_embeds_verifier() -> None:
     script = replay._wrapper_script("a" * 32)
 
     assert '"protected_sha256":[' in script
     assert 'for path do' in script
     assert 'sha256sum -- "/work/$path"' in script
+    assert "xargs -0 -r sha256sum --" in script
     assert "python3 -m pytest" not in script
     assert "/result/result.json" in script
 
@@ -1375,10 +1446,182 @@ def test_docker_executor_cleans_only_its_exact_cid_on_every_failure(
     argvs = [call[0] for call in runtime.calls]
     if fail_verb == "create":
         assert all(CID not in argv for argv in argvs)
+    elif fail_verb == "inspect":
+        assert ("docker", "stop", "--time=2", CID) not in argvs
+        assert ("docker", "rm", "--force", "--volumes", CID) not in argvs
     else:
         assert ("docker", "stop", "--time=2", CID) in argvs
         assert ("docker", "rm", "--force", "--volumes", CID) in argvs
     assert not any(argv[1] in {"pull", "prune"} for argv in argvs)
+
+
+def test_invalid_create_stdout_never_becomes_a_cleanup_mutation_target(
+    tmp_path: Path,
+) -> None:
+    victim = "victim-production"
+    runtime = FakeDockerRuntime(create_output=(victim + "\n").encode())
+
+    with pytest.raises(ReplayContractError, match="invalid exact CID"):
+        _docker_execute(runtime, tmp_path)
+
+    mutations = [
+        argv
+        for argv, *_rest in runtime.calls
+        if argv[1] in {"stop", "rm"}
+    ]
+    assert all(victim not in argv for argv in mutations)
+
+
+def test_invalid_create_stdout_recovers_only_owner_label_proven_exact_cid(
+    tmp_path: Path,
+) -> None:
+    victim = "victim-production"
+
+    class DiscoverRuntime(FakeDockerRuntime):
+        def __init__(self) -> None:
+            super().__init__(create_output=(victim + "\n").encode())
+            self.ps_calls = 0
+
+        def run(self, argv, **kwargs):
+            if argv[1] == "ps":
+                self.calls.append(
+                    (
+                        argv,
+                        kwargs["timeout_seconds"],
+                        kwargs["output_limit_bytes"],
+                        kwargs.get("output_path"),
+                    )
+                )
+                self.ps_calls += 1
+                output = (CID + "\n").encode() if self.ps_calls == 1 else b""
+                return replay.RuntimeCommandResult(0, output, 0.01)
+            return super().run(argv, **kwargs)
+
+    runtime = DiscoverRuntime()
+    with pytest.raises(ReplayContractError, match="invalid exact CID"):
+        _docker_execute(runtime, tmp_path)
+    argvs = [call[0] for call in runtime.calls]
+
+    assert ("docker", "stop", "--time=2", CID) in argvs
+    assert ("docker", "rm", "--force", "--volumes", CID) in argvs
+    assert all(victim not in argv for argv in argvs if argv[1] in {"stop", "rm"})
+
+
+@pytest.mark.parametrize("drift", ["wrong_owner", "wrong_id"])
+def test_failed_initial_ownership_proof_never_mutates_create_stdout(
+    tmp_path: Path, drift: str
+) -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        if drift == "wrong_owner":
+            payload["Config"]["Labels"]["fable.replay.owner"] = "b" * 32
+        else:
+            payload["Id"] = "d" * 64
+
+    runtime = FakeDockerRuntime(inspect_mutator=mutate)
+    with pytest.raises(ReplayContractError, match="ownership/policy"):
+        _docker_execute(runtime, tmp_path)
+    argvs = [call[0] for call in runtime.calls]
+
+    assert ("docker", "stop", "--time=2", CID) not in argvs
+    assert ("docker", "rm", "--force", "--volumes", CID) not in argvs
+
+
+def test_malformed_initial_ownership_inspect_never_mutates_create_stdout(
+    tmp_path: Path,
+) -> None:
+    class MalformedInspectRuntime(FakeDockerRuntime):
+        def run(self, argv, **kwargs):
+            if argv[1] == "inspect" and argv[2] == CID:
+                self.calls.append(
+                    (
+                        argv,
+                        kwargs["timeout_seconds"],
+                        kwargs["output_limit_bytes"],
+                        kwargs.get("output_path"),
+                    )
+                )
+                return replay.RuntimeCommandResult(0, b"not-json", 0.01)
+            return super().run(argv, **kwargs)
+
+    runtime = MalformedInspectRuntime()
+    with pytest.raises(ReplayContractError, match="schema"):
+        _docker_execute(runtime, tmp_path)
+    argvs = [call[0] for call in runtime.calls]
+
+    assert ("docker", "stop", "--time=2", CID) not in argvs
+    assert ("docker", "rm", "--force", "--volumes", CID) not in argvs
+
+
+@pytest.mark.parametrize("drift", ["owner", "id"])
+def test_cleanup_reproves_exact_identity_immediately_before_stop(
+    tmp_path: Path, drift: str
+) -> None:
+    inspections = 0
+
+    def mutate(payload: dict[str, object]) -> None:
+        nonlocal inspections
+        inspections += 1
+        if inspections >= 5:
+            if drift == "owner":
+                payload["Config"]["Labels"]["fable.replay.owner"] = "b" * 32
+            else:
+                payload["Id"] = "d" * 64
+
+    runtime = FakeDockerRuntime(inspect_mutator=mutate)
+    with pytest.raises(ReplayContractError, match="cleanup"):
+        _docker_execute(runtime, tmp_path)
+    argvs = [call[0] for call in runtime.calls]
+
+    assert ("docker", "stop", "--time=2", CID) not in argvs
+    assert ("docker", "rm", "--force", "--volumes", CID) not in argvs
+
+
+def test_cleanup_malformed_identity_proof_never_reaches_stop(tmp_path: Path) -> None:
+    class MalformedCleanupInspectRuntime(FakeDockerRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.inspect_count = 0
+
+        def run(self, argv, **kwargs):
+            if argv[1] == "inspect" and argv[2] == CID:
+                self.inspect_count += 1
+                if self.inspect_count == 5:
+                    self.calls.append(
+                        (
+                            argv,
+                            kwargs["timeout_seconds"],
+                            kwargs["output_limit_bytes"],
+                            kwargs.get("output_path"),
+                        )
+                    )
+                    return replay.RuntimeCommandResult(0, b"not-json", 0.01)
+            return super().run(argv, **kwargs)
+
+    runtime = MalformedCleanupInspectRuntime()
+    with pytest.raises(ReplayContractError, match="cleanup"):
+        _docker_execute(runtime, tmp_path)
+    argvs = [call[0] for call in runtime.calls]
+
+    assert ("docker", "stop", "--time=2", CID) not in argvs
+    assert ("docker", "rm", "--force", "--volumes", CID) not in argvs
+
+
+def test_cleanup_reproves_owner_again_immediately_before_remove(tmp_path: Path) -> None:
+    inspections = 0
+
+    def mutate(payload: dict[str, object]) -> None:
+        nonlocal inspections
+        inspections += 1
+        if inspections >= 6:
+            payload["Config"]["Labels"]["fable.replay.owner"] = "b" * 32
+
+    runtime = FakeDockerRuntime(inspect_mutator=mutate)
+    with pytest.raises(ReplayContractError, match="cleanup"):
+        _docker_execute(runtime, tmp_path)
+    argvs = [call[0] for call in runtime.calls]
+
+    assert ("docker", "stop", "--time=2", CID) in argvs
+    assert ("docker", "rm", "--force", "--volumes", CID) not in argvs
 
 
 def test_docker_executor_never_claims_cleanup_when_final_query_fails(
@@ -1561,8 +1804,120 @@ def test_docker_executor_rejects_effective_container_policy_drift(tmp_path: Path
         _docker_execute(runtime, tmp_path)
 
     argvs = [call[0] for call in runtime.calls]
-    assert ("docker", "stop", "--time=2", CID) in argvs
-    assert ("docker", "rm", "--force", "--volumes", CID) in argvs
+    assert not any(argv[1] == "start" for argv in argvs)
+
+
+@pytest.mark.parametrize(
+    ("scope", "field", "unsafe"),
+    [
+        ("HostConfig", "Privileged", True),
+        ("HostConfig", "CapAdd", ["SYS_ADMIN"]),
+        ("HostConfig", "CapDrop", ["ALL", "NET_RAW"]),
+        (
+            "HostConfig",
+            "SecurityOpt",
+            ["no-new-privileges:true", "seccomp=unconfined"],
+        ),
+        (
+            "HostConfig",
+            "Mounts",
+            [{"Type": "bind", "Source": "/", "Target": "/host"}],
+        ),
+        ("HostConfig", "Binds", ["/:/host:rw"]),
+        (
+            "HostConfig",
+            "Devices",
+            [{"PathOnHost": "/dev/sda", "PathInContainer": "/dev/sda"}],
+        ),
+        (
+            "HostConfig",
+            "DeviceRequests",
+            [{"Driver": "nvidia", "Count": -1, "Capabilities": [["gpu"]]}],
+        ),
+        ("HostConfig", "DeviceCgroupRules", ["a *:* rwm"]),
+        ("HostConfig", "PidMode", "host"),
+        ("HostConfig", "IpcMode", "host"),
+        ("HostConfig", "UTSMode", "host"),
+        ("HostConfig", "UsernsMode", "host"),
+        ("HostConfig", "PortBindings", {"8000/tcp": [{"HostPort": "8000"}]}),
+        ("HostConfig", "PublishAllPorts", True),
+        (
+            "HostConfig",
+            "RestartPolicy",
+            {"Name": "always", "MaximumRetryCount": 0},
+        ),
+        ("HostConfig", "Runtime", "nvidia"),
+        ("HostConfig", "CgroupnsMode", "host"),
+        ("HostConfig", "Isolation", "hyperv"),
+        (
+            "HostConfig",
+            "Ulimits",
+            [
+                {"Name": "fsize", "Soft": 1_048_576, "Hard": 1_048_576},
+                {"Name": "nofile", "Soft": 1_024, "Hard": 1_024},
+            ],
+        ),
+        ("HostConfig", "NetworkMode", "bridge"),
+        ("Config", "ExposedPorts", {"8000/tcp": {}}),
+        (
+            "Mounts",
+            "replace",
+            [
+                {
+                    "Type": "bind",
+                    "Source": "/",
+                    "Destination": "/host",
+                    "Mode": "rw",
+                    "RW": True,
+                    "Propagation": "rprivate",
+                }
+            ],
+        ),
+        ("NetworkSettings", "Ports", {"8000/tcp": [{"HostPort": "8000"}]}),
+        ("NetworkSettings", "Networks", {"bridge": {}}),
+    ],
+    ids=lambda value: str(value)[:40],
+)
+def test_docker_executor_rejects_security_policy_drift_before_start(
+    tmp_path: Path, scope: str, field: str, unsafe: object
+) -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        if scope == "Mounts":
+            payload["Mounts"] = unsafe
+        else:
+            payload[scope][field] = unsafe
+
+    runtime = FakeDockerRuntime(inspect_mutator=mutate)
+    with pytest.raises(ReplayContractError, match="policy|mount|namespace"):
+        _docker_execute(runtime, tmp_path)
+    argvs = [call[0] for call in runtime.calls]
+
+    assert not any(argv[1] == "start" for argv in argvs)
+
+
+@pytest.mark.parametrize("drift", ["missing_mount", "wrong_mount_options", "zero_pid"])
+def test_docker_executor_rejects_running_policy_drift_before_verifier(
+    tmp_path: Path, drift: str
+) -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        if payload["State"]["Running"] is not True:
+            return
+        if drift == "missing_mount":
+            payload["Mounts"].pop()
+        elif drift == "wrong_mount_options":
+            payload["Mounts"][0]["Mode"] = "rw,size=1"
+        else:
+            payload["State"]["Pid"] = 0
+
+    runtime = FakeDockerRuntime(inspect_mutator=mutate)
+    with pytest.raises(ReplayContractError, match="policy|mount|running"):
+        _docker_execute(runtime, tmp_path)
+    argvs = [call[0] for call in runtime.calls]
+
+    assert not any(
+        argv[1] == "exec" and any(value.endswith("/verifier.sh") for value in argv)
+        for argv in argvs
+    )
 
 
 def test_docker_executor_timeout_is_bounded_and_cleaned(tmp_path: Path) -> None:
@@ -1611,7 +1966,7 @@ def test_docker_executor_applies_one_wall_budget_to_the_running_container(
         if call[0][1] == "logs":
             break
 
-    timeouts = [call[1] for call in lifecycle_calls]
+    timeouts = [call[1] for call in lifecycle_calls[:-1]]
     assert timeouts[0] < 30
     assert timeouts == sorted(timeouts, reverse=True)
     assert timeouts[-1] < timeouts[0]
@@ -1761,6 +2116,10 @@ def _run_evidence(
     protected: tuple[tuple[str, str], ...],
     rc: int,
     output_hash: str,
+    policy_version: str = "fable-docker-v1",
+    image_digest: str = IMAGE_DIGEST,
+    runtime_version: str = "27.5.1",
+    run_contract_sha256: str = "f" * 64,
 ) -> object:
     return replay.RunEvidence(
         schema_version=1,
@@ -1782,16 +2141,17 @@ def _run_evidence(
         resolved=rc == 0,
         failure_class=None if rc == 0 else "verifier_failed",
         cleanup_state="verified_removed",
-        policy_version="fable-docker-v1",
-        image_digest=IMAGE_DIGEST,
-        runtime_version="27.5.1",
-        run_contract_sha256="f" * 64,
+        policy_version=policy_version,
+        image_digest=image_digest,
+        runtime_version=runtime_version,
+        run_contract_sha256=run_contract_sha256,
         resource_peaks=(("memory_bytes", 1024), ("pids", 3), ("cpu_usec", 4000)),
     )
 
 
 class FakeRestrictedExecutor:
     def __init__(self, outcomes: dict[str, list[int]]) -> None:
+        self.policy = _docker_policy()
         self.outcomes = {key: list(values) for key, values in outcomes.items()}
         self.calls: list[dict[str, object]] = []
         self.counter = 0
@@ -1801,6 +2161,23 @@ class FakeRestrictedExecutor:
         identity = str(kwargs["control_identity"])
         rc = self.outcomes[identity].pop(0)
         self.counter += 1
+        image = self.policy.image_for(str(kwargs["language"]))
+        run_contract = replay._sha256(
+            replay._canonical_json(
+                {
+                    "policy": replay._policy_payload(self.policy, image),
+                    "language": kwargs["language"],
+                    "verifier_sha256": replay._sha256(
+                        str(kwargs["verifier_text"]).encode()
+                    ),
+                    "effective_timeout": kwargs["effective_timeout"],
+                    "control_identity": identity,
+                    "pre_tree": kwargs["pre_candidate_tree_sha256"],
+                    "pre_diff": kwargs["pre_candidate_diff_sha256"],
+                    "protected": kwargs["protected_before"],
+                }
+            )
+        )
         return _run_evidence(
             identity=identity,
             tree=str(kwargs["pre_candidate_tree_sha256"]),
@@ -1808,6 +2185,9 @@ class FakeRestrictedExecutor:
             protected=tuple(kwargs["protected_before"]),
             rc=rc,
             output_hash=f"{self.counter:064x}",
+            policy_version=self.policy.policy_version,
+            image_digest=image,
+            run_contract_sha256=run_contract,
         )
 
 
@@ -1921,6 +2301,92 @@ def test_verify_candidate_rejects_executor_evidence_from_a_control_namespace(
     assert evidence.resolved is False
     assert evidence.trainable is False
     assert evidence.failure_class == "candidate_not_repeatable"
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"returncode": 9},
+        {"wrapper_returncode": 8},
+        {"termination": "wall_timeout"},
+        {"failure_class": "verifier_timeout"},
+        {"post_candidate_tree_sha256": None},
+        {"resource_peaks": ()},
+        {
+            "resource_peaks": (
+                ("memory_bytes", 0),
+                ("pids", 3),
+                ("cpu_usec", 4000),
+            )
+        },
+        {"resource_peaks": (("memory_bytes", 1, 2),)},
+        {"cleanup_state": "cleanup_failed"},
+        {"protected_after": ()},
+        {"trainable": False},
+        {"resolved": False},
+        {"pre_candidate_tree_sha256": "9" * 64},
+        {"pre_candidate_diff_sha256": "8" * 64},
+        {"policy_version": "other-policy"},
+        {"image_digest": "example.invalid/other@sha256:" + "2" * 64},
+        {"runtime_version": "other-runtime"},
+        {"run_contract_sha256": "7" * 64},
+    ],
+)
+def test_verify_candidate_rejects_every_contradictory_positive_run_field(
+    tmp_path: Path, updates: dict[str, object]
+) -> None:
+    contract = _materialized(tmp_path)
+    plan = _plan_for(
+        contract,
+        _call("Write", {"file_path": "/testbed/src.py", "content": "new\n"}),
+    )
+
+    class ContradictoryExecutor(FakeRestrictedExecutor):
+        def execute(self, **kwargs: object):
+            run = super().execute(**kwargs)
+            return dataclasses.replace(run, **updates)
+
+    evidence = replay.verify_candidate(
+        contract,
+        plan,
+        trajectory_id="1" * 64,
+        source_terminal_sha256="2" * 64,
+        executor=ContradictoryExecutor({"candidate": [0, 0]}),
+        workspace=tmp_path / "verify",
+    )
+
+    assert evidence.resolved is False
+    assert evidence.trainable is False
+    assert evidence.failure_class == "candidate_not_repeatable"
+
+
+def test_verify_candidate_requires_one_exact_runtime_identity_across_runs(
+    tmp_path: Path,
+) -> None:
+    contract = _materialized(tmp_path)
+    plan = _plan_for(
+        contract,
+        _call("Write", {"file_path": "/testbed/src.py", "content": "new\n"}),
+    )
+
+    class RuntimeDriftExecutor(FakeRestrictedExecutor):
+        def execute(self, **kwargs: object):
+            run = super().execute(**kwargs)
+            if self.counter == 2:
+                return dataclasses.replace(run, runtime_version="other-runtime")
+            return run
+
+    evidence = replay.verify_candidate(
+        contract,
+        plan,
+        trajectory_id="1" * 64,
+        source_terminal_sha256="2" * 64,
+        executor=RuntimeDriftExecutor({"candidate": [0, 0]}),
+        workspace=tmp_path / "verify",
+    )
+
+    assert evidence.resolved is False
+    assert evidence.trainable is False
 
 
 def test_control_set_requires_failing_baseline_passing_reference_and_two_candidates(
@@ -2042,3 +2508,145 @@ def test_control_set_rejects_timeout_as_a_valid_failing_baseline(tmp_path: Path)
     assert controls.admitted is False
     assert controls.failure_class == "baseline_invalid_failure"
     assert controls.candidate.trainable is False
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"resource_peaks": ()},
+        {"cleanup_state": "cleanup_failed"},
+        {"pre_candidate_tree_sha256": "9" * 64},
+        {"pre_candidate_diff_sha256": "8" * 64},
+        {"policy_version": "other-policy"},
+        {"image_digest": "example.invalid/other@sha256:" + "2" * 64},
+        {"run_contract_sha256": "7" * 64},
+    ],
+)
+def test_control_set_requires_strict_clean_negative_baseline_evidence(
+    tmp_path: Path, updates: dict[str, object]
+) -> None:
+    contract = _materialized(tmp_path)
+    plan = _plan_for(
+        contract,
+        _call("Write", {"file_path": "/testbed/src.py", "content": "new\n"}),
+    )
+
+    class DirtyBaselineExecutor(FakeRestrictedExecutor):
+        def execute(self, **kwargs: object):
+            run = super().execute(**kwargs)
+            if kwargs["control_identity"] == "baseline":
+                return dataclasses.replace(run, **updates)
+            return run
+
+    controls = replay.run_control_set(
+        contract,
+        plan,
+        trajectory_id="1" * 64,
+        source_terminal_sha256="2" * 64,
+        executor=DirtyBaselineExecutor(
+            {"baseline": [1], "reference": [0], "candidate": [0, 0]}
+        ),
+        workspace=tmp_path / "controls",
+        reference_builder=lambda seed, destination: _copy_reference_fixture(
+            seed, destination
+        ),
+    )
+
+    assert controls.admitted is False
+    assert controls.failure_class == "baseline_invalid_failure"
+    assert controls.candidate.trainable is False
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"control_identity": "candidate"},
+        {"trainable": True},
+        {"cleanup_state": "cleanup_failed"},
+        {"termination": "wall_timeout"},
+        {"returncode": 9},
+        {"wrapper_returncode": None},
+        {"failure_class": "verifier_timeout"},
+        {"protected_after": ()},
+        {"post_candidate_tree_sha256": None},
+        {"resource_peaks": ()},
+        {"pre_candidate_tree_sha256": "9" * 64},
+        {"pre_candidate_diff_sha256": "8" * 64},
+        {"policy_version": "other-policy"},
+        {"image_digest": "example.invalid/other@sha256:" + "2" * 64},
+        {"runtime_version": "other-runtime"},
+        {"run_contract_sha256": "7" * 64},
+        {"resolved": False},
+    ],
+)
+def test_control_set_rejects_every_dirty_reference_field(
+    tmp_path: Path, updates: dict[str, object]
+) -> None:
+    contract = _materialized(tmp_path)
+    plan = _plan_for(
+        contract,
+        _call("Write", {"file_path": "/testbed/src.py", "content": "new\n"}),
+    )
+
+    class DirtyReferenceExecutor(FakeRestrictedExecutor):
+        def execute(self, **kwargs: object):
+            run = super().execute(**kwargs)
+            if kwargs["control_identity"] == "reference":
+                return dataclasses.replace(run, **updates)
+            return run
+
+    controls = replay.run_control_set(
+        contract,
+        plan,
+        trajectory_id="1" * 64,
+        source_terminal_sha256="2" * 64,
+        executor=DirtyReferenceExecutor(
+            {"baseline": [1], "reference": [0], "candidate": [0, 0]}
+        ),
+        workspace=tmp_path / "controls",
+        reference_builder=lambda seed, destination: _copy_reference_fixture(
+            seed, destination
+        ),
+    )
+
+    assert controls.admitted is False
+    assert controls.failure_class == "reference_invalid_evidence"
+    assert controls.candidate.trainable is False
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"control_identity": "candidate", "trainable": True},
+        {"cleanup_state": "cleanup_failed"},
+        {"termination": "wall_timeout"},
+        {"returncode": 9},
+        {"wrapper_returncode": None},
+        {"failure_class": "verifier_timeout"},
+        {"post_candidate_tree_sha256": None},
+        {"resource_peaks": ()},
+        {"policy_version": "other-policy"},
+        {"image_digest": "example.invalid/other@sha256:" + "2" * 64},
+        {"run_contract_sha256": "7" * 64},
+        {"resolved": False},
+    ],
+)
+def test_functional_admission_rejects_every_dirty_positive_field(
+    tmp_path: Path, updates: dict[str, object]
+) -> None:
+    policy = _docker_policy()
+
+    class DirtyAdmissionExecutor(FakeRestrictedExecutor):
+        def execute(self, **kwargs: object):
+            run = super().execute(**kwargs)
+            return dataclasses.replace(run, **updates)
+
+    evidence = replay.functional_admission_probe(
+        policy,
+        "python",
+        executor=DirtyAdmissionExecutor({"admission": [0]}),
+        workspace=tmp_path / "admission",
+    )
+
+    assert evidence.admitted is False
+    assert evidence.failure_class == "admission_invalid_evidence"

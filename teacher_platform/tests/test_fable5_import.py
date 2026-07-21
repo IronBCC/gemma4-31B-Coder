@@ -44,6 +44,7 @@ from fable5_import import (  # noqa: E402
     SourceContract,
     VerifierEvidenceOp,
     _load_replay_ledger,
+    _rendered_token_count,
     _replay_matches,
     build_fable5_pilot,
     canonical_language,
@@ -1760,6 +1761,13 @@ def test_token_gate_budget_is_inclusive() -> None:
     assert token_gate([], lambda _messages: 49_152, max_tokens=49_152) == 49_152
     with pytest.raises(RowRejected, match="token_budget"):
         token_gate([], lambda _messages: 49_153, max_tokens=49_152)
+
+
+def test_rendered_token_count_uses_input_ids_not_batch_encoding_keys() -> None:
+    assert _rendered_token_count(
+        {"input_ids": [11, 12, 13, 14], "attention_mask": [1, 1, 1, 1]}
+    ) == 4
+    assert _rendered_token_count([11, 12, 13]) == 3
 
 
 def test_metadata_drift_fails_before_consuming_rows_or_publishing(

@@ -13,6 +13,7 @@ import dataclasses
 import errno
 import fcntl
 import hashlib
+import io
 import json
 import math
 import os
@@ -294,6 +295,7 @@ class DockerRuntime(Protocol):
         timeout_seconds: int,
         output_limit_bytes: int,
         output_path: Path | None = None,
+        input_path: Path | None = None,
     ) -> RuntimeCommandResult: ...
 
 
@@ -1577,8 +1579,13 @@ def preflight_reference_patch(
 def _sanitized_docker_environment() -> dict[str, str]:
     return {
         "PATH": os.defpath,
-        "HOME": os.devnull,
-        "XDG_CONFIG_HOME": os.devnull,
+        # Docker treats HOME=/dev/null as a directory and writes a warning to
+        # its merged stdout/stderr stream, corrupting machine-readable output.
+        # /var is root-owned on the supported host, so this absent path also
+        # prevents an untrusted per-user Docker configuration from loading.
+        "HOME": "/var/empty",
+        "XDG_CONFIG_HOME": "/var/empty",
+        "DOCKER_CONFIG": "/var/empty/.docker",
         "LANG": "C",
         "LC_ALL": "C",
     }
@@ -1594,15 +1601,44 @@ class _SubprocessDockerRuntime:
         timeout_seconds: int,
         output_limit_bytes: int,
         output_path: Path | None = None,
+        input_path: Path | None = None,
     ) -> RuntimeCommandResult:
         started = time.monotonic()
         descriptor = -1
+        input_descriptor = -1
         if output_path is not None:
             descriptor = os.open(
                 output_path,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                 0o600,
             )
+        if input_path is not None:
+            try:
+                input_descriptor = os.open(
+                    input_path,
+                    os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                )
+                status = os.fstat(input_descriptor)
+            except Exception:
+                if input_descriptor >= 0:
+                    os.close(input_descriptor)
+                    input_descriptor = -1
+                if descriptor >= 0:
+                    os.close(descriptor)
+                    descriptor = -1
+                raise
+            if (
+                not stat.S_ISREG(status.st_mode)
+                or status.st_nlink != 1
+                or status.st_uid != os.getuid()
+                or stat.S_IMODE(status.st_mode) != 0o600
+            ):
+                os.close(input_descriptor)
+                input_descriptor = -1
+                if descriptor >= 0:
+                    os.close(descriptor)
+                    descriptor = -1
+                raise ReplayContractError("Docker input is not a private regular file")
         process: subprocess.Popen[bytes] | None = None
         captured = bytearray()
         truncated = False
@@ -1610,7 +1646,7 @@ class _SubprocessDockerRuntime:
         try:
             process = subprocess.Popen(
                 argv,
-                stdin=subprocess.DEVNULL,
+                stdin=(subprocess.DEVNULL if input_descriptor < 0 else input_descriptor),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 close_fds=True,
@@ -1671,6 +1707,8 @@ class _SubprocessDockerRuntime:
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
+            if input_descriptor >= 0:
+                os.close(input_descriptor)
 
 
 def _default_docker_free_bytes() -> int:
@@ -1851,7 +1889,7 @@ def _wrapper_script(run_nonce: str) -> str:
 set -eu
 umask 077
 while [ ! -f /control/go ]; do sleep 0.05; done
-tree=$(find /work -xdev -type f -printf '%P\\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum | awk '{{print $1}}')
+tree=$(cd /work && find . -xdev -type f -printf '%P\\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum | awk '{{print $1}}')
 memory=$(cat /sys/fs/cgroup/memory.peak)
 pids=$(cat /sys/fs/cgroup/pids.peak)
 cpu=$(awk '$1 == "usage_usec" {{print $2}}' /sys/fs/cgroup/cpu.stat)
@@ -1867,7 +1905,7 @@ for path do
   separator=,
 done
 printf '],"resource_peaks":{{"memory_bytes":%s,"pids":%s,"cpu_usec":%s}}}}' "$memory" "$pids" "$cpu" >> "$tmp"
-chmod 0600 "$tmp"
+chmod 0644 "$tmp"
 mv "$tmp" /result/result.json
 : > /status/done
 while :; do sleep 3600; done
@@ -1879,9 +1917,8 @@ def _verifier_script(verifier_text: str, file_limit_blocks: int) -> str:
 set -eu
 umask 077
 cp -R /seed/candidate/. /work/
-chmod -R u+rwX /work
+chmod -R u+rwX,go+rX /work
 cd /work
-ulimit -f {file_limit_blocks}
 exec /bin/sh -c {shlex.quote(verifier_text)}
 """
 
@@ -1894,6 +1931,71 @@ def _make_staged_candidate_read_only(root: Path) -> None:
             os.chmod(current_path / dirname, 0o555)
         for filename in filenames:
             os.chmod(current_path / filename, 0o444)
+
+
+def _write_seed_archive(
+    source: Path,
+    destination: Path,
+    *,
+    owner_uid: int,
+    owner_gid: int,
+) -> None:
+    """Write one deterministic, path-safe tar stream for the seed tmpfs."""
+
+    descriptor = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as raw:
+            descriptor = -1
+            with tarfile.open(fileobj=raw, mode="w") as archive:
+                for path in sorted(source.rglob("*"), key=lambda item: item.as_posix()):
+                    relative = path.relative_to(source).as_posix()
+                    item = os.stat(path, follow_symlinks=False)
+                    name = relative + ("/" if stat.S_ISDIR(item.st_mode) else "")
+                    info = tarfile.TarInfo(name)
+                    info.uid = owner_uid
+                    info.gid = owner_gid
+                    info.uname = ""
+                    info.gname = ""
+                    info.mtime = 0
+                    info.mode = stat.S_IMODE(item.st_mode)
+                    if stat.S_ISDIR(item.st_mode):
+                        info.type = tarfile.DIRTYPE
+                        archive.addfile(info)
+                        continue
+                    if not stat.S_ISREG(item.st_mode) or item.st_nlink != 1:
+                        raise ReplayContractError("seed archive input is not a regular file")
+                    info.size = item.st_size
+                    opened = os.open(
+                        path,
+                        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                    )
+                    try:
+                        current = os.fstat(opened)
+                        if (current.st_dev, current.st_ino) != (item.st_dev, item.st_ino):
+                            raise ReplayContractError("seed archive input changed")
+                        with os.fdopen(opened, "rb") as handle:
+                            opened = -1
+                            archive.addfile(info, handle)
+                    finally:
+                        if opened >= 0:
+                            os.close(opened)
+                ready = b"ready\n"
+                info = tarfile.TarInfo(".ready")
+                info.uid = owner_uid
+                info.gid = owner_gid
+                info.uname = ""
+                info.gname = ""
+                info.mtime = 0
+                info.mode = 0o400
+                info.size = len(ready)
+                archive.addfile(info, io.BytesIO(ready))
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _strict_wrapper_result(
@@ -1960,9 +2062,13 @@ def _strict_wrapper_result(
 
 def _tmpfs_policy(policy: DockerPolicy) -> dict[str, str]:
     return {
+        "/seed": (
+            f"rw,nosuid,nodev,noexec,size={policy.tmpfs_bytes},"
+            f"uid={policy.observer_uid},gid={policy.observer_gid},mode=0755"
+        ),
         "/work": (
             f"rw,nosuid,nodev,size={policy.tmpfs_bytes},"
-            f"uid={policy.verifier_uid},gid={policy.verifier_gid},mode=0700"
+            f"uid={policy.verifier_uid},gid={policy.verifier_gid},mode=0755"
         ),
         "/scratch": (
             f"rw,nosuid,nodev,size={policy.tmpfs_bytes},"
@@ -1970,11 +2076,17 @@ def _tmpfs_policy(policy: DockerPolicy) -> dict[str, str]:
         ),
         "/control": (
             "rw,nosuid,nodev,noexec,size=1048576,"
-            f"uid={policy.signal_uid},gid={policy.signal_gid},mode=0700"
+            f"uid={policy.signal_uid},gid={policy.signal_gid},mode=0755"
         ),
-        "/result": "rw,nosuid,nodev,noexec,size=1048576,uid=0,gid=0,mode=0700",
+        "/result": "rw,nosuid,nodev,noexec,size=1048576,uid=0,gid=0,mode=0755",
         "/status": "rw,nosuid,nodev,noexec,size=1048576,uid=0,gid=0,mode=0755",
     }
+
+
+_SEED_BOOTSTRAP: Final = (
+    'while [ ! -f /seed/.ready ]; do sleep 0.05; done; '
+    'exec /bin/sh /seed/wrapper.sh "$@"'
+)
 
 
 _REQUIRED_MASKED_PATHS: Final = frozenset(
@@ -2023,6 +2135,8 @@ def _safe_moby_restriction_paths(
 _QUIESCE_VERIFIER_SCRIPT: Final = """set -eu
 self=$$
 parent=$PPID
+list=/scratch/quiesce.$$
+trap 'rm -f "$list"' EXIT
 owned() {
   for status in /proc/[0-9]*/status; do
     [ -r "$status" ] || continue
@@ -2032,12 +2146,16 @@ owned() {
     uid=$(awk '$1 == "Uid:" {print $2}' "$status")
     [ "$uid" = "$(id -u)" ] && printf '%s\n' "$pid"
   done
+  return 0
 }
-for pid in $(owned); do kill -TERM "$pid" 2>/dev/null || :; done
+owned > "$list"
+while IFS= read -r pid; do kill -TERM "$pid" 2>/dev/null || :; done < "$list"
 sleep 0.1
-for pid in $(owned); do kill -KILL "$pid" 2>/dev/null || :; done
+owned > "$list"
+while IFS= read -r pid; do kill -KILL "$pid" 2>/dev/null || :; done < "$list"
 sleep 0.1
-[ -z "$(owned)" ]
+owned > "$list"
+[ ! -s "$list" ]
 """
 
 
@@ -2076,6 +2194,7 @@ class DockerExecutor:
         timeout: int | None = None,
         output_limit: int | None = None,
         output_path: Path | None = None,
+        input_path: Path | None = None,
     ) -> RuntimeCommandResult:
         return self.runner.run(
             argv,
@@ -2088,6 +2207,7 @@ class DockerExecutor:
                 else output_limit
             ),
             output_path=output_path,
+            input_path=input_path,
         )
 
     def _required(
@@ -2098,12 +2218,14 @@ class DockerExecutor:
         timeout: int | None = None,
         output_limit: int | None = None,
         output_path: Path | None = None,
+        input_path: Path | None = None,
     ) -> RuntimeCommandResult:
         result = self._run(
             argv,
             timeout=timeout,
             output_limit=output_limit,
             output_path=output_path,
+            input_path=input_path,
         )
         if result.returncode != 0 or result.timed_out:
             raise ReplayContractError(f"restricted Docker {context} failed")
@@ -2207,35 +2329,45 @@ class DockerExecutor:
             raise ReplayContractError("restricted Docker mount policy mismatch")
         if require_running:
             expected_tmpfs = _tmpfs_policy(self.policy)
-            if len(mounts) != len(expected_tmpfs):
-                raise ReplayContractError("restricted Docker mount policy mismatch")
-            seen_destinations: set[str] = set()
-            for mount in mounts:
-                if type(mount) is not dict or set(mount) != {
-                    "Type",
-                    "Source",
-                    "Destination",
-                    "Mode",
-                    "RW",
-                    "Propagation",
-                }:
+            # Moby 27 reports runtime tmpfs mounts here; Moby 28 on the
+            # production host reports an empty list while retaining the exact
+            # effective map in HostConfig.Tmpfs. Validate either complete
+            # representation, never a partial runtime list.
+            if mounts:
+                if len(mounts) != len(expected_tmpfs):
                     raise ReplayContractError("restricted Docker mount policy mismatch")
-                destination = mount.get("Destination")
-                if (
-                    mount.get("Type") != "tmpfs"
-                    or mount.get("Source") != ""
-                    or type(destination) is not str
-                    or destination not in expected_tmpfs
-                    or mount.get("Mode") != ""
-                    or mount.get("RW") is not True
-                    or mount.get("Propagation") != ""
-                    or destination in seen_destinations
-                ):
+                seen_destinations: set[str] = set()
+                for mount in mounts:
+                    if type(mount) is not dict or set(mount) != {
+                        "Type",
+                        "Source",
+                        "Destination",
+                        "Mode",
+                        "RW",
+                        "Propagation",
+                    }:
+                        raise ReplayContractError(
+                            "restricted Docker mount policy mismatch"
+                        )
+                    destination = mount.get("Destination")
+                    if (
+                        mount.get("Type") != "tmpfs"
+                        or mount.get("Source") != ""
+                        or type(destination) is not str
+                        or destination not in expected_tmpfs
+                        or mount.get("Mode") != ""
+                        or mount.get("RW") is not True
+                        or mount.get("Propagation") != ""
+                        or destination in seen_destinations
+                    ):
+                        raise ReplayContractError(
+                            "restricted Docker mount policy mismatch"
+                        )
+                    seen_destinations.add(destination)
+                if seen_destinations != set(expected_tmpfs):
                     raise ReplayContractError("restricted Docker mount policy mismatch")
-                seen_destinations.add(destination)
             if (
-                seen_destinations != set(expected_tmpfs)
-                or state.get("Status") != "running"
+                state.get("Status") != "running"
                 or state.get("Running") is not True
                 or type(state.get("Pid")) is not int
                 or state["Pid"] <= 0
@@ -2390,6 +2522,7 @@ class DockerExecutor:
             _make_staged_candidate_read_only(stage / "candidate")
             wrapper = stage / "wrapper.sh"
             verifier = stage / "verifier.sh"
+            seed_archive = host / "seed.tar"
             wrapper.write_text(
                 _wrapper_script(nonce), encoding="utf-8"
             )
@@ -2397,9 +2530,18 @@ class DockerExecutor:
                 _verifier_script(verifier_text, self.policy.file_limit_blocks),
                 encoding="utf-8",
             )
-            os.chmod(wrapper, 0o500)
+            # The archive is extracted by the non-root observer UID. With all
+            # capabilities dropped, PID 1 cannot bypass DAC to read a 0500
+            # observer-owned file, so make the immutable wrapper world-readable.
+            os.chmod(wrapper, 0o555)
             os.chmod(verifier, 0o555)
             os.chmod(stage, 0o555)
+            _write_seed_archive(
+                stage,
+                seed_archive,
+                owner_uid=self.policy.observer_uid,
+                owner_gid=self.policy.observer_gid,
+            )
             raw_output = b""
             try:
                 runtime = self._required(
@@ -2416,7 +2558,9 @@ class DockerExecutor:
                     raise ReplayContractError("cached image inspect returned an invalid ID")
                 tmpfs = _tmpfs_policy(self.policy)
                 container_cmd = (
-                    "/seed/wrapper.sh",
+                    "-c",
+                    _SEED_BOOTSTRAP,
+                    "fable-bootstrap",
                     *(path for path, _digest in protected_before),
                 )
                 create = (
@@ -2440,6 +2584,8 @@ class DockerExecutor:
                     f"--ulimit=fsize={self.policy.file_limit_blocks}:{self.policy.file_limit_blocks}",
                     "--label",
                     f"fable.replay.owner={nonce}",
+                    "--tmpfs",
+                    f"/seed:{tmpfs['/seed']}",
                     "--tmpfs",
                     f"/work:{tmpfs['/work']}",
                     "--tmpfs",
@@ -2467,10 +2613,6 @@ class DockerExecutor:
                     require_running=False,
                 )
                 cid = created_cid
-                self._required(
-                    (docker, "cp", str(stage), f"{cid}:/seed"),
-                    context="stopped-container input copy",
-                )
                 lifecycle_deadline = self.clock() + effective_timeout
                 self._required(
                     (docker, "start", cid),
@@ -2484,6 +2626,24 @@ class DockerExecutor:
                     container_cmd,
                     require_running=True,
                     timeout=self._remaining_lifecycle_seconds(lifecycle_deadline),
+                )
+                self._required(
+                    (
+                        docker,
+                        "exec",
+                        "-i",
+                        "--user",
+                        f"{self.policy.observer_uid}:{self.policy.observer_gid}",
+                        cid,
+                        "tar",
+                        "-xpf",
+                        "-",
+                        "-C",
+                        "/seed",
+                    ),
+                    context="running-container input stream",
+                    timeout=self._remaining_lifecycle_seconds(lifecycle_deadline),
+                    input_path=seed_archive,
                 )
                 output_path = host / "verifier-output.log"
                 verifier_result = self._run(
@@ -2598,10 +2758,19 @@ class DockerExecutor:
                     )
                     result_path = host / "result.json"
                     self._required(
-                        (docker, "cp", f"{cid}:/result/result.json", str(result_path)),
-                        context="bounded result copy",
+                        (
+                            docker,
+                            "exec",
+                            "--user",
+                            f"{self.policy.observer_uid}:{self.policy.observer_gid}",
+                            cid,
+                            "cat",
+                            "/result/result.json",
+                        ),
+                        context="bounded result stream",
                         output_limit=self.policy.result_limit_bytes,
                         timeout=self._remaining_lifecycle_seconds(lifecycle_deadline),
+                        output_path=result_path,
                     )
                     self._inspect_owned(
                         cid,

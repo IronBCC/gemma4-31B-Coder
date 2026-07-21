@@ -1586,6 +1586,39 @@ def token_gate(
     return count
 
 
+def _rendered_token_count(rendered: object) -> int:
+    """Count one rendered conversation across tokenizer return conventions."""
+
+    input_ids = rendered
+    if isinstance(rendered, Mapping):
+        if "input_ids" not in rendered:
+            raise ValueError("rendered tokenizer output is missing input_ids")
+        input_ids = rendered["input_ids"]
+
+    shape = getattr(input_ids, "shape", None)
+    if shape is not None:
+        dimensions = tuple(int(value) for value in shape)
+        if len(dimensions) == 1:
+            return dimensions[0]
+        if len(dimensions) == 2 and dimensions[0] == 1:
+            return dimensions[1]
+        raise ValueError("rendered tokenizer output must contain exactly one sequence")
+
+    if isinstance(input_ids, Sequence) and not isinstance(
+        input_ids, (str, bytes, bytearray)
+    ):
+        if input_ids and isinstance(input_ids[0], Sequence) and not isinstance(
+            input_ids[0], (str, bytes, bytearray)
+        ):
+            if len(input_ids) != 1:
+                raise ValueError(
+                    "rendered tokenizer output must contain exactly one sequence"
+                )
+            return len(input_ids[0])
+        return len(input_ids)
+    raise ValueError("rendered tokenizer output has unsupported input_ids")
+
+
 def _normalized_words(text: str) -> tuple[str, ...]:
     return tuple(word.casefold() for word in _WORD_RE.findall(text))
 
@@ -3098,7 +3131,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             rendered = tokenizer.apply_chat_template(
                 messages, tokenize=True, add_generation_prompt=False
             )
-            return len(rendered)
+            return _rendered_token_count(rendered)
 
         seed_loader = lambda task: _load_seed_contract(args.moonshiner_root, task)
     if args.replay_ledger and args.replay_logs is None:

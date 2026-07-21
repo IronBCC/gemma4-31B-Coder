@@ -47,6 +47,16 @@ TASK = "py-safe"
 VERIFY_CMD = "python3 -m pytest -q"
 
 
+@pytest.fixture(autouse=True)
+def _private_test_umask() -> object:
+    """Keep security-sensitive CLI fixtures portable across host umasks."""
+    previous = os.umask(0o077)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
 def _task_json(**updates: object) -> bytes:
     payload: dict[str, object] = {
         "id": TASK,
@@ -1062,8 +1072,9 @@ def test_default_docker_client_environment_cannot_redirect_to_network_or_context
 
     assert env == {
         "PATH": os.defpath,
-        "HOME": os.devnull,
-        "XDG_CONFIG_HOME": os.devnull,
+        "HOME": "/var/empty",
+        "XDG_CONFIG_HOME": "/var/empty",
+        "DOCKER_CONFIG": "/var/empty/.docker",
         "LANG": "C",
         "LC_ALL": "C",
     }
@@ -1094,13 +1105,20 @@ class FakeDockerRuntime:
         self.inspect_mutator = inspect_mutator
         self.create_output = create_output or (CID + "\n").encode()
         self.free_values = iter(free_bytes)
-        self.calls: list[tuple[tuple[str, ...], int, int, Path | None]] = []
+        self.calls: list[
+            tuple[tuple[str, ...], int, int, Path | None, Path | None]
+        ] = []
         self._failed = False
         self.protected_result: list[str] = []
         self.verifier_script = ""
         self.input_modes: dict[str, int] = {}
         self.stage_mode = 0
-        self.container_cmd = ["/seed/wrapper.sh", "test_src.py"]
+        self.container_cmd = [
+            "-c",
+            replay._SEED_BOOTSTRAP,
+            "fable-bootstrap",
+            "test_src.py",
+        ]
         self.started = False
 
     def disk_free_bytes(self) -> int:
@@ -1113,8 +1131,11 @@ class FakeDockerRuntime:
         timeout_seconds: int,
         output_limit_bytes: int,
         output_path: Path | None = None,
+        input_path: Path | None = None,
     ):
-        self.calls.append((argv, timeout_seconds, output_limit_bytes, output_path))
+        self.calls.append(
+            (argv, timeout_seconds, output_limit_bytes, output_path, input_path)
+        )
         verb = argv[1] if len(argv) > 1 else ""
         if self.fail_verb == verb and not self._failed:
             self._failed = True
@@ -1133,10 +1154,11 @@ class FakeDockerRuntime:
             return replay.RuntimeCommandResult(0, self.create_output, 0.01)
         if verb == "inspect":
             tmpfs = {
-                "/work": "rw,nosuid,nodev,size=4294967296,uid=65532,gid=65532,mode=0700",
+                "/seed": "rw,nosuid,nodev,noexec,size=4294967296,uid=65534,gid=65534,mode=0755",
+                "/work": "rw,nosuid,nodev,size=4294967296,uid=65532,gid=65532,mode=0755",
                 "/scratch": "rw,nosuid,nodev,size=4294967296,uid=65532,gid=65532,mode=0700",
-                "/control": "rw,nosuid,nodev,noexec,size=1048576,uid=65533,gid=65533,mode=0700",
-                "/result": "rw,nosuid,nodev,noexec,size=1048576,uid=0,gid=0,mode=0700",
+                "/control": "rw,nosuid,nodev,noexec,size=1048576,uid=65533,gid=65533,mode=0755",
+                "/result": "rw,nosuid,nodev,noexec,size=1048576,uid=0,gid=0,mode=0755",
                 "/status": "rw,nosuid,nodev,noexec,size=1048576,uid=0,gid=0,mode=0755",
             }
             payload = {
@@ -1203,6 +1225,51 @@ class FakeDockerRuntime:
                 0, (json.dumps(payload) + "\n").encode(), 0.01
             )
         if verb == "exec":
+            if "tar" in argv:
+                assert self.started
+                assert input_path is not None
+                with tarfile.open(input_path, mode="r:") as archive:
+                    members = {
+                        member.name.rstrip("/"): member for member in archive
+                    }
+                    self.stage_mode = 0o555
+                    self.input_modes = {
+                        name: member.mode
+                        for name, member in members.items()
+                        if name != ".ready"
+                    }
+                    verifier = archive.extractfile("verifier.sh")
+                    assert verifier is not None
+                    self.verifier_script = verifier.read().decode()
+                    self.protected_result = []
+                    for protected_path in self.container_cmd[3:]:
+                        candidate = archive.extractfile(
+                            f"candidate/{protected_path}"
+                        )
+                        assert candidate is not None
+                        self.protected_result.append(
+                            hashlib.sha256(candidate.read()).hexdigest()
+                        )
+                return replay.RuntimeCommandResult(0, b"", 0.01)
+            if "/result/result.json" in argv:
+                assert output_path is not None
+                result = {
+                    "schema_version": 1,
+                    "run_nonce": "a" * 32,
+                    "wrapper_rc": 0,
+                    "post_tree_sha256": "d" * 64,
+                    "protected_sha256": self.protected_result,
+                    "resource_peaks": {
+                        "memory_bytes": 1024,
+                        "pids": 3,
+                        "cpu_usec": 4000,
+                    },
+                }
+                result.update(self.result_updates)
+                encoded = json.dumps(result).encode()
+                output_path.write_bytes(encoded)
+                os.chmod(output_path, self.result_mode)
+                return replay.RuntimeCommandResult(0, encoded, 0.01)
             if any(value.endswith("/verifier.sh") for value in argv):
                 return replay.RuntimeCommandResult(
                     self.verifier_rc,
@@ -1217,37 +1284,6 @@ class FakeDockerRuntime:
             return replay.RuntimeCommandResult(0, b"", 0.01)
         if verb == "stop":
             self.started = False
-            return replay.RuntimeCommandResult(0, b"", 0.01)
-        if verb == "cp" and argv[3] == f"{CID}:/seed":
-            candidate = Path(argv[2]) / "candidate"
-            self.stage_mode = stat.S_IMODE(Path(argv[2]).stat().st_mode)
-            self.verifier_script = (Path(argv[2]) / "verifier.sh").read_text()
-            self.input_modes = {
-                path.relative_to(Path(argv[2])).as_posix(): stat.S_IMODE(path.stat().st_mode)
-                for path in Path(argv[2]).rglob("*")
-            }
-            self.protected_result = [
-                hashlib.sha256((candidate / path).read_bytes()).hexdigest()
-                for path in self.container_cmd[1:]
-            ]
-            return replay.RuntimeCommandResult(0, b"", 0.01)
-        if verb == "cp" and argv[2] == f"{CID}:/result/result.json":
-            destination = Path(argv[3])
-            result = {
-                "schema_version": 1,
-                "run_nonce": "a" * 32,
-                "wrapper_rc": 0,
-                "post_tree_sha256": "d" * 64,
-                "protected_sha256": self.protected_result,
-                "resource_peaks": {
-                    "memory_bytes": 1024,
-                    "pids": 3,
-                    "cpu_usec": 4000,
-                },
-            }
-            result.update(self.result_updates)
-            destination.write_text(json.dumps(result), encoding="utf-8")
-            os.chmod(destination, self.result_mode)
             return replay.RuntimeCommandResult(0, b"", 0.01)
         if verb == "logs":
             return replay.RuntimeCommandResult(0, b"wrapper log\n", 0.01)
@@ -1368,12 +1404,17 @@ def test_docker_executor_uses_the_complete_restricted_state_machine(tmp_path: Pa
     assert any(value.startswith("--memory-swap=") for value in create)
     assert any(value.startswith("--cpus=") for value in create)
     assert any(value.startswith("--ulimit=fsize=") for value in create)
-    assert sum(value == "--tmpfs" for value in create) == 5
+    assert sum(value == "--tmpfs" for value in create) == 6
     assert not any(value in {"-v", "--volume", "--mount"} for value in create)
     assert not any("docker.sock" in value for value in create)
     assert IMAGE_DIGEST in create
     image_index = create.index(IMAGE_DIGEST)
-    assert create[image_index + 1 :] == ("/seed/wrapper.sh", "test_src.py")
+    assert create[image_index + 1 :] == (
+        "-c",
+        replay._SEED_BOOTSTRAP,
+        "fable-bootstrap",
+        "test_src.py",
+    )
 
     verbs = [argv[1] for argv in argvs]
     assert verbs == [
@@ -1381,15 +1422,15 @@ def test_docker_executor_uses_the_complete_restricted_state_machine(tmp_path: Pa
         "image",
         "create",
         "inspect",
-        "cp",
         "start",
         "inspect",
         "exec",
         "exec",
         "exec",
         "exec",
+        "exec",
         "inspect",
-        "cp",
+        "exec",
         "inspect",
         "inspect",
         "logs",
@@ -1417,8 +1458,25 @@ def test_docker_executor_uses_the_complete_restricted_state_machine(tmp_path: Pa
     assert runtime.input_modes["candidate/src.py"] == 0o444
     assert runtime.input_modes["candidate/test_src.py"] == 0o444
     assert runtime.input_modes["verifier.sh"] == 0o555
-    assert runtime.input_modes["wrapper.sh"] == 0o500
+    assert runtime.input_modes["wrapper.sh"] == 0o555
     assert runtime.stage_mode == 0o555
+
+
+def test_readonly_container_starts_before_seed_tmpfs_stream(tmp_path: Path) -> None:
+    runtime = FakeDockerRuntime()
+
+    _docker_execute(runtime, tmp_path)
+
+    argvs = [call[0] for call in runtime.calls]
+    create = next(argv for argv in argvs if argv[1] == "create")
+    start_index = next(index for index, argv in enumerate(argvs) if argv[1] == "start")
+    seed_stream_index = next(
+        index
+        for index, call in enumerate(runtime.calls)
+        if call[0][1] == "exec" and "tar" in call[0] and call[4] is not None
+    )
+    assert start_index < seed_stream_index
+    assert any("/seed:" in value for value in create)
 
 
 def test_running_inspect_accepts_captured_real_moby_tmpfs_mount_shape(
@@ -1439,12 +1497,28 @@ def test_running_inspect_accepts_captured_real_moby_tmpfs_mount_shape(
     assert evidence.resolved is True
 
 
+def test_running_inspect_accepts_moby_empty_mounts_with_exact_host_tmpfs(
+    tmp_path: Path,
+) -> None:
+    def empty_runtime_mounts(payload: dict[str, object]) -> None:
+        state = payload.get("State")
+        if isinstance(state, dict) and state.get("Running") is True:
+            payload["Mounts"] = []
+
+    evidence = _docker_execute(
+        FakeDockerRuntime(inspect_mutator=empty_runtime_mounts), tmp_path
+    )
+
+    assert evidence.resolved is True
+
+
 def test_trusted_wrapper_quotes_hashes_as_json_and_never_embeds_verifier() -> None:
     script = replay._wrapper_script("a" * 32)
 
     assert '"protected_sha256":[' in script
     assert 'for path do' in script
     assert 'sha256sum -- "/work/$path"' in script
+    assert "cd /work && find ." in script
     assert "xargs -0 -r sha256sum --" in script
     assert "python3 -m pytest" not in script
     assert "/result/result.json" in script
@@ -1457,7 +1531,8 @@ def test_hostile_protected_path_is_argv_data_never_shell_source(tmp_path: Path) 
     _docker_execute(runtime, tmp_path, protected_path=hostile)
 
     create = next(call[0] for call in runtime.calls if call[0][1] == "create")
-    assert create[-2:] == ("/seed/wrapper.sh", hostile)
+    assert create[-1] == hostile
+    assert hostile not in replay._SEED_BOOTSTRAP
     assert hostile not in replay._wrapper_script("a" * 32)
 
 
@@ -1465,11 +1540,11 @@ def test_nonroot_verifier_copies_readonly_seed_to_private_writable_tmpfs() -> No
     script = replay._verifier_script("python3 -m pytest -q", 1024)
 
     assert "cp -R /seed/candidate/. /work/" in script
-    assert "chmod -R u+rwX /work" in script
+    assert "chmod -R u+rwX,go+rX /work" in script
     assert "cd /work" in script
 
 
-@pytest.mark.parametrize("fail_verb", ["create", "inspect", "cp", "start"])
+@pytest.mark.parametrize("fail_verb", ["create", "inspect", "exec", "start"])
 def test_docker_executor_cleans_only_its_exact_cid_on_every_failure(
     tmp_path: Path, fail_verb: str
 ) -> None:
@@ -2105,6 +2180,7 @@ def test_docker_executor_quiesces_verifier_uid_before_hash_signal(tmp_path: Path
 
     assert quiesce[1:4] == ("exec", "--user", "65532:65532")
     assert any("/proc/[0-9]*" in value for value in quiesce)
+    assert all("for pid in $(owned)" not in value for value in quiesce)
     assert any("/control/go" in value for value in signal)
 
 

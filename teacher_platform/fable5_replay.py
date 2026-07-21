@@ -12,10 +12,15 @@ import hashlib
 import json
 import os
 import re
+import selectors
+import secrets
+import shlex
+import shutil
 import stat
 import subprocess
 import tarfile
 import tempfile
+import time
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -163,6 +168,210 @@ class ReferencePatchContract:
     exclusion_reason: str | None
     patch_sha256: str | None
     targets: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DockerPolicy:
+    """Immutable runtime policy keyed only by locally cached image digests."""
+
+    images: tuple[tuple[str, str], ...]
+    policy_version: str = "fable-docker-v1"
+    docker_binary: str = "docker"
+    cpus: str = "2.0"
+    memory_bytes: int = 4 * 1024**3
+    pids_limit: int = 256
+    tmpfs_bytes: int = 4 * 1024**3
+    file_limit_blocks: int = 1_048_576
+    output_limit_bytes: int = 4 * 1024**2
+    result_limit_bytes: int = 16 * 1024
+    disk_floor_bytes: int = 40 * 1024**3
+    command_timeout_seconds: int = 30
+    verifier_uid: int = 65_532
+    verifier_gid: int = 65_532
+    signal_uid: int = 65_533
+    signal_gid: int = 65_533
+    observer_uid: int = 65_534
+    observer_gid: int = 65_534
+
+    def __post_init__(self) -> None:
+        if type(self.images) is not tuple or any(
+            type(item) is not tuple
+            or len(item) != 2
+            or any(type(value) is not str for value in item)
+            for item in self.images
+        ):
+            raise ValueError("Docker policy image mapping must be deeply immutable")
+        if not self.images:
+            raise ValueError("Docker policy needs at least one exact image digest")
+        seen: set[str] = set()
+        for language, image in self.images:
+            if language not in {"python", "rust", "cpp"} or language in seen:
+                raise ValueError("Docker policy languages must be unique and supported")
+            seen.add(language)
+            if re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", image) is None:
+                raise ValueError("Docker image must use an exact immutable digest")
+        if self.docker_binary != "docker" or not self.policy_version:
+            raise ValueError("Docker policy command and version are fixed")
+        integer_limits = (
+            self.memory_bytes,
+            self.pids_limit,
+            self.tmpfs_bytes,
+            self.file_limit_blocks,
+            self.output_limit_bytes,
+            self.result_limit_bytes,
+            self.command_timeout_seconds,
+        )
+        if any(type(value) is not int or value <= 0 for value in integer_limits):
+            raise ValueError("Docker policy resource limits must be positive integers")
+        if (
+            type(self.disk_floor_bytes) is not int
+            or self.disk_floor_bytes < 40 * 1024**3
+        ):
+            raise ValueError("Docker policy disk floor must be at least 40 GiB")
+        if (
+            type(self.cpus) is not str
+            or re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", self.cpus) is None
+            or float(self.cpus) <= 0
+        ):
+            raise ValueError("Docker policy CPU limit must be a positive decimal")
+        identities = (
+            (self.verifier_uid, self.verifier_gid),
+            (self.signal_uid, self.signal_gid),
+            (self.observer_uid, self.observer_gid),
+        )
+        if any(
+            type(uid) is not int
+            or type(gid) is not int
+            or uid <= 0
+            or gid <= 0
+            or uid != gid
+            for uid, gid in identities
+        ) or len(set(identities)) != len(identities):
+            raise ValueError("Docker policy identities must be distinct non-root UID/GIDs")
+
+    def image_for(self, language: str) -> str:
+        for candidate_language, image in self.images:
+            if candidate_language == language:
+                return image
+        raise ReplayContractError(f"no exact cached image for language {language!r}")
+
+
+@dataclass(frozen=True)
+class RuntimeCommandResult:
+    returncode: int
+    output: bytes
+    duration_seconds: float
+    timed_out: bool = False
+    truncated: bool = False
+
+
+class DockerRuntime(Protocol):
+    def run(
+        self,
+        argv: tuple[str, ...],
+        *,
+        timeout_seconds: int,
+        output_limit_bytes: int,
+        output_path: Path | None = None,
+    ) -> RuntimeCommandResult: ...
+
+
+@dataclass(frozen=True)
+class RunEvidence:
+    schema_version: int
+    run_id: str
+    control_identity: str
+    trainable: bool
+    returncode: int
+    wrapper_returncode: int | None
+    duration_seconds: float
+    termination: str
+    raw_output_sha256: str
+    raw_output_bytes: int
+    output_truncated: bool
+    pre_candidate_tree_sha256: str
+    pre_candidate_diff_sha256: str
+    post_candidate_tree_sha256: str | None
+    protected_before: tuple[tuple[str, str], ...]
+    protected_after: tuple[tuple[str, str], ...]
+    resolved: bool
+    failure_class: str | None
+    cleanup_state: str
+    policy_version: str
+    image_digest: str
+    runtime_version: str
+    run_contract_sha256: str
+    resource_peaks: tuple[tuple[str, int], ...]
+
+
+class RestrictedExecutor(Protocol):
+    def execute(
+        self,
+        *,
+        candidate_root: Path,
+        language: str,
+        verifier_text: str,
+        effective_timeout: int,
+        control_identity: str,
+        pre_candidate_tree_sha256: str,
+        pre_candidate_diff_sha256: str,
+        protected_before: tuple[tuple[str, str], ...],
+    ) -> RunEvidence: ...
+
+
+@dataclass(frozen=True)
+class AdmissionEvidence:
+    schema_version: int
+    language: str
+    admitted: bool
+    policy_version: str
+    image_digest: str
+    runtime_version: str
+    probe_run: RunEvidence
+    failure_class: str | None
+
+
+@dataclass(frozen=True)
+class ReplayEvidence:
+    schema_version: int
+    trajectory_id: str
+    task: str
+    language: str
+    dataset_revision: str
+    source_commit_sha: str
+    source_tree_sha: str
+    task_tree_sha: str
+    inventory_sha256: str
+    source_terminal_sha256: str
+    operation_sha256: str
+    candidate_tree_sha256: str
+    candidate_diff_sha256: str
+    protected_sha256: tuple[tuple[str, str], ...]
+    verifier_text: str
+    verifier_sha256: str
+    source_verify_timeout: int | None
+    effective_verify_timeout: int
+    policy_version: str
+    image_digest: str
+    runtime_version: str
+    run_contract_sha256: str
+    runs: tuple[RunEvidence, RunEvidence]
+    resolved: bool
+    failure_class: str | None
+    control_identity: str
+    trainable: bool
+
+
+@dataclass(frozen=True)
+class ControlSetEvidence:
+    schema_version: int
+    trajectory_id: str
+    baseline: RunEvidence
+    reference: RunEvidence
+    candidate: ReplayEvidence
+    corrupt: RunEvidence | None
+    admitted: bool
+    failure_class: str | None
 
 
 @dataclass(frozen=True)
@@ -1284,17 +1493,1196 @@ def preflight_reference_patch(
     return ReferencePatchContract(True, None, patch_sha, targets)
 
 
+def _sanitized_docker_environment() -> dict[str, str]:
+    return {
+        "PATH": os.defpath,
+        "HOME": os.devnull,
+        "XDG_CONFIG_HOME": os.devnull,
+        "LANG": "C",
+        "LC_ALL": "C",
+    }
+
+
+class _SubprocessDockerRuntime:
+    """Run argv-only Docker clients with incremental, bounded output capture."""
+
+    def run(
+        self,
+        argv: tuple[str, ...],
+        *,
+        timeout_seconds: int,
+        output_limit_bytes: int,
+        output_path: Path | None = None,
+    ) -> RuntimeCommandResult:
+        started = time.monotonic()
+        descriptor = -1
+        if output_path is not None:
+            descriptor = os.open(
+                output_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+        process: subprocess.Popen[bytes] | None = None
+        captured = bytearray()
+        truncated = False
+        timed_out = False
+        try:
+            process = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+                env=_sanitized_docker_environment(),
+            )
+            assert process.stdout is not None
+            selector = selectors.DefaultSelector()
+            selector.register(process.stdout, selectors.EVENT_READ)
+            deadline = started + timeout_seconds
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    process.terminate()
+                    try:
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    break
+                events = selector.select(min(remaining, 0.25))
+                if not events and process.poll() is not None:
+                    chunk = process.stdout.read()
+                    if chunk:
+                        events = [(None, None)]
+                    else:
+                        selector.unregister(process.stdout)
+                        break
+                else:
+                    chunk = b""
+                for key, _mask in events:
+                    if key is not None:
+                        chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+                    if not chunk:
+                        if key is not None:
+                            selector.unregister(key.fileobj)
+                        continue
+                    available = max(0, output_limit_bytes - len(captured))
+                    accepted = chunk[:available]
+                    captured.extend(accepted)
+                    if descriptor >= 0 and accepted:
+                        os.write(descriptor, accepted)
+                    if len(accepted) != len(chunk):
+                        truncated = True
+            if process.poll() is None:
+                process.wait(timeout=1)
+            return RuntimeCommandResult(
+                124 if timed_out else process.returncode,
+                bytes(captured),
+                time.monotonic() - started,
+                timed_out=timed_out,
+                truncated=truncated,
+            )
+        except OSError as exc:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+            raise ReplayContractError(f"Docker client could not start: {argv!r}") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
+def _default_docker_free_bytes() -> int:
+    root = Path("/var/lib/docker")
+    return shutil.disk_usage(root if root.exists() else Path("/")).free
+
+
+def _validate_sha256(value: str, field_name: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ReplayContractError(f"{field_name} must be a SHA-256 digest")
+    return value
+
+
+def _policy_payload(policy: DockerPolicy, image: str) -> dict[str, Any]:
+    return {
+        "policy_version": policy.policy_version,
+        "image_digest": image,
+        "cpus": policy.cpus,
+        "memory_bytes": policy.memory_bytes,
+        "pids_limit": policy.pids_limit,
+        "tmpfs_bytes": policy.tmpfs_bytes,
+        "file_limit_blocks": policy.file_limit_blocks,
+        "output_limit_bytes": policy.output_limit_bytes,
+        "result_limit_bytes": policy.result_limit_bytes,
+        "command_timeout_seconds": policy.command_timeout_seconds,
+        "disk_floor_bytes": policy.disk_floor_bytes,
+        "verifier_uid": policy.verifier_uid,
+        "verifier_gid": policy.verifier_gid,
+        "signal_uid": policy.signal_uid,
+        "signal_gid": policy.signal_gid,
+        "observer_uid": policy.observer_uid,
+        "observer_gid": policy.observer_gid,
+    }
+
+
+def _wrapper_script(run_nonce: str) -> str:
+    return f"""#!/bin/sh
+set -eu
+umask 077
+while [ ! -f /control/go ]; do sleep 0.05; done
+tree=$(find /work -xdev -type f -printf '%P\\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum | awk '{{print $1}}')
+memory=$(cat /sys/fs/cgroup/memory.peak)
+pids=$(cat /sys/fs/cgroup/pids.peak)
+cpu=$(awk '$1 == "usage_usec" {{print $2}}' /sys/fs/cgroup/cpu.stat)
+for peak in "$memory" "$pids" "$cpu"; do
+  case "$peak" in ''|0|*[!0-9]*) exit 1 ;; esac
+done
+tmp=/result/result.json.tmp
+printf '{{"schema_version":1,"run_nonce":"{run_nonce}","wrapper_rc":0,"post_tree_sha256":"%s","protected_sha256":[' "$tree" > "$tmp"
+separator=
+for path do
+  actual=$(sha256sum -- "/work/$path" | awk '{{print $1}}')
+  printf '%s"%s"' "$separator" "$actual" >> "$tmp"
+  separator=,
+done
+printf '],"resource_peaks":{{"memory_bytes":%s,"pids":%s,"cpu_usec":%s}}}}' "$memory" "$pids" "$cpu" >> "$tmp"
+chmod 0600 "$tmp"
+mv "$tmp" /result/result.json
+: > /status/done
+while :; do sleep 3600; done
+"""
+
+
+def _verifier_script(verifier_text: str, file_limit_blocks: int) -> str:
+    return f"""#!/bin/sh
+set -eu
+umask 077
+cp -R /seed/candidate/. /work/
+chmod -R u+rwX /work
+cd /work
+ulimit -f {file_limit_blocks}
+exec /bin/sh -c {shlex.quote(verifier_text)}
+"""
+
+
+def _make_staged_candidate_read_only(root: Path) -> None:
+    for current, dirnames, filenames in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        os.chmod(current_path, 0o555)
+        for dirname in dirnames:
+            os.chmod(current_path / dirname, 0o555)
+        for filename in filenames:
+            os.chmod(current_path / filename, 0o444)
+
+
+def _strict_wrapper_result(
+    path: Path,
+    *,
+    run_nonce: str,
+    protected_before: tuple[tuple[str, str], ...],
+    limit: int,
+) -> tuple[int, str, tuple[tuple[str, str], ...], tuple[tuple[str, int], ...]]:
+    try:
+        item = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise ReplayContractError("wrapper result is missing") from exc
+    if (
+        not stat.S_ISREG(item.st_mode)
+        or item.st_nlink != 1
+        or stat.S_IMODE(item.st_mode) != 0o600
+        or item.st_size > limit
+    ):
+        raise ReplayContractError("wrapper result is not a bounded regular file")
+    try:
+        payload = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ReplayContractError("wrapper result is malformed") from exc
+    expected = {
+        "schema_version",
+        "run_nonce",
+        "wrapper_rc",
+        "post_tree_sha256",
+        "protected_sha256",
+        "resource_peaks",
+    }
+    if type(payload) is not dict or set(payload) != expected:
+        raise ReplayContractError("wrapper result has the wrong exact schema")
+    if payload["schema_version"] != 1 or payload["run_nonce"] != run_nonce:
+        raise ReplayContractError("wrapper result binding mismatch")
+    if type(payload["wrapper_rc"]) is not int:
+        raise ReplayContractError("wrapper result has invalid wrapper rc")
+    post_tree = payload["post_tree_sha256"]
+    if type(post_tree) is not str:
+        raise ReplayContractError("wrapper result has invalid state hash")
+    _validate_sha256(post_tree, "wrapper result state hash")
+    expected_paths = tuple(path for path, _digest in protected_before)
+    protected = payload["protected_sha256"]
+    if type(protected) is not list or len(protected) != len(expected_paths):
+        raise ReplayContractError("wrapper result protected hash schema mismatch")
+    protected_after = tuple(
+        (path, _validate_sha256(digest, "wrapper result protected hash"))
+        for path, digest in zip(expected_paths, protected, strict=True)
+    )
+    resources = payload["resource_peaks"]
+    resource_keys = ("memory_bytes", "pids", "cpu_usec")
+    if type(resources) is not dict or set(resources) != set(resource_keys):
+        raise ReplayContractError("wrapper result resource schema mismatch")
+    if any(type(resources[key]) is not int or resources[key] <= 0 for key in resource_keys):
+        raise ReplayContractError("wrapper result resource values are invalid")
+    return (
+        payload["wrapper_rc"],
+        post_tree,
+        protected_after,
+        tuple((key, resources[key]) for key in resource_keys),
+    )
+
+
+def _tmpfs_policy(policy: DockerPolicy) -> dict[str, str]:
+    return {
+        "/work": (
+            f"rw,nosuid,nodev,size={policy.tmpfs_bytes},"
+            f"uid={policy.verifier_uid},gid={policy.verifier_gid},mode=0700"
+        ),
+        "/scratch": (
+            f"rw,nosuid,nodev,size={policy.tmpfs_bytes},"
+            f"uid={policy.verifier_uid},gid={policy.verifier_gid},mode=0700"
+        ),
+        "/control": (
+            "rw,nosuid,nodev,noexec,size=1048576,"
+            f"uid={policy.signal_uid},gid={policy.signal_gid},mode=0700"
+        ),
+        "/result": "rw,nosuid,nodev,noexec,size=1048576,uid=0,gid=0,mode=0700",
+        "/status": "rw,nosuid,nodev,noexec,size=1048576,uid=0,gid=0,mode=0755",
+    }
+
+
+_QUIESCE_VERIFIER_SCRIPT: Final = """set -eu
+self=$$
+parent=$PPID
+owned() {
+  for status in /proc/[0-9]*/status; do
+    [ -r "$status" ] || continue
+    pid=${status#/proc/}; pid=${pid%/status}
+    [ "$pid" = "$self" ] && continue
+    [ "$pid" = "$parent" ] && continue
+    uid=$(awk '$1 == "Uid:" {print $2}' "$status")
+    [ "$uid" = "$(id -u)" ] && printf '%s\n' "$pid"
+  done
+}
+for pid in $(owned); do kill -TERM "$pid" 2>/dev/null || :; done
+sleep 0.1
+for pid in $(owned); do kill -KILL "$pid" 2>/dev/null || :; done
+sleep 0.1
+[ -z "$(owned)" ]
+"""
+
+
+class DockerExecutor:
+    """Exact-CID Docker verifier with no network, mounts, pulls, or root verifier."""
+
+    def __init__(
+        self,
+        policy: DockerPolicy,
+        *,
+        runner: DockerRuntime | None = None,
+        disk_free_bytes: Callable[[], int] = _default_docker_free_bytes,
+        token_factory: Callable[[], str] = lambda: secrets.token_hex(16),
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.policy = policy
+        self.runner = runner or _SubprocessDockerRuntime()
+        self.disk_free_bytes = disk_free_bytes
+        self.token_factory = token_factory
+        self.clock = clock
+
+    def _remaining_lifecycle_seconds(
+        self, deadline: float, *, command_cap: bool = True
+    ) -> int:
+        remaining = int(deadline - self.clock())
+        if remaining < 1:
+            raise ReplayContractError("restricted Docker container wall timeout")
+        if command_cap:
+            return min(self.policy.command_timeout_seconds, remaining)
+        return remaining
+
+    def _run(
+        self,
+        argv: tuple[str, ...],
+        *,
+        timeout: int | None = None,
+        output_limit: int | None = None,
+        output_path: Path | None = None,
+    ) -> RuntimeCommandResult:
+        return self.runner.run(
+            argv,
+            timeout_seconds=(
+                self.policy.command_timeout_seconds if timeout is None else timeout
+            ),
+            output_limit_bytes=(
+                self.policy.output_limit_bytes
+                if output_limit is None
+                else output_limit
+            ),
+            output_path=output_path,
+        )
+
+    def _required(
+        self,
+        argv: tuple[str, ...],
+        *,
+        context: str,
+        timeout: int | None = None,
+        output_limit: int | None = None,
+        output_path: Path | None = None,
+    ) -> RuntimeCommandResult:
+        result = self._run(
+            argv,
+            timeout=timeout,
+            output_limit=output_limit,
+            output_path=output_path,
+        )
+        if result.returncode != 0 or result.timed_out:
+            raise ReplayContractError(f"restricted Docker {context} failed")
+        return result
+
+    def _inspect_owned(
+        self,
+        cid: str,
+        nonce: str,
+        image_id: str,
+        expected_cmd: tuple[str, ...],
+        *,
+        require_running: bool,
+        timeout: int | None = None,
+    ) -> None:
+        result = self._required(
+            (self.policy.docker_binary, "inspect", cid),
+            context="ownership inspect",
+            timeout=timeout,
+        )
+        try:
+            payload = json.loads(result.output)
+            if type(payload) is list:
+                if len(payload) != 1:
+                    raise ValueError
+                payload = payload[0]
+            labels = payload["Config"]["Labels"]
+            config = payload["Config"]
+            host = payload["HostConfig"]
+            state = payload["State"]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ReplayContractError("restricted Docker inspect schema mismatch") from exc
+        if (
+            payload.get("Id") != cid
+            or payload.get("Name") != f"/fable-replay-{nonce}"
+            or payload.get("Image") != image_id
+            or labels.get("fable.replay.owner") != nonce
+            or config.get("User") != "0:0"
+            or config.get("Entrypoint") != ["/bin/sh"]
+            or config.get("Cmd") != list(expected_cmd)
+            or config.get("Volumes") not in (None, {})
+            or host.get("NetworkMode") != "none"
+            or host.get("ReadonlyRootfs") is not True
+            or "ALL" not in host.get("CapDrop", [])
+            or "no-new-privileges:true" not in host.get("SecurityOpt", [])
+            or host.get("NanoCpus") != int(float(self.policy.cpus) * 1_000_000_000)
+            or host.get("Memory") != self.policy.memory_bytes
+            or host.get("MemorySwap") != self.policy.memory_bytes
+            or host.get("PidsLimit") != self.policy.pids_limit
+            or host.get("Tmpfs") != _tmpfs_policy(self.policy)
+            or host.get("Binds") not in (None, [], ())
+        ):
+            raise ReplayContractError("restricted Docker ownership/policy mismatch")
+        expected_ulimit = {
+            "Name": "fsize",
+            "Soft": self.policy.file_limit_blocks,
+            "Hard": self.policy.file_limit_blocks,
+        }
+        if expected_ulimit not in (host.get("Ulimits") or []):
+            raise ReplayContractError("restricted Docker resource policy mismatch")
+        mounts = payload.get("Mounts") or []
+        if type(mounts) is not list or any(
+            type(mount) is not dict
+            or mount.get("Type") != "tmpfs"
+            or mount.get("Destination") not in _tmpfs_policy(self.policy)
+            for mount in mounts
+        ):
+            raise ReplayContractError("restricted Docker mount policy mismatch")
+        if require_running and (
+            state.get("Running") is not True or type(state.get("Pid")) is not int
+        ):
+            raise ReplayContractError("restricted Docker wrapper is not running")
+
+    def _cleanup(self, cid: str, nonce: str) -> str:
+        docker = self.policy.docker_binary
+        failures: list[str] = []
+        self._run((docker, "logs", cid), output_limit=self.policy.output_limit_bytes)
+        self._run((docker, "inspect", cid))
+        stop = self._run((docker, "stop", "--time=2", cid))
+        remove = self._run((docker, "rm", "--force", "--volumes", cid))
+        if stop.returncode != 0 or stop.timed_out:
+            failures.append("parent_stop_failed")
+        if remove.returncode != 0 or remove.timed_out:
+            failures.append("parent_remove_failed")
+        descendants = self._run(
+            (
+                docker,
+                "ps",
+                "-aq",
+                "--no-trunc",
+                "--filter",
+                f"label=fable.replay.owner={nonce}",
+            )
+        )
+        if descendants.returncode != 0 or descendants.timed_out:
+            failures.append("descendant_query_failed")
+            ids: list[str] = []
+        else:
+            try:
+                ids = [
+                    line.strip()
+                    for line in descendants.output.decode("ascii").splitlines()
+                    if line.strip()
+                ]
+            except UnicodeDecodeError:
+                failures.append("descendant_query_invalid")
+                ids = []
+        for descendant in ids:
+            if re.fullmatch(r"[0-9a-f]{64}", descendant) is None:
+                failures.append("invalid_descendant_cid")
+                continue
+            inspected = self._run((docker, "inspect", descendant))
+            try:
+                if inspected.returncode != 0 or inspected.timed_out:
+                    raise ValueError
+                payload = json.loads(inspected.output)
+                if type(payload) is list:
+                    if len(payload) != 1:
+                        raise ValueError
+                    payload = payload[0]
+                owner = payload["Config"]["Labels"]["fable.replay.owner"]
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                failures.append("descendant_ownership_schema_mismatch")
+                continue
+            if payload.get("Id") != descendant or owner != nonce:
+                failures.append("descendant_ownership_mismatch")
+                continue
+            descendant_stop = self._run((docker, "stop", "--time=2", descendant))
+            descendant_remove = self._run(
+                (docker, "rm", "--force", "--volumes", descendant)
+            )
+            if descendant_stop.returncode != 0 or descendant_stop.timed_out:
+                failures.append("descendant_stop_failed")
+            if descendant_remove.returncode != 0 or descendant_remove.timed_out:
+                failures.append("descendant_remove_failed")
+        final = self._run(
+            (
+                docker,
+                "ps",
+                "-aq",
+                "--no-trunc",
+                "--filter",
+                f"label=fable.replay.owner={nonce}",
+            )
+        )
+        if final.returncode != 0 or final.timed_out:
+            failures.append("final_query_failed")
+        elif final.output.strip():
+            failures.append("owned_descendants_remain")
+        if failures:
+            raise ReplayContractError(
+                "restricted Docker cleanup failed: " + ",".join(failures)
+            )
+        return "verified_removed"
+
+    def execute(
+        self,
+        *,
+        candidate_root: Path,
+        language: str,
+        verifier_text: str,
+        effective_timeout: int,
+        control_identity: str,
+        pre_candidate_tree_sha256: str,
+        pre_candidate_diff_sha256: str,
+        protected_before: tuple[tuple[str, str], ...],
+    ) -> RunEvidence:
+        if control_identity not in {"candidate", "baseline", "reference", "corrupt", "admission"}:
+            raise ReplayContractError("control identity is not explicit")
+        if type(effective_timeout) is not int or not 0 < effective_timeout <= MAX_VERIFY_TIMEOUT:
+            raise ReplayContractError("effective verifier timeout is invalid")
+        _validate_sha256(pre_candidate_tree_sha256, "pre-candidate tree")
+        _validate_sha256(pre_candidate_diff_sha256, "pre-candidate diff")
+        for path, digest in protected_before:
+            _relative_path(path, field_name="protected path")
+            _validate_sha256(digest, "protected hash")
+        image = self.policy.image_for(language)
+        if self.disk_free_bytes() <= self.policy.disk_floor_bytes:
+            raise ReplayContractError("Docker disk floor is not preserved before create")
+        records = _inventory_from_root(Path(candidate_root))
+        if _inventory_sha(records) != pre_candidate_tree_sha256:
+            raise ReplayContractError("candidate tree changed before restricted execution")
+        nonce = self.token_factory()
+        if re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
+            raise ReplayContractError("run nonce is invalid")
+        docker = self.policy.docker_binary
+        cid: str | None = None
+        cleanup_state = "not_created"
+        evidence: RunEvidence | None = None
+        pending_error: BaseException | None = None
+        with tempfile.TemporaryDirectory(prefix="fable-docker-run-") as temporary:
+            host = Path(temporary)
+            stage = host / "stage"
+            stage.mkdir(mode=0o700)
+            _write_records(stage / "candidate", records)
+            _make_staged_candidate_read_only(stage / "candidate")
+            wrapper = stage / "wrapper.sh"
+            verifier = stage / "verifier.sh"
+            wrapper.write_text(
+                _wrapper_script(nonce), encoding="utf-8"
+            )
+            verifier.write_text(
+                _verifier_script(verifier_text, self.policy.file_limit_blocks),
+                encoding="utf-8",
+            )
+            os.chmod(wrapper, 0o500)
+            os.chmod(verifier, 0o555)
+            os.chmod(stage, 0o555)
+            raw_output = b""
+            try:
+                runtime = self._required(
+                    (docker, "version", "--format={{.Server.Version}}"),
+                    context="runtime version",
+                ).output.decode("ascii").strip()
+                if not runtime or len(runtime) > 128:
+                    raise ReplayContractError("Docker runtime version is invalid")
+                image_id = self._required(
+                    (docker, "image", "inspect", "--format={{.Id}}", image),
+                    context="cached image inspect",
+                ).output.decode("ascii").strip()
+                if re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None:
+                    raise ReplayContractError("cached image inspect returned an invalid ID")
+                tmpfs = _tmpfs_policy(self.policy)
+                container_cmd = (
+                    "/seed/wrapper.sh",
+                    *(path for path, _digest in protected_before),
+                )
+                create = (
+                    docker,
+                    "create",
+                    f"--name=fable-replay-{nonce}",
+                    "--pull=never",
+                    "--network=none",
+                    "--read-only",
+                    "--cap-drop=ALL",
+                    "--security-opt=no-new-privileges:true",
+                    "--user=0:0",
+                    f"--cpus={self.policy.cpus}",
+                    f"--memory={self.policy.memory_bytes}",
+                    f"--memory-swap={self.policy.memory_bytes}",
+                    f"--pids-limit={self.policy.pids_limit}",
+                    f"--ulimit=fsize={self.policy.file_limit_blocks}:{self.policy.file_limit_blocks}",
+                    "--label",
+                    f"fable.replay.owner={nonce}",
+                    "--tmpfs",
+                    f"/work:{tmpfs['/work']}",
+                    "--tmpfs",
+                    f"/scratch:{tmpfs['/scratch']}",
+                    "--tmpfs",
+                    f"/control:{tmpfs['/control']}",
+                    "--tmpfs",
+                    f"/result:{tmpfs['/result']}",
+                    "--tmpfs",
+                    f"/status:{tmpfs['/status']}",
+                    "--entrypoint=/bin/sh",
+                    image,
+                    *container_cmd,
+                )
+                created = self._required(create, context="create")
+                cid = created.output.decode("ascii").strip()
+                if re.fullmatch(r"[0-9a-f]{64}", cid) is None:
+                    raise ReplayContractError("Docker create returned an invalid exact CID")
+                self._inspect_owned(
+                    cid,
+                    nonce,
+                    image_id,
+                    container_cmd,
+                    require_running=False,
+                )
+                self._required(
+                    (docker, "cp", str(stage), f"{cid}:/seed"),
+                    context="stopped-container input copy",
+                )
+                lifecycle_deadline = self.clock() + effective_timeout
+                self._required(
+                    (docker, "start", cid),
+                    context="start",
+                    timeout=self._remaining_lifecycle_seconds(lifecycle_deadline),
+                )
+                self._inspect_owned(
+                    cid,
+                    nonce,
+                    image_id,
+                    container_cmd,
+                    require_running=True,
+                    timeout=self._remaining_lifecycle_seconds(lifecycle_deadline),
+                )
+                output_path = host / "verifier-output.log"
+                verifier_result = self._run(
+                    (
+                        docker,
+                        "exec",
+                        "--user",
+                        f"{self.policy.verifier_uid}:{self.policy.verifier_gid}",
+                        cid,
+                        "/bin/sh",
+                        "/seed/verifier.sh",
+                    ),
+                    timeout=self._remaining_lifecycle_seconds(
+                        lifecycle_deadline, command_cap=False
+                    ),
+                    output_limit=self.policy.output_limit_bytes,
+                    output_path=output_path,
+                )
+                raw_output = verifier_result.output[: self.policy.output_limit_bytes]
+                run_contract = _sha256(
+                    _canonical_json(
+                        {
+                            "policy": _policy_payload(self.policy, image),
+                            "language": language,
+                            "verifier_sha256": _sha256(verifier_text.encode()),
+                            "effective_timeout": effective_timeout,
+                            "control_identity": control_identity,
+                            "pre_tree": pre_candidate_tree_sha256,
+                            "pre_diff": pre_candidate_diff_sha256,
+                            "protected": protected_before,
+                        }
+                    )
+                )
+                if verifier_result.timed_out:
+                    evidence = RunEvidence(
+                        1,
+                        nonce,
+                        control_identity,
+                        False,
+                        verifier_result.returncode,
+                        None,
+                        verifier_result.duration_seconds,
+                        "wall_timeout",
+                        _sha256(raw_output),
+                        len(raw_output),
+                        verifier_result.truncated,
+                        pre_candidate_tree_sha256,
+                        pre_candidate_diff_sha256,
+                        None,
+                        protected_before,
+                        (),
+                        False,
+                        "verifier_timeout",
+                        "cleanup_pending",
+                        self.policy.policy_version,
+                        image,
+                        runtime,
+                        run_contract,
+                        (),
+                    )
+                else:
+                    self._required(
+                        (
+                            docker,
+                            "exec",
+                            "--user",
+                            f"{self.policy.verifier_uid}:{self.policy.verifier_gid}",
+                            cid,
+                            "/bin/sh",
+                            "-ceu",
+                            _QUIESCE_VERIFIER_SCRIPT,
+                        ),
+                        context="verifier process quiescence",
+                        timeout=min(
+                            30, self._remaining_lifecycle_seconds(lifecycle_deadline)
+                        ),
+                    )
+                    self._required(
+                        (
+                            docker,
+                            "exec",
+                            "--user",
+                            f"{self.policy.signal_uid}:{self.policy.signal_gid}",
+                            cid,
+                            "/bin/sh",
+                            "-ceu",
+                            "umask 077; : > /control/go",
+                        ),
+                        context="wrapper signal",
+                        timeout=self._remaining_lifecycle_seconds(lifecycle_deadline),
+                    )
+                    self._required(
+                        (
+                            docker,
+                            "exec",
+                            "--user",
+                            f"{self.policy.observer_uid}:{self.policy.observer_gid}",
+                            cid,
+                            "/bin/sh",
+                            "-ceu",
+                            "i=0; while [ ! -f /status/done ]; do i=$((i+1)); [ \"$i\" -lt 600 ] || exit 1; sleep 0.05; done",
+                        ),
+                        context="done marker",
+                        timeout=min(
+                            30, self._remaining_lifecycle_seconds(lifecycle_deadline)
+                        ),
+                    )
+                    self._inspect_owned(
+                        cid,
+                        nonce,
+                        image_id,
+                        container_cmd,
+                        require_running=True,
+                        timeout=self._remaining_lifecycle_seconds(lifecycle_deadline),
+                    )
+                    result_path = host / "result.json"
+                    self._required(
+                        (docker, "cp", f"{cid}:/result/result.json", str(result_path)),
+                        context="bounded result copy",
+                        output_limit=self.policy.result_limit_bytes,
+                        timeout=self._remaining_lifecycle_seconds(lifecycle_deadline),
+                    )
+                    self._inspect_owned(
+                        cid,
+                        nonce,
+                        image_id,
+                        container_cmd,
+                        require_running=True,
+                        timeout=self._remaining_lifecycle_seconds(lifecycle_deadline),
+                    )
+                    wrapper_rc, post_tree, protected_after, peaks = _strict_wrapper_result(
+                        result_path,
+                        run_nonce=nonce,
+                        protected_before=protected_before,
+                        limit=self.policy.result_limit_bytes,
+                    )
+                    protected_stable = protected_after == protected_before
+                    resolved = (
+                        verifier_result.returncode == 0
+                        and wrapper_rc == 0
+                        and protected_stable
+                    )
+                    failure = None
+                    if verifier_result.returncode != 0:
+                        failure = "verifier_failed"
+                    elif wrapper_rc != 0:
+                        failure = "wrapper_failed"
+                    elif not protected_stable:
+                        failure = "protected_drift"
+                    evidence = RunEvidence(
+                        1,
+                        nonce,
+                        control_identity,
+                        control_identity == "candidate" and resolved,
+                        verifier_result.returncode,
+                        wrapper_rc,
+                        verifier_result.duration_seconds,
+                        "exited",
+                        _sha256(raw_output),
+                        len(raw_output),
+                        verifier_result.truncated,
+                        pre_candidate_tree_sha256,
+                        pre_candidate_diff_sha256,
+                        post_tree,
+                        protected_before,
+                        protected_after,
+                        resolved,
+                        failure,
+                        "cleanup_pending",
+                        self.policy.policy_version,
+                        image,
+                        runtime,
+                        run_contract,
+                        peaks,
+                    )
+            except BaseException as exc:
+                pending_error = exc
+            finally:
+                if cid is not None:
+                    try:
+                        cleanup_state = self._cleanup(cid, nonce)
+                    except BaseException as cleanup_exc:
+                        if pending_error is None:
+                            pending_error = cleanup_exc
+                        else:
+                            combined = ReplayContractError(
+                                f"{cleanup_exc}; preceding execution error: "
+                                f"{pending_error}"
+                            )
+                            combined.__cause__ = pending_error
+                            pending_error = combined
+                        cleanup_state = "cleanup_failed"
+                if self.disk_free_bytes() <= self.policy.disk_floor_bytes:
+                    floor_error = ReplayContractError(
+                        "Docker disk floor is not preserved after cleanup"
+                    )
+                    if pending_error is not None:
+                        combined = ReplayContractError(
+                            f"{floor_error}; preceding restricted execution error: "
+                            f"{pending_error}"
+                        )
+                        combined.__cause__ = pending_error
+                        floor_error = combined
+                    pending_error = floor_error
+            if pending_error is not None:
+                if isinstance(pending_error, ReplayContractError):
+                    raise pending_error
+                raise ReplayContractError("restricted Docker execution failed") from pending_error
+            if evidence is None:
+                raise ReplayContractError("restricted Docker produced no run evidence")
+            return dataclasses.replace(evidence, cleanup_state=cleanup_state)
+
+
+_ADMISSION_COMMANDS: Final = {
+    "python": "python3 -c 'print(\"fable-admission-v1\")'",
+    "rust": "rustc --version",
+    "cpp": "c++ --version",
+}
+
+
+def functional_admission_probe(
+    policy: DockerPolicy,
+    language: str,
+    *,
+    executor: RestrictedExecutor | None = None,
+    workspace: Path | None = None,
+) -> AdmissionEvidence:
+    """Functionally probe one toolchain through the complete production policy."""
+
+    if language not in _ADMISSION_COMMANDS:
+        raise ReplayContractError("unsupported admission language")
+    active = executor or DockerExecutor(policy)
+    with tempfile.TemporaryDirectory(
+        prefix="fable-admission-", dir=None if workspace is None else workspace.parent
+    ) as temporary:
+        root = Path(temporary) if workspace is None else Path(workspace)
+        if workspace is not None:
+            root.mkdir(parents=True, mode=0o700)
+        probe = root / "probe"
+        probe.mkdir(mode=0o700)
+        (probe / "README").write_bytes(b"fable admission probe\n")
+        records = _inventory_from_root(probe)
+        tree = _inventory_sha(records)
+        run = active.execute(
+            candidate_root=probe,
+            language=language,
+            verifier_text=_ADMISSION_COMMANDS[language],
+            effective_timeout=60,
+            control_identity="admission",
+            pre_candidate_tree_sha256=tree,
+            pre_candidate_diff_sha256=_sha256(b"admission"),
+            protected_before=(),
+        )
+    return AdmissionEvidence(
+        1,
+        language,
+        run.resolved and run.cleanup_state == "verified_removed",
+        run.policy_version,
+        run.image_digest,
+        run.runtime_version,
+        run,
+        None if run.resolved else (run.failure_class or "admission_failed"),
+    )
+
+
+def _candidate_state_for_control(
+    contract: SeedContract, root: Path, identity: str
+) -> CandidateState:
+    inventory = _inventory_from_root(root)
+    tree = _inventory_sha(inventory)
+    diff = _sha256(
+        _canonical_json(
+            {
+                "identity": identity,
+                "tree": tree,
+                "baseline": contract.inventory_sha256,
+            }
+        )
+    )
+    return CandidateState(
+        root=root,
+        tree_sha256=tree,
+        diff_sha256=diff,
+        changed_paths=(),
+        operation_sha256=_sha256(identity.encode()),
+        verifier_sha256=contract.verifier_sha256,
+        protected_sha256=_protected_hashes(root, contract),
+    )
+
+
+def _replay_contract_sha(
+    contract: SeedContract,
+    plan: MutationPlan,
+    *,
+    trajectory_id: str,
+    source_terminal_sha256: str,
+    candidate: CandidateState,
+    runs: Sequence[RunEvidence],
+) -> str:
+    return _sha256(
+        _canonical_json(
+            {
+                "schema_version": 2,
+                "dataset_revision": DATASET_REVISION,
+                "source_commit_sha": contract.source_commit_sha,
+                "source_tree_sha": contract.source_tree_sha,
+                "task_tree_sha": contract.task_tree_sha,
+                "inventory_sha256": contract.inventory_sha256,
+                "trajectory_id": trajectory_id,
+                "source_terminal_sha256": source_terminal_sha256,
+                "operation_sha256": plan.operation_sha256,
+                "candidate_tree_sha256": candidate.tree_sha256,
+                "candidate_diff_sha256": candidate.diff_sha256,
+                "verifier_sha256": contract.verifier_sha256,
+                "source_verify_timeout": contract.source_verify_timeout,
+                "effective_verify_timeout": contract.effective_verify_timeout,
+                "executor_runs": [run.run_contract_sha256 for run in runs],
+            }
+        )
+    )
+
+
+def verify_candidate(
+    contract: SeedContract,
+    plan: MutationPlan,
+    *,
+    trajectory_id: str,
+    source_terminal_sha256: str,
+    executor: RestrictedExecutor,
+    workspace: Path,
+) -> ReplayEvidence:
+    """Rebuild and verify two independent candidate states."""
+
+    _validate_sha256(trajectory_id, "trajectory ID")
+    _validate_sha256(source_terminal_sha256, "source terminal")
+    workspace = Path(workspace)
+    workspace.mkdir(parents=True, mode=0o700)
+    states = (
+        reconstruct_candidate(contract, plan, workspace / "candidate-run-1"),
+        reconstruct_candidate(contract, plan, workspace / "candidate-run-2"),
+    )
+    same_state = (
+        states[0].tree_sha256 == states[1].tree_sha256
+        and states[0].diff_sha256 == states[1].diff_sha256
+        and states[0].changed_paths == states[1].changed_paths
+        and bool(states[0].changed_paths)
+    )
+    runs = tuple(
+        executor.execute(
+            candidate_root=state.root,
+            language=contract.language,
+            verifier_text=contract.verify_cmd,
+            effective_timeout=contract.effective_verify_timeout,
+            control_identity="candidate",
+            pre_candidate_tree_sha256=state.tree_sha256,
+            pre_candidate_diff_sha256=state.diff_sha256,
+            protected_before=state.protected_sha256,
+        )
+        for state in states
+    )
+    assert len(runs) == 2
+    repeatable = (
+        same_state
+        and all(run.resolved for run in runs)
+        and all(run.cleanup_state == "verified_removed" for run in runs)
+        and all(run.protected_before == run.protected_after for run in runs)
+        and all(run.pre_candidate_tree_sha256 == states[0].tree_sha256 for run in runs)
+        and all(run.pre_candidate_diff_sha256 == states[0].diff_sha256 for run in runs)
+        and all(run.policy_version == runs[0].policy_version for run in runs)
+        and all(run.image_digest == runs[0].image_digest for run in runs)
+        and all(run.runtime_version == runs[0].runtime_version for run in runs)
+        and all(run.schema_version == 1 for run in runs)
+        and all(run.control_identity == "candidate" for run in runs)
+        and all(run.trainable for run in runs)
+    )
+    failure = None if repeatable else "candidate_not_repeatable"
+    return ReplayEvidence(
+        2,
+        trajectory_id,
+        contract.task,
+        contract.language,
+        DATASET_REVISION,
+        contract.source_commit_sha,
+        contract.source_tree_sha,
+        contract.task_tree_sha,
+        contract.inventory_sha256,
+        source_terminal_sha256,
+        plan.operation_sha256,
+        states[0].tree_sha256,
+        states[0].diff_sha256,
+        states[0].protected_sha256,
+        contract.verify_cmd,
+        contract.verifier_sha256,
+        contract.source_verify_timeout,
+        contract.effective_verify_timeout,
+        runs[0].policy_version,
+        runs[0].image_digest,
+        runs[0].runtime_version,
+        _replay_contract_sha(
+            contract,
+            plan,
+            trajectory_id=trajectory_id,
+            source_terminal_sha256=source_terminal_sha256,
+            candidate=states[0],
+            runs=runs,
+        ),
+        (runs[0], runs[1]),
+        repeatable,
+        failure,
+        "candidate",
+        repeatable,
+    )
+
+
+def _default_reference_builder(
+    contract: SeedContract, destination: Path
+) -> CandidateState:
+    preflight = preflight_reference_patch(contract)
+    if not preflight.eligible:
+        raise ReplayContractError(
+            preflight.exclusion_reason or "reference patch is ineligible"
+        )
+    records = _inventory_from_root(contract.files_root)
+    _write_records(destination, records)
+    patch_copy = destination / ".fable-reference.patch"
+    patch, _mode = _read_regular_no_follow(contract.reference_patch_path)
+    patch_copy.write_bytes(patch)
+    result = _default_patch_executor(
+        ("git", "apply", "--", patch_copy.name), destination
+    )
+    patch_copy.unlink()
+    if result.returncode != 0:
+        raise ReplayContractError("reference patch application failed")
+    return _candidate_state_for_control(contract, destination, "reference")
+
+
+def run_control_set(
+    contract: SeedContract,
+    plan: MutationPlan,
+    *,
+    trajectory_id: str,
+    source_terminal_sha256: str,
+    executor: RestrictedExecutor,
+    workspace: Path,
+    reference_builder: Callable[[SeedContract, Path], CandidateState] = _default_reference_builder,
+    corrupt_builder: Callable[[SeedContract, Path], CandidateState] | None = None,
+) -> ControlSetEvidence:
+    """Run tainted controls and two-run candidate verification."""
+
+    workspace = Path(workspace)
+    workspace.mkdir(parents=True, mode=0o700)
+    baseline_root = workspace / "baseline"
+    _write_records(baseline_root, _inventory_from_root(contract.files_root))
+    baseline_state = _candidate_state_for_control(contract, baseline_root, "baseline")
+    baseline = executor.execute(
+        candidate_root=baseline_state.root,
+        language=contract.language,
+        verifier_text=contract.verify_cmd,
+        effective_timeout=contract.effective_verify_timeout,
+        control_identity="baseline",
+        pre_candidate_tree_sha256=baseline_state.tree_sha256,
+        pre_candidate_diff_sha256=baseline_state.diff_sha256,
+        protected_before=baseline_state.protected_sha256,
+    )
+    reference_state = reference_builder(contract, workspace / "reference")
+    reference = executor.execute(
+        candidate_root=reference_state.root,
+        language=contract.language,
+        verifier_text=contract.verify_cmd,
+        effective_timeout=contract.effective_verify_timeout,
+        control_identity="reference",
+        pre_candidate_tree_sha256=reference_state.tree_sha256,
+        pre_candidate_diff_sha256=reference_state.diff_sha256,
+        protected_before=reference_state.protected_sha256,
+    )
+    corrupt = None
+    if corrupt_builder is not None:
+        corrupt_state = corrupt_builder(contract, workspace / "corrupt")
+        corrupt = executor.execute(
+            candidate_root=corrupt_state.root,
+            language=contract.language,
+            verifier_text=contract.verify_cmd,
+            effective_timeout=contract.effective_verify_timeout,
+            control_identity="corrupt",
+            pre_candidate_tree_sha256=corrupt_state.tree_sha256,
+            pre_candidate_diff_sha256=corrupt_state.diff_sha256,
+            protected_before=corrupt_state.protected_sha256,
+        )
+        corrupt = dataclasses.replace(corrupt, trainable=False)
+    candidate = verify_candidate(
+        contract,
+        plan,
+        trajectory_id=trajectory_id,
+        source_terminal_sha256=source_terminal_sha256,
+        executor=executor,
+        workspace=workspace / "candidate",
+    )
+    baseline_is_clean_failure = (
+        baseline.schema_version == 1
+        and baseline.control_identity == "baseline"
+        and baseline.trainable is False
+        and baseline.resolved is False
+        and baseline.returncode is not None
+        and baseline.returncode != 0
+        and baseline.wrapper_returncode == 0
+        and baseline.termination == "exited"
+        and baseline.post_candidate_tree_sha256 is not None
+        and baseline.protected_after == baseline.protected_before
+        and baseline.failure_class == "verifier_failed"
+        and baseline.cleanup_state == "verified_removed"
+    )
+    if baseline.resolved:
+        failure = "baseline_unexpectedly_passed"
+    elif not baseline_is_clean_failure:
+        failure = "baseline_invalid_failure"
+    elif not reference.resolved:
+        failure = "reference_failed"
+    elif not candidate.resolved:
+        failure = candidate.failure_class or "candidate_failed"
+    else:
+        failure = None
+    admitted = failure is None
+    if not admitted:
+        candidate = dataclasses.replace(candidate, trainable=False)
+    return ControlSetEvidence(
+        1,
+        trajectory_id,
+        dataclasses.replace(baseline, trainable=False),
+        dataclasses.replace(reference, trainable=False),
+        candidate,
+        corrupt,
+        admitted,
+        failure,
+    )
+
+
 __all__ = [
+    "AdmissionEvidence",
     "CandidateState",
+    "ControlSetEvidence",
+    "DockerExecutor",
+    "DockerPolicy",
     "GitSeedSource",
     "MOONSHINER_REVISION",
     "MutationPlan",
     "ReferencePatchContract",
     "ReplayContractError",
+    "ReplayEvidence",
+    "RestrictedExecutor",
+    "RunEvidence",
     "SeedContract",
     "canonical_mutation_plan",
+    "functional_admission_probe",
     "materialize_seed",
     "preflight_reference_patch",
     "reconstruct_candidate",
+    "run_control_set",
     "trajectory_identity",
+    "verify_candidate",
 ]

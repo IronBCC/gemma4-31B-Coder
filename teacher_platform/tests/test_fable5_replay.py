@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import fcntl
 import hashlib
 import io
 import json
@@ -2261,6 +2262,7 @@ def _verified_replay_evidence(
                 "verifier_sha256": hashlib.sha256(VERIFY_CMD.encode()).hexdigest(),
                 "source_verify_timeout": None,
                 "effective_verify_timeout": 300,
+                "policy_output_limit_bytes": 4 * 1024**2,
                 "executor_runs": [run.run_contract_sha256 for run in runs],
             }
         )
@@ -2286,6 +2288,7 @@ def _verified_replay_evidence(
         effective_verify_timeout=300,
         policy_version="fable-docker-v1",
         image_digest=IMAGE_DIGEST,
+        policy_output_limit_bytes=4 * 1024**2,
         runtime_version="27.5.1",
         run_contract_sha256=outer_contract,
         runs=runs,
@@ -2383,6 +2386,111 @@ def test_ledger_refuses_symlink_lock_and_substituted_log(tmp_path: Path) -> None
             pass
 
 
+def test_unlinked_lock_rejects_second_owner_and_blocks_first_publish(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "replay.jsonl"
+    lock_path = tmp_path / ".replay.jsonl.lock"
+    with replay.ReplayLedger(path, tmp_path / "logs") as first:
+        lock_path.unlink()
+        with pytest.raises(ReplayContractError, match="locked"):
+            with replay.ReplayLedger(path, tmp_path / "logs"):
+                pass
+        with pytest.raises(ReplayContractError, match="lock identity"):
+            first.publish_failure(
+                trajectory_id="1" * 64,
+                status="rejected",
+                failure_class="unsupported_operation",
+                log=b"bounded detail",
+            )
+    assert not path.exists()
+    assert not (tmp_path / "logs" / f"{'1' * 64}.log").exists()
+
+
+def test_external_lock_failure_releases_parent_and_log_descriptors(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "replay.jsonl"
+    lock_path = tmp_path / ".replay.jsonl.lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        with pytest.raises(ReplayContractError, match="already locked"):
+            with replay.ReplayLedger(path, tmp_path / "logs"):
+                pass
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+    with replay.ReplayLedger(path, tmp_path / "logs"):
+        pass
+
+
+def test_replaced_log_directory_blocks_ledger_publication(tmp_path: Path) -> None:
+    path = tmp_path / "replay.jsonl"
+    evidence = _verified_replay_evidence()
+
+    def replace_logs(_path: Path) -> None:
+        (tmp_path / "logs").rename(tmp_path / "moved")
+        (tmp_path / "logs").mkdir(mode=0o700)
+
+    with replay.ReplayLedger(path, tmp_path / "logs") as ledger:
+        with pytest.raises(ReplayContractError, match="log directory identity"):
+            ledger.publish_verified(
+                evidence,
+                source_content_sha256="f" * 64,
+                fixture_sha256=evidence.inventory_sha256,
+                log=b"orphaned but not published",
+                after_log_publish=replace_logs,
+            )
+    assert not path.exists()
+    assert not (tmp_path / "logs" / f"{evidence.trajectory_id}.log").exists()
+
+
+def test_ledger_rejects_symlinked_parent_component(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    apparent = tmp_path / "apparent"
+    apparent.symlink_to(real, target_is_directory=True)
+    with pytest.raises(ReplayContractError, match="directory"):
+        with replay.ReplayLedger(apparent / "replay.jsonl", apparent / "logs"):
+            pass
+    assert not (real / ".replay.jsonl.lock").exists()
+
+
+def test_atomic_publish_detects_post_rename_swap_without_touching_victim(
+    tmp_path: Path,
+) -> None:
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"victim")
+    os.chmod(victim, 0o644)
+    target = tmp_path / "target"
+
+    def swap(_directory_fd: int, name: str) -> None:
+        os.unlink(name, dir_fd=_directory_fd)
+        os.symlink(victim, name, dir_fd=_directory_fd)
+
+    with pytest.raises(ReplayContractError, match="publication identity"):
+        replay._atomic_write_0600(target, b"published", after_rename=swap)
+    assert victim.read_bytes() == b"victim"
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+
+
+def test_atomic_publish_rejects_replaced_parent_directory(tmp_path: Path) -> None:
+    output = tmp_path / "out"
+    output.mkdir(mode=0o700)
+    target = output / "eligibility.json"
+
+    def replace_parent(_directory_fd: int, _name: str) -> None:
+        output.rename(tmp_path / "moved")
+        output.mkdir(mode=0o700)
+
+    with pytest.raises(ReplayContractError, match="parent directory identity"):
+        replay._atomic_write_0600(target, b"published", after_rename=replace_parent)
+    assert not target.exists()
+    assert (tmp_path / "moved" / "eligibility.json").read_bytes() == b"published"
+
+
 def test_ledger_records_rejection_timeout_and_rejects_contract_alias(tmp_path: Path) -> None:
     path = tmp_path / "replay.jsonl"
     with replay.ReplayLedger(path, tmp_path / "logs") as ledger:
@@ -2414,6 +2522,68 @@ def test_ledger_records_rejection_timeout_and_rejects_contract_alias(tmp_path: P
             )
 
 
+@pytest.mark.parametrize(
+    "failure_class",
+    ["unknown_reason", "contains\nnewline", "x" * 65, "secret=token"],
+)
+def test_failure_code_is_reviewed_and_validated_before_log_publish(
+    tmp_path: Path, failure_class: str
+) -> None:
+    trajectory_id = "1" * 64
+    with replay.ReplayLedger(tmp_path / "replay.jsonl", tmp_path / "logs") as ledger:
+        with pytest.raises(ReplayContractError, match="failure code"):
+            ledger.publish_failure(
+                trajectory_id=trajectory_id,
+                status="rejected",
+                failure_class=failure_class,
+                log=b"detail",
+            )
+    assert not (tmp_path / "logs" / f"{trajectory_id}.log").exists()
+
+
+def test_v2_decoder_rejects_malformed_image_and_output_above_policy_limit() -> None:
+    evidence = _verified_replay_evidence()
+    malformed = replay.replay_evidence_payload(evidence)
+    malformed["image_digest"] = "evil@sha256:nothex"
+    for run in malformed["runs"]:
+        run["image_digest"] = malformed["image_digest"]
+    with pytest.raises(ReplayContractError, match="candidate namespace"):
+        replay.validate_replay_evidence_payload(malformed)
+
+    bounded = dataclasses.replace(evidence, policy_output_limit_bytes=10)
+    oversized = replay.replay_evidence_payload(bounded)
+    for run in oversized["runs"]:
+        run["raw_output_bytes"] = 11
+    with pytest.raises(ReplayContractError, match="strict candidate runs"):
+        replay.validate_replay_evidence_payload(oversized)
+
+
+def test_v2_output_limit_cannot_be_inflated_by_self_declared_evidence() -> None:
+    evidence = _verified_replay_evidence()
+    inflated_runs = tuple(
+        dataclasses.replace(run, raw_output_bytes=10**18) for run in evidence.runs
+    )
+    inflated = dataclasses.replace(
+        evidence,
+        policy_output_limit_bytes=10**18,
+        runs=inflated_runs,
+    )
+    inflated = dataclasses.replace(
+        inflated,
+        run_contract_sha256=replay._outer_replay_contract(inflated),
+    )
+    with pytest.raises(ReplayContractError, match="candidate namespace"):
+        replay.validate_replay_evidence_payload(
+            replay.replay_evidence_payload(inflated)
+        )
+
+    with pytest.raises(ValueError, match="output limit"):
+        replay.DockerPolicy(
+            images=(("python", "image@sha256:" + "a" * 64),),
+            output_limit_bytes=10**18,
+        )
+
+
 def test_inventory_arithmetic_and_explicit_smoke_manifest_are_exhaustive() -> None:
     def candidate(
         trajectory_id: str, task: str, language: str, **updates: bool
@@ -2443,10 +2613,28 @@ def test_inventory_arithmetic_and_explicit_smoke_manifest_are_exhaustive() -> No
         candidate(
             "7" * 64, "drop-admit", "rust", admission_valid=False
         ),
+        candidate("8" * 64, "drop-contam", "python", decontaminated=False),
+        candidate("9" * 64, "drop-seed", "rust", git_seed_valid=False),
+        candidate(
+            "a" * 64, "drop-reference", "cpp", reference_patch_valid=False
+        ),
+        candidate(
+            "b" * 64, "drop-image", "cpp", language_digest_present=False
+        ),
     ]
-    inventory = replay.build_eligibility_inventory(rows)
-    assert inventory["total"] == 7
+    bindings = replay.EligibilityBindings(
+        source_sha256="8" * 64,
+        sidecar_sha256="9" * 64,
+        policy_sha256="a" * 64,
+        admission_sha256="b" * 64,
+        seed_evidence_sha256="d" * 64,
+        seed_commit_sha=MOONSHINER_REVISION,
+        seed_tree_sha="c" * 40,
+    )
+    inventory = replay.build_eligibility_inventory(rows, bindings)
+    assert inventory["total"] == 11
     assert inventory["eligible_ceiling"] == 5
+    assert set(inventory["exclusions"].values()) == {1}
     assert inventory["total"] == inventory["eligible_ceiling"] + sum(
         inventory["exclusions"].values()
     )
@@ -2457,10 +2645,154 @@ def test_inventory_arithmetic_and_explicit_smoke_manifest_are_exhaustive() -> No
     assert [row["language"] for row in smoke["trajectories"]] == [
         "python", "python", "rust", "rust", "cpp"
     ]
+    assert smoke["eligibility_sha256"] == inventory["inventory_sha256"]
     with pytest.raises(
         ReplayContractError, match=r"exactly 2 Python, 2 Rust, and 1 C\+\+"
     ):
         replay.build_smoke_manifest(inventory, ["1" * 64] * 5)
+
+
+def _admission_for(policy: replay.DockerPolicy, language: str) -> replay.AdmissionEvidence:
+    tree = replay._admission_tree_sha256()
+    diff = hashlib.sha256(b"admission").hexdigest()
+    image = policy.image_for(language)
+    command = replay._ADMISSION_COMMANDS[language]
+    contract = replay._executor_run_contract_sha256(
+        policy,
+        image,
+        language=language,
+        verifier_text=command,
+        effective_timeout=60,
+        control_identity="admission",
+        pre_candidate_tree_sha256=tree,
+        pre_candidate_diff_sha256=diff,
+        protected_before=(),
+    )
+    run = dataclasses.replace(
+        _run_evidence(
+            identity="admission",
+            tree=tree,
+            diff=diff,
+            protected=(),
+            rc=0,
+            output_hash="2" * 64,
+            image_digest=image,
+            policy_version=policy.policy_version,
+            run_contract_sha256=contract,
+        ),
+        trainable=False,
+    )
+    return replay.AdmissionEvidence(
+        1,
+        language,
+        True,
+        policy.policy_version,
+        image,
+        policy.output_limit_bytes,
+        run.runtime_version,
+        run,
+        None,
+    )
+
+
+def test_admission_artifact_is_bound_to_exact_policy_digest_and_hash() -> None:
+    policy = dataclasses.replace(
+        _docker_policy(),
+        images=(
+            ("python", "example.invalid/python@sha256:" + "1" * 64),
+            ("rust", "example.invalid/rust@sha256:" + "2" * 64),
+            ("cpp", "example.invalid/cpp@sha256:" + "3" * 64),
+        ),
+    )
+    policy_document = replay.docker_policy_artifact(policy)
+    admission = replay.admission_artifact(
+        policy, [_admission_for(policy, language) for language in ("python", "rust", "cpp")]
+    )
+    validated = replay.validate_admission_artifact(policy_document, admission)
+    assert set(validated) == {"python", "rust", "cpp"}
+
+    changed_policy = dataclasses.replace(
+        policy,
+        images=tuple(
+            (language, image[:-1] + ("0" if image[-1] != "0" else "1"))
+            for language, image in policy.images
+        ),
+    )
+    with pytest.raises(ReplayContractError, match="admission.*policy"):
+        replay.validate_admission_artifact(
+            replay.docker_policy_artifact(changed_policy), admission
+        )
+    tampered = json.loads(json.dumps(admission))
+    tampered["records"][0]["evidence"]["runtime_version"] = "99.0.0"
+    with pytest.raises(ReplayContractError, match="admission.*hash"):
+        replay.validate_admission_artifact(policy_document, tampered)
+
+
+def test_structural_sidecar_recomputes_source_identity_and_rejects_tampering() -> None:
+    row = {
+        "task": "py-bound",
+        "lang": "python",
+        "category": "debug",
+        "split": "train",
+        "assistant_step": 1,
+        "assistant_steps": 1,
+        "messages": [
+            {"role": "system", "content": "work"},
+            {"role": "user", "content": "fix"},
+            {"role": "assistant", "content": "done"},
+        ],
+        "tools": "[]",
+    }
+    trajectory = replay.trajectory_identity("py-bound", row)
+    terminal_sha = hashlib.sha256(replay._canonical_json(row)).hexdigest()
+    sidecar = {
+        "trajectory_id": trajectory,
+        "source_instance_id": "py-bound",
+        "source_terminal_sha256": terminal_sha,
+        "row": row,
+    }
+    records = replay.validate_structural_sidecar([row], [sidecar])
+    assert records[0]["trajectory_id"] == trajectory
+    tampered = json.loads(json.dumps(sidecar))
+    tampered["row"]["task"] = "other"
+    with pytest.raises(ReplayContractError, match="sidecar"):
+        replay.validate_structural_sidecar([row], [tampered])
+
+
+def test_seed_repository_requires_pinned_commit_and_tasks_tree(tmp_path: Path) -> None:
+    repository = tmp_path / "seed.git"
+    repository.mkdir()
+
+    def good_runner(argv: tuple[str, ...], _env: dict[str, str]) -> bytes:
+        tail = argv[4:]
+        if tail == ("cat-file", "-e", f"{MOONSHINER_REVISION}^{{commit}}"):
+            return b""
+        if tail == ("rev-parse", f"{MOONSHINER_REVISION}^{{commit}}"):
+            return (MOONSHINER_REVISION + "\n").encode()
+        if tail == ("rev-parse", f"{MOONSHINER_REVISION}:tasks/seeds"):
+            return ("a" * 40 + "\n").encode()
+        raise subprocess.CalledProcessError(1, argv)
+
+    evidence = replay.validate_seed_repository(
+        GitSeedSource(repository, MOONSHINER_REVISION, good_runner)
+    )
+    assert evidence["tasks_seed_tree_sha"] == "a" * 40
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(ReplayContractError, match="pinned seed repository"):
+        replay.validate_seed_repository(GitSeedSource(empty, MOONSHINER_REVISION))
+
+    def wrong_runner(argv: tuple[str, ...], env: dict[str, str]) -> bytes:
+        result = good_runner(argv, env)
+        if argv[4:] == ("rev-parse", f"{MOONSHINER_REVISION}^{{commit}}"):
+            return ("b" * 40 + "\n").encode()
+        return result
+
+    with pytest.raises(ReplayContractError, match="commit mismatch"):
+        replay.validate_seed_repository(
+            GitSeedSource(repository, MOONSHINER_REVISION, wrong_runner)
+        )
 
 
 def test_replay_cli_requires_every_pinned_inventory_input() -> None:
@@ -2498,16 +2830,19 @@ def test_inventory_cli_rejects_nonexact_policy_digest(
     seed_repo = tmp_path / "seed"
     seed_repo.mkdir()
     policy = tmp_path / "policy.json"
-    policy.write_text(
-        json.dumps({"schema_version": 1, "language_digests": {"python": digest}})
-    )
+    policy_document = replay.docker_policy_artifact(_docker_policy())
+    policy_document["policy"]["images"] = [["python", digest]]
+    policy_document["policy_sha256"] = hashlib.sha256(
+        replay._canonical_json(policy_document["policy"])
+    ).hexdigest()
+    policy.write_text(json.dumps(policy_document))
     admission = tmp_path / "admission.json"
-    admission.write_text(
-        json.dumps({"schema_version": 1, "admitted_languages": ["python"]})
-    )
+    admission.write_text("{}")
+    exclusion = tmp_path / "exclusion.json"
+    exclusion.write_text("[]")
     smoke = tmp_path / "smoke.json"
     smoke.write_text("[]")
-    with pytest.raises(ReplayContractError, match="exact language digests"):
+    with pytest.raises(ReplayContractError, match="policy artifact values"):
         replay.main(
             [
                 "--source",
@@ -2522,6 +2857,8 @@ def test_inventory_cli_rejects_nonexact_policy_digest(
                 str(admission),
                 "--smoke-manifest",
                 str(smoke),
+                "--exclusion",
+                str(exclusion),
                 "--ledger",
                 str(tmp_path / "replay.jsonl"),
                 "--logs",

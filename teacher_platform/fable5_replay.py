@@ -58,6 +58,7 @@ else:  # pragma: no cover - the branch is exercised by local tests.
 MOONSHINER_REVISION: Final = "436316e8f86eb136d5ce3ec95a1a6f48c1d7f940"
 DEFAULT_VERIFY_TIMEOUT: Final = 300
 MAX_VERIFY_TIMEOUT: Final = 1_800
+MAX_POLICY_OUTPUT_LIMIT_BYTES: Final = 4 * 1024**2
 _TASK_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _OID_RE: Final = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 
@@ -229,6 +230,10 @@ class DockerPolicy:
         )
         if any(type(value) is not int or value <= 0 for value in integer_limits):
             raise ValueError("Docker policy resource limits must be positive integers")
+        if self.output_limit_bytes > MAX_POLICY_OUTPUT_LIMIT_BYTES:
+            raise ValueError(
+                "Docker policy output limit exceeds the reviewed v2 maximum"
+            )
         if (
             type(self.disk_floor_bytes) is not int
             or self.disk_floor_bytes < 40 * 1024**3
@@ -334,6 +339,7 @@ class AdmissionEvidence:
     admitted: bool
     policy_version: str
     image_digest: str
+    policy_output_limit_bytes: int
     runtime_version: str
     probe_run: RunEvidence
     failure_class: str | None
@@ -361,6 +367,7 @@ class ReplayEvidence:
     effective_verify_timeout: int
     policy_version: str
     image_digest: str
+    policy_output_limit_bytes: int
     runtime_version: str
     run_contract_sha256: str
     runs: tuple[RunEvidence, RunEvidence]
@@ -395,6 +402,17 @@ class EligibilityCandidate:
     reference_patch_valid: bool
     language_digest_present: bool
     admission_valid: bool
+
+
+@dataclass(frozen=True)
+class EligibilityBindings:
+    source_sha256: str
+    sidecar_sha256: str
+    policy_sha256: str
+    admission_sha256: str
+    seed_evidence_sha256: str
+    seed_commit_sha: str
+    seed_tree_sha: str
 
 
 @dataclass(frozen=True)
@@ -2660,6 +2678,12 @@ _ADMISSION_COMMANDS: Final = {
 }
 
 
+def _admission_tree_sha256() -> str:
+    return _inventory_sha(
+        (_InventoryFile("README", 0o644, b"fable admission probe\n"),)
+    )
+
+
 def functional_admission_probe(
     policy: DockerPolicy,
     language: str,
@@ -2680,9 +2704,13 @@ def functional_admission_probe(
             root.mkdir(parents=True, mode=0o700)
         probe = root / "probe"
         probe.mkdir(mode=0o700)
-        (probe / "README").write_bytes(b"fable admission probe\n")
+        readme = probe / "README"
+        readme.write_bytes(b"fable admission probe\n")
+        os.chmod(readme, 0o644)
         records = _inventory_from_root(probe)
         tree = _inventory_sha(records)
+        if tree != _admission_tree_sha256():
+            raise ReplayContractError("admission probe fixture identity mismatch")
         run = active.execute(
             candidate_root=probe,
             language=language,
@@ -2725,6 +2753,7 @@ def functional_admission_probe(
         admitted,
         policy.policy_version,
         image,
+        policy.output_limit_bytes,
         run.runtime_version,
         run,
         None if admitted else "admission_invalid_evidence",
@@ -2764,6 +2793,7 @@ def _replay_contract_sha(
     source_terminal_sha256: str,
     candidate: CandidateState,
     runs: Sequence[RunEvidence],
+    policy_output_limit_bytes: int,
 ) -> str:
     return _sha256(
         _canonical_json(
@@ -2782,6 +2812,7 @@ def _replay_contract_sha(
                 "verifier_sha256": contract.verifier_sha256,
                 "source_verify_timeout": contract.source_verify_timeout,
                 "effective_verify_timeout": contract.effective_verify_timeout,
+                "policy_output_limit_bytes": policy_output_limit_bytes,
                 "executor_runs": [run.run_contract_sha256 for run in runs],
             }
         )
@@ -2885,6 +2916,7 @@ def verify_candidate(
         contract.effective_verify_timeout,
         policy.policy_version,
         image,
+        policy.output_limit_bytes,
         runtime_version,
         _replay_contract_sha(
             contract,
@@ -2893,6 +2925,7 @@ def verify_candidate(
             source_terminal_sha256=source_terminal_sha256,
             candidate=states[0],
             runs=runs,
+            policy_output_limit_bytes=policy.output_limit_bytes,
         ),
         (runs[0], runs[1]),
         repeatable,
@@ -3086,6 +3119,34 @@ _ATTEMPT_FIELDS: Final = frozenset(
     }
 )
 _LOG_FIELDS: Final = frozenset({"path", "sha256", "bytes"})
+_ATTEMPT_FAILURE_CODES: Final = frozenset(
+    {
+        "admission_failed",
+        "candidate_not_repeatable",
+        "cleanup_failed",
+        "invalid_reference_patch",
+        "invalid_seed",
+        "invalid_source",
+        "missing_image_digest",
+        "policy_mismatch",
+        "protected_path_changed",
+        "replay_rejected",
+        "unsupported_operation",
+        "verifier_failed",
+        "verifier_timeout",
+    }
+)
+
+
+def _validate_attempt_failure_code(value: object) -> str:
+    if (
+        type(value) is not str
+        or value not in _ATTEMPT_FAILURE_CODES
+        or len(value.encode("ascii", errors="ignore")) != len(value)
+        or len(value) > 64
+    ):
+        raise ReplayContractError("attempt failure code is not reviewed")
+    return value
 
 
 def replay_evidence_payload(evidence: ReplayEvidence) -> dict[str, Any]:
@@ -3127,6 +3188,239 @@ def _run_evidence_from_payload(payload: object) -> RunEvidence:
         raise ReplayContractError("run evidence cannot be decoded") from exc
 
 
+def docker_policy_artifact(policy: DockerPolicy) -> dict[str, Any]:
+    if type(policy) is not DockerPolicy:
+        raise ReplayContractError("policy artifact requires the exact DockerPolicy type")
+    policy_payload = json.loads(_canonical_json(dataclasses.asdict(policy)))
+    return {
+        "schema_version": 1,
+        "policy": policy_payload,
+        "policy_sha256": _sha256(_canonical_json(policy_payload)),
+    }
+
+
+def _policy_from_artifact(document: object) -> tuple[DockerPolicy, str]:
+    if (
+        type(document) is not dict
+        or set(document) != {"schema_version", "policy", "policy_sha256"}
+        or document["schema_version"] != 1
+        or type(document["policy"]) is not dict
+    ):
+        raise ReplayContractError("policy artifact has an invalid exact schema")
+    payload = dict(document["policy"])
+    if set(payload) != {field.name for field in dataclasses.fields(DockerPolicy)}:
+        raise ReplayContractError("policy artifact does not contain the full policy")
+    images = payload.get("images")
+    if type(images) is not list or any(
+        type(item) is not list or len(item) != 2 for item in images
+    ):
+        raise ReplayContractError("policy artifact image map is invalid")
+    payload["images"] = tuple(tuple(item) for item in images)
+    try:
+        policy = DockerPolicy(**payload)
+    except (TypeError, ValueError) as exc:
+        raise ReplayContractError("policy artifact values are invalid") from exc
+    digest = _sha256(_canonical_json(document["policy"]))
+    if document["policy_sha256"] != digest:
+        raise ReplayContractError("policy artifact hash mismatch")
+    return policy, digest
+
+
+def _admission_evidence_payload(evidence: AdmissionEvidence) -> dict[str, Any]:
+    if type(evidence) is not AdmissionEvidence:
+        raise ReplayContractError("admission requires exact AdmissionEvidence")
+    return json.loads(_canonical_json(dataclasses.asdict(evidence)))
+
+
+def admission_artifact(
+    policy: DockerPolicy, evidences: Sequence[AdmissionEvidence]
+) -> dict[str, Any]:
+    policy_document = docker_policy_artifact(policy)
+    records = []
+    for evidence in sorted(evidences, key=lambda item: item.language):
+        payload = _admission_evidence_payload(evidence)
+        records.append(
+            {
+                "evidence": payload,
+                "evidence_sha256": _sha256(_canonical_json(payload)),
+            }
+        )
+    body = {"policy_sha256": policy_document["policy_sha256"], "records": records}
+    artifact = {
+        "schema_version": 1,
+        **body,
+        "admission_sha256": _sha256(_canonical_json(body)),
+    }
+    validate_admission_artifact(policy_document, artifact)
+    return artifact
+
+
+def validate_admission_artifact(
+    policy_document: object, admission_document: object
+) -> dict[str, AdmissionEvidence]:
+    policy, policy_sha = _policy_from_artifact(policy_document)
+    if (
+        type(admission_document) is not dict
+        or set(admission_document)
+        != {"schema_version", "policy_sha256", "records", "admission_sha256"}
+        or admission_document["schema_version"] != 1
+        or admission_document["policy_sha256"] != policy_sha
+        or type(admission_document["records"]) is not list
+    ):
+        raise ReplayContractError("admission artifact is not bound to the exact policy")
+    body = {
+        "policy_sha256": admission_document["policy_sha256"],
+        "records": admission_document["records"],
+    }
+    if admission_document["admission_sha256"] != _sha256(_canonical_json(body)):
+        raise ReplayContractError("admission artifact hash mismatch")
+    admitted: dict[str, AdmissionEvidence] = {}
+    exact_fields = {field.name for field in dataclasses.fields(AdmissionEvidence)}
+    for record in admission_document["records"]:
+        if type(record) is not dict or set(record) != {"evidence", "evidence_sha256"}:
+            raise ReplayContractError("admission record has an invalid exact schema")
+        payload = record["evidence"]
+        if (
+            type(payload) is not dict
+            or set(payload) != exact_fields
+            or record["evidence_sha256"] != _sha256(_canonical_json(payload))
+        ):
+            raise ReplayContractError("admission evidence hash mismatch")
+        values = dict(payload)
+        values["probe_run"] = _run_evidence_from_payload(values["probe_run"])
+        try:
+            evidence = AdmissionEvidence(**values)
+        except TypeError as exc:
+            raise ReplayContractError("admission evidence cannot be decoded") from exc
+        language = evidence.language
+        if language in admitted or language not in _ADMISSION_COMMANDS:
+            raise ReplayContractError("admission language is invalid or duplicate")
+        image = policy.image_for(language)
+        run = evidence.probe_run
+        expected_contract = _executor_run_contract_sha256(
+            policy,
+            image,
+            language=language,
+            verifier_text=_ADMISSION_COMMANDS[language],
+            effective_timeout=60,
+            control_identity="admission",
+            pre_candidate_tree_sha256=_admission_tree_sha256(),
+            pre_candidate_diff_sha256=_sha256(b"admission"),
+            protected_before=(),
+        )
+        valid = (
+            evidence.schema_version == 1
+            and evidence.admitted is True
+            and evidence.failure_class is None
+            and evidence.policy_version == policy.policy_version
+            and evidence.image_digest == image
+            and evidence.policy_output_limit_bytes == policy.output_limit_bytes
+            and evidence.runtime_version == run.runtime_version
+            and run.pre_candidate_tree_sha256 == _admission_tree_sha256()
+            and run.raw_output_bytes <= policy.output_limit_bytes
+            and _strict_positive_run_evidence(
+                run,
+                control_identity="admission",
+                trainable=False,
+                pre_candidate_tree_sha256=_admission_tree_sha256(),
+                pre_candidate_diff_sha256=_sha256(b"admission"),
+                protected_before=(),
+                policy_version=policy.policy_version,
+                image_digest=image,
+                run_contract_sha256=expected_contract,
+                output_limit_bytes=policy.output_limit_bytes,
+                effective_timeout=60,
+                runtime_version=evidence.runtime_version,
+            )
+        )
+        if not valid:
+            raise ReplayContractError("admission evidence is not a strict clean probe")
+        admitted[language] = evidence
+    return admitted
+
+
+def validate_seed_repository(source: GitSeedSource) -> dict[str, Any]:
+    """Bind the exact pinned commit and tasks/seeds tree through sanitized Git."""
+
+    try:
+        _git_output(source, "cat-file", "-e", f"{source.commit}^{{commit}}")
+        commit = _exact_oid(
+            _git_output(source, "rev-parse", f"{source.commit}^{{commit}}"),
+            "seed commit",
+        )
+        tree = _exact_oid(
+            _git_output(source, "rev-parse", f"{source.commit}:tasks/seeds"),
+            "tasks/seeds tree",
+        )
+    except ReplayContractError as exc:
+        raise ReplayContractError("pinned seed repository validation failed") from exc
+    if commit != MOONSHINER_REVISION:
+        raise ReplayContractError("pinned seed repository commit mismatch")
+    body = {"source_commit_sha": commit, "tasks_seed_tree_sha": tree}
+    return {**body, "seed_evidence_sha256": _sha256(_canonical_json(body))}
+
+
+def validate_structural_sidecar(
+    source_rows: Iterable[Mapping[str, Any]],
+    sidecar_rows: Iterable[Mapping[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    """Recompute every sidecar source/trajectory binding against pinned rows."""
+
+    required = {
+        "trajectory_id",
+        "source_instance_id",
+        "source_terminal_sha256",
+        "row",
+    }
+    pending: dict[str, dict[str, Any]] = {}
+    for item in sidecar_rows:
+        if type(item) is not dict or set(item) != required or type(item["row"]) is not dict:
+            raise ReplayContractError("structural sidecar has an invalid exact schema")
+        task = item["source_instance_id"]
+        row = item["row"]
+        if type(task) is not str or row.get("task") != task:
+            raise ReplayContractError("structural sidecar task binding mismatch")
+        terminal = _canonical_json(row)
+        trajectory = trajectory_identity(task, row)
+        terminal_sha = _sha256(terminal)
+        language = {
+            "python": "python",
+            "py": "python",
+            "rust": "rust",
+            "cpp": "cpp",
+            "c++": "cpp",
+        }.get(row.get("lang"))
+        if (
+            item["trajectory_id"] != trajectory
+            or item["source_terminal_sha256"] != terminal_sha
+            or language is None
+            or trajectory in pending
+        ):
+            raise ReplayContractError("structural sidecar identity mismatch")
+        pending[trajectory] = {
+            "trajectory_id": trajectory,
+            "task": task,
+            "language": language,
+            "source_terminal_sha256": terminal_sha,
+            "row": row,
+        }
+    matched: set[str] = set()
+    for row in source_rows:
+        if type(row) is not dict or type(row.get("task")) is not str:
+            continue
+        trajectory = trajectory_identity(row["task"], row)
+        candidate = pending.get(trajectory)
+        if candidate is not None and _canonical_json(candidate["row"]) == _canonical_json(row):
+            matched.add(trajectory)
+    if matched != set(pending):
+        raise ReplayContractError("structural sidecar contains a row absent from source")
+    ordered = sorted(
+        pending,
+        key=lambda key: (pending[key]["language"], pending[key]["task"], key),
+    )
+    return tuple(pending[key] for key in ordered)
+
+
 def _outer_replay_contract(evidence: ReplayEvidence) -> str:
     return _sha256(
         _canonical_json(
@@ -3145,6 +3439,7 @@ def _outer_replay_contract(evidence: ReplayEvidence) -> str:
                 "verifier_sha256": evidence.verifier_sha256,
                 "source_verify_timeout": evidence.source_verify_timeout,
                 "effective_verify_timeout": evidence.effective_verify_timeout,
+                "policy_output_limit_bytes": evidence.policy_output_limit_bytes,
                 "executor_runs": [run.run_contract_sha256 for run in evidence.runs],
             }
         )
@@ -3170,7 +3465,7 @@ def _validate_positive_candidate_run(run: RunEvidence, evidence: ReplayEvidence)
         and run.termination == "exited"
         and _is_sha256(run.raw_output_sha256)
         and type(run.raw_output_bytes) is int
-        and run.raw_output_bytes >= 0
+        and 0 <= run.raw_output_bytes <= evidence.policy_output_limit_bytes
         and run.output_truncated is False
         and run.pre_candidate_tree_sha256 == evidence.candidate_tree_sha256
         and run.pre_candidate_diff_sha256 == evidence.candidate_diff_sha256
@@ -3241,7 +3536,10 @@ def validate_replay_evidence_payload(payload: object) -> ReplayEvidence:
         and type(evidence.policy_version) is str
         and bool(evidence.policy_version)
         and type(evidence.image_digest) is str
-        and "@sha256:" in evidence.image_digest
+        and re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", evidence.image_digest)
+        is not None
+        and type(evidence.policy_output_limit_bytes) is int
+        and 0 < evidence.policy_output_limit_bytes <= MAX_POLICY_OUTPUT_LIMIT_BYTES
         and _is_runtime_version(evidence.runtime_version)
         and evidence.resolved is True
         and evidence.failure_class is None
@@ -3270,32 +3568,249 @@ def validate_replay_evidence_payload(payload: object) -> ReplayEvidence:
     return evidence
 
 
-def _atomic_write_0600(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
-    )
-    temporary = Path(temporary_name)
+def _open_real_private_directory(path: Path, *, create: bool = False) -> int:
+    """Open a real owner-private directory without following any component."""
+
+    absolute = Path(os.path.abspath(path))
+    parts = absolute.parts
+    descriptor = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY)
     try:
-        if os.fstat(fd).st_dev != path.parent.stat().st_dev:
-            raise ReplayContractError("temporary publication is not on the target filesystem")
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb", closefd=True) as handle:
-            fd = -1
+        for index, component in enumerate(parts[1:], start=1):
+            try:
+                child = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                if not create or index != len(parts) - 1:
+                    raise ReplayContractError("confined directory is missing") from None
+                os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                child = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+            except OSError as exc:
+                raise ReplayContractError(
+                    "confined directory has a symlink or non-directory component"
+                ) from exc
+            os.close(descriptor)
+            descriptor = child
+        status = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(status.st_mode)
+            or status.st_uid != os.getuid()
+            or stat.S_IMODE(status.st_mode) & 0o077
+        ):
+            raise ReplayContractError("confined directory must be owner-private")
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_private_subdirectory(parent_fd: int, name: str) -> int:
+    if not name or name in {".", ".."} or "/" in name:
+        raise ReplayContractError("log directory must be one confined component")
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+    except FileNotFoundError:
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        raise ReplayContractError("log directory is not confined") from exc
+    status = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(status.st_mode)
+        or status.st_uid != os.getuid()
+        or stat.S_IMODE(status.st_mode) & 0o077
+    ):
+        os.close(descriptor)
+        raise ReplayContractError("log directory must be owner-private")
+    return descriptor
+
+
+def _private_directory_identity(descriptor: int, *, label: str) -> tuple[int, int]:
+    status = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(status.st_mode)
+        or status.st_nlink < 1
+        or status.st_uid != os.getuid()
+        or stat.S_IMODE(status.st_mode) & 0o077
+    ):
+        raise ReplayContractError(f"{label} is not an owner-private directory")
+    return status.st_dev, status.st_ino
+
+
+def _assert_path_directory_identity(
+    path: Path,
+    descriptor: int,
+    identity: tuple[int, int],
+    *,
+    label: str,
+) -> None:
+    if _private_directory_identity(descriptor, label=label) != identity:
+        raise ReplayContractError(f"{label} identity changed")
+    reopened = _open_real_private_directory(path)
+    try:
+        if _private_directory_identity(reopened, label=label) != identity:
+            raise ReplayContractError(f"{label} identity changed")
+    finally:
+        os.close(reopened)
+
+
+def _assert_named_directory_identity(
+    parent_fd: int,
+    name: str,
+    descriptor: int,
+    identity: tuple[int, int],
+    *,
+    label: str,
+) -> None:
+    if _private_directory_identity(descriptor, label=label) != identity:
+        raise ReplayContractError(f"{label} identity changed")
+    try:
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except (FileNotFoundError, OSError) as exc:
+        raise ReplayContractError(f"{label} identity changed") from exc
+    if (
+        not stat.S_ISDIR(named.st_mode)
+        or named.st_nlink < 1
+        or named.st_uid != os.getuid()
+        or stat.S_IMODE(named.st_mode) & 0o077
+        or (named.st_dev, named.st_ino) != identity
+    ):
+        raise ReplayContractError(f"{label} identity changed")
+
+
+def _read_bound_file_at(directory_fd: int, name: str, *, mode: int = 0o600) -> bytes:
+    try:
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    except (FileNotFoundError, OSError) as exc:
+        raise ReplayContractError("bound publication file is missing or unsafe") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != mode
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise ReplayContractError("bound publication identity is invalid")
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = -1
+            return handle.read()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _atomic_write_0600_at(
+    directory_fd: int,
+    name: str,
+    data: bytes,
+    *,
+    before_rename: Callable[[], None] | None = None,
+    after_rename: Callable[[int, str], None] | None = None,
+) -> None:
+    if not name or name in {".", ".."} or "/" in name:
+        raise ReplayContractError("publication name is not confined")
+    temporary = f".{name}.{secrets.token_hex(16)}.tmp"
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    published = False
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            descriptor = -1
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        os.chmod(path, 0o600)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
+            temporary_identity = os.fstat(handle.fileno())
+        if before_rename is not None:
+            before_rename()
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        published = True
+        if after_rename is not None:
+            after_rename(directory_fd, name)
         try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+            published_bytes = _read_bound_file_at(directory_fd, name)
+        except ReplayContractError as exc:
+            raise ReplayContractError(
+                "publication identity changed after rename"
+            ) from exc
+        published_identity = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            (published_identity.st_dev, published_identity.st_ino)
+            != (temporary_identity.st_dev, temporary_identity.st_ino)
+            or published_bytes != data
+        ):
+            raise ReplayContractError("publication identity changed after rename")
+        os.fsync(directory_fd)
     finally:
-        if fd >= 0:
-            os.close(fd)
-        temporary.unlink(missing_ok=True)
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not published:
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+
+
+def _atomic_write_0600(
+    path: Path,
+    data: bytes,
+    *,
+    after_rename: Callable[[int, str], None] | None = None,
+) -> None:
+    directory_fd = _open_real_private_directory(path.parent, create=True)
+    identity = _private_directory_identity(
+        directory_fd, label="publication parent directory"
+    )
+
+    def assert_parent_identity() -> None:
+        _assert_path_directory_identity(
+            path.parent,
+            directory_fd,
+            identity,
+            label="publication parent directory",
+        )
+
+    def after_publish(bound_fd: int, name: str) -> None:
+        if after_rename is not None:
+            after_rename(bound_fd, name)
+        assert_parent_identity()
+
+    try:
+        _atomic_write_0600_at(
+            directory_fd,
+            path.name,
+            data,
+            before_rename=assert_parent_identity,
+            after_rename=after_publish,
+        )
+        assert_parent_identity()
+    finally:
+        os.close(directory_fd)
 
 
 class ReplayLedger:
@@ -3304,38 +3819,64 @@ class ReplayLedger:
     def __init__(self, path: Path, log_dir: Path) -> None:
         self.path = Path(path)
         self.log_dir = Path(log_dir)
+        self._parent_fd: int | None = None
+        self._log_fd: int | None = None
+        self._parent_identity: tuple[int, int] | None = None
+        self._log_identity: tuple[int, int] | None = None
         self._lock_fd: int | None = None
         self._records: list[dict[str, Any]] = []
 
     def __enter__(self) -> ReplayLedger:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = self.path.parent / f".{self.path.name}.lock"
+        if Path(os.path.abspath(self.log_dir.parent)) != Path(
+            os.path.abspath(self.path.parent)
+        ):
+            raise ReplayContractError("ledger and logs must share one confined parent")
+        self._parent_fd = _open_real_private_directory(self.path.parent, create=True)
+        parent_status = os.fstat(self._parent_fd)
+        self._parent_identity = (parent_status.st_dev, parent_status.st_ino)
+        try:
+            fcntl.flock(self._parent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(self._parent_fd)
+            self._parent_fd = None
+            raise ReplayContractError("replay ledger parent is already locked") from exc
+        try:
+            self._log_fd = _open_private_subdirectory(
+                self._parent_fd, self.log_dir.name
+            )
+            self._log_identity = _private_directory_identity(
+                self._log_fd, label="replay log directory"
+            )
+        except Exception:
+            self.__exit__(None, None, None)
+            raise
+        lock_name = f".{self.path.name}.lock"
         try:
             self._lock_fd = os.open(
-                lock_path,
+                lock_name,
                 os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
                 0o600,
+                dir_fd=self._parent_fd,
             )
         except OSError as exc:
+            self.__exit__(None, None, None)
             raise ReplayContractError("replay lock is not a confined regular file") from exc
         lock_stat = os.fstat(self._lock_fd)
         if (
             not stat.S_ISREG(lock_stat.st_mode)
             or lock_stat.st_nlink != 1
-            or lock_stat.st_dev != self.path.parent.stat().st_dev
+            or lock_stat.st_dev != parent_status.st_dev
         ):
-            os.close(self._lock_fd)
-            self._lock_fd = None
+            self.__exit__(None, None, None)
             raise ReplayContractError("replay lock is not a same-filesystem single-link file")
         os.fchmod(self._lock_fd, 0o600)
         try:
             fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            os.close(self._lock_fd)
-            self._lock_fd = None
+            self.__exit__(None, None, None)
             raise ReplayContractError("replay ledger is already locked") from exc
         try:
+            self._assert_lock_identity()
             self._records = self._load_and_validate()
         except Exception:
             self.__exit__(None, None, None)
@@ -3347,6 +3888,14 @@ class ReplayLedger:
             fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
             os.close(self._lock_fd)
             self._lock_fd = None
+        if self._log_fd is not None:
+            os.close(self._log_fd)
+            self._log_fd = None
+        self._log_identity = None
+        if self._parent_fd is not None:
+            fcntl.flock(self._parent_fd, fcntl.LOCK_UN)
+            os.close(self._parent_fd)
+            self._parent_fd = None
 
     @property
     def completed_trajectory_ids(self) -> frozenset[str]:
@@ -3357,8 +3906,45 @@ class ReplayLedger:
         return tuple(self._records)
 
     def _require_locked(self) -> None:
-        if self._lock_fd is None:
+        if self._lock_fd is None or self._parent_fd is None or self._log_fd is None:
             raise ReplayContractError("replay ledger is not locked")
+
+    def _assert_lock_identity(self) -> None:
+        self._require_locked()
+        assert self._parent_fd is not None
+        assert self._lock_fd is not None
+        assert self._log_fd is not None
+        assert self._log_identity is not None
+        try:
+            named = os.stat(
+                f".{self.path.name}.lock",
+                dir_fd=self._parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as exc:
+            raise ReplayContractError("replay lock identity is missing") from exc
+        held = os.fstat(self._lock_fd)
+        if (
+            not stat.S_ISREG(named.st_mode)
+            or named.st_nlink != 1
+            or held.st_nlink != 1
+            or (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino)
+        ):
+            raise ReplayContractError("replay lock identity changed")
+        assert self._parent_identity is not None
+        _assert_path_directory_identity(
+            self.path.parent,
+            self._parent_fd,
+            self._parent_identity,
+            label="replay parent directory",
+        )
+        _assert_named_directory_identity(
+            self._parent_fd,
+            self.log_dir.name,
+            self._log_fd,
+            self._log_identity,
+            label="replay log directory",
+        )
 
     def _validate_attempt(self, payload: object, line_number: int) -> dict[str, Any]:
         if type(payload) is not dict or set(payload) != _ATTEMPT_FIELDS:
@@ -3384,34 +3970,13 @@ class ReplayLedger:
             raise ReplayContractError(f"replay ledger line {line_number} has invalid log hash")
         if type(log["bytes"]) is not int or log["bytes"] < 0:
             raise ReplayContractError(f"replay ledger line {line_number} has invalid log size")
-        log_path = self.log_dir / log["path"]
         try:
-            log_lstat = log_path.lstat()
-        except FileNotFoundError as exc:
+            assert self._log_fd is not None
+            log_bytes = _read_bound_file_at(self._log_fd, log["path"])
+        except ReplayContractError as exc:
             raise ReplayContractError(
-                f"replay ledger line {line_number} log is missing"
+                f"replay ledger line {line_number} log is missing or unsafe"
             ) from exc
-        if (
-            not stat.S_ISREG(log_lstat.st_mode)
-            or log_lstat.st_nlink != 1
-            or log_lstat.st_dev != self.log_dir.stat().st_dev
-        ):
-            raise ReplayContractError(f"replay ledger line {line_number} log is missing")
-        if stat.S_IMODE(log_lstat.st_mode) != 0o600:
-            raise ReplayContractError(f"replay ledger line {line_number} log mode is not 0600")
-        log_fd = os.open(log_path, os.O_RDONLY | os.O_NOFOLLOW)
-        try:
-            opened = os.fstat(log_fd)
-            if (opened.st_dev, opened.st_ino) != (log_lstat.st_dev, log_lstat.st_ino):
-                raise ReplayContractError(
-                    f"replay ledger line {line_number} log identity changed"
-                )
-            with os.fdopen(log_fd, "rb", closefd=True) as handle:
-                log_fd = -1
-                log_bytes = handle.read()
-        finally:
-            if log_fd >= 0:
-                os.close(log_fd)
         if (
             log["bytes"] != len(log_bytes)
             or log["sha256"] != _sha256(log_bytes)
@@ -3434,9 +3999,7 @@ class ReplayLedger:
                 )
         else:
             if (
-                type(payload["failure_class"]) is not str
-                or not payload["failure_class"]
-                or any(
+                any(
                     payload[field] is not None
                     for field in (
                         "source_content_sha256",
@@ -3450,21 +4013,32 @@ class ReplayLedger:
                 raise ReplayContractError(
                     f"replay ledger line {line_number} failure binding mismatch"
                 )
+            _validate_attempt_failure_code(payload["failure_class"])
         return dict(payload)
 
     def _load_and_validate(self) -> list[dict[str, Any]]:
-        if not self.path.exists():
+        assert self._parent_fd is not None
+        try:
+            ledger_stat = os.stat(
+                self.path.name,
+                dir_fd=self._parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
             return []
-        ledger_stat = self.path.lstat()
         if (
             not stat.S_ISREG(ledger_stat.st_mode)
             or ledger_stat.st_nlink != 1
-            or ledger_stat.st_dev != self.path.parent.stat().st_dev
+            or ledger_stat.st_dev != os.fstat(self._parent_fd).st_dev
         ):
             raise ReplayContractError("replay ledger is not a confined single-link file")
         if stat.S_IMODE(ledger_stat.st_mode) != 0o600:
             raise ReplayContractError("replay ledger mode is not 0600")
-        ledger_fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
+        ledger_fd = os.open(
+            self.path.name,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=self._parent_fd,
+        )
         try:
             opened = os.fstat(ledger_fd)
             if (opened.st_dev, opened.st_ino) != (
@@ -3510,6 +4084,7 @@ class ReplayLedger:
         callback: Callable[[Path], None] | None,
     ) -> None:
         self._require_locked()
+        self._assert_lock_identity()
         trajectory = record["trajectory_id"]
         if trajectory in self.completed_trajectory_ids:
             raise ReplayContractError(f"duplicate trajectory {trajectory}")
@@ -3518,12 +4093,19 @@ class ReplayLedger:
             existing["run_contract_sha256"] == contract for existing in self._records
         ):
             raise ReplayContractError("duplicate run contract")
-        log_path = self.log_dir / f"{trajectory}.log"
-        _atomic_write_0600(log_path, log)
+        log_name = f"{trajectory}.log"
+        assert self._log_fd is not None
+        _atomic_write_0600_at(
+            self._log_fd,
+            log_name,
+            log,
+            before_rename=self._assert_lock_identity,
+        )
         if callback is not None:
-            callback(log_path)
+            callback(self.log_dir / log_name)
+        self._assert_lock_identity()
         record["log"] = {
-            "path": log_path.name,
+            "path": log_name,
             "sha256": _sha256(log),
             "bytes": len(log),
         }
@@ -3531,7 +4113,14 @@ class ReplayLedger:
         output = b"".join(
             _canonical_json(item) + b"\n" for item in (*self._records, validated)
         )
-        _atomic_write_0600(self.path, output)
+        assert self._parent_fd is not None
+        _atomic_write_0600_at(
+            self._parent_fd,
+            self.path.name,
+            output,
+            before_rename=self._assert_lock_identity,
+        )
+        self._assert_lock_identity()
         self._records.append(validated)
 
     def publish_verified(
@@ -3578,6 +4167,7 @@ class ReplayLedger:
             raise ReplayContractError("failure status must be rejected or timeout")
         if not _is_sha256(trajectory_id):
             raise ReplayContractError("trajectory ID is invalid")
+        _validate_attempt_failure_code(failure_class)
         self._publish(
             {
                 "schema_version": 2,
@@ -3608,9 +4198,26 @@ _ELIGIBILITY_GATES: Final = (
 
 def build_eligibility_inventory(
     rows: Sequence[EligibilityCandidate],
+    bindings: EligibilityBindings,
 ) -> dict[str, Any]:
     """Compute a deterministic, exclusive gate partition without discovery."""
 
+    if type(bindings) is not EligibilityBindings:
+        raise ReplayContractError("eligibility requires exact artifact bindings")
+    for field_name in (
+        "source_sha256",
+        "sidecar_sha256",
+        "policy_sha256",
+        "admission_sha256",
+        "seed_evidence_sha256",
+    ):
+        if not _is_sha256(getattr(bindings, field_name)):
+            raise ReplayContractError(f"eligibility {field_name} is invalid")
+    if (
+        bindings.seed_commit_sha != MOONSHINER_REVISION
+        or _OID_RE.fullmatch(bindings.seed_tree_sha) is None
+    ):
+        raise ReplayContractError("eligibility seed binding is invalid")
     seen: set[str] = set()
     exclusions = {reason: 0 for _, reason in _ELIGIBILITY_GATES}
     eligible: list[dict[str, str]] = []
@@ -3645,8 +4252,9 @@ def build_eligibility_inventory(
     total = len(rows)
     if total != len(eligible) + sum(exclusions.values()):
         raise ReplayContractError("eligibility manifest arithmetic mismatch")
-    return {
+    manifest = {
         "schema_version": 1,
+        "bindings": dataclasses.asdict(bindings),
         "gate_order": [field for field, _ in _ELIGIBILITY_GATES],
         "total": total,
         "gate_pass": gate_pass,
@@ -3657,6 +4265,8 @@ def build_eligibility_inventory(
         ),
         "eligible": eligible,
     }
+    manifest["inventory_sha256"] = _sha256(_canonical_json(manifest))
+    return manifest
 
 
 def build_smoke_manifest(
@@ -3665,6 +4275,13 @@ def build_smoke_manifest(
     """Validate an explicit smoke set; never select candidates implicitly."""
 
     eligible = inventory.get("eligible")
+    inventory_sha = inventory.get("inventory_sha256")
+    if type(inventory_sha) is not str or not _is_sha256(inventory_sha):
+        raise ReplayContractError("eligibility inventory hash is missing")
+    hash_input = dict(inventory)
+    del hash_input["inventory_sha256"]
+    if _sha256(_canonical_json(hash_input)) != inventory_sha:
+        raise ReplayContractError("eligibility inventory hash mismatch")
     if type(eligible) is not list:
         raise ReplayContractError("eligibility inventory has no explicit candidates")
     by_id = {
@@ -3689,6 +4306,7 @@ def build_smoke_manifest(
     return {
         "schema_version": 1,
         "counts": {"python": 2, "rust": 2, "cpp": 1},
+        "eligibility_sha256": inventory_sha,
         "trajectories": selected,
         "selection_sha256": _sha256(_canonical_json(selected)),
     }
@@ -3702,6 +4320,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--admission", type=Path, required=True)
     parser.add_argument("--smoke-manifest", type=Path, required=True)
+    parser.add_argument("--exclusion", type=Path, action="append", required=True)
     parser.add_argument("--ledger", type=Path, required=True)
     parser.add_argument("--logs", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
@@ -3721,67 +4340,160 @@ def main(argv: Sequence[str] | None = None) -> int:
     if _sha256_path(args.source) != SOURCE_LFS_SHA256:
         raise ReplayContractError("explicit source artifact does not match the pinned hash")
     try:
-        policy_payload = json.loads(args.policy.read_text(encoding="utf-8"))
-        admission_payload = json.loads(args.admission.read_text(encoding="utf-8"))
+        policy_document = json.loads(args.policy.read_text(encoding="utf-8"))
+        admission_document = json.loads(args.admission.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ReplayContractError("policy/admission input is invalid JSON") from exc
-    if (
-        type(policy_payload) is not dict
-        or set(policy_payload) != {"schema_version", "language_digests"}
-        or policy_payload["schema_version"] != 1
-        or type(policy_payload["language_digests"]) is not dict
-        or any(
-            language not in {"python", "rust", "cpp"}
-            or type(digest) is not str
-            or re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", digest) is None
-            for language, digest in policy_payload["language_digests"].items()
+    policy, policy_sha = _policy_from_artifact(policy_document)
+    admitted = validate_admission_artifact(policy_document, admission_document)
+    try:
+        sidecar_rows = [
+            json.loads(line)
+            for line in args.sidecar.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+    except json.JSONDecodeError as exc:
+        raise ReplayContractError("structural sidecar is invalid JSONL") from exc
+
+    def source_rows() -> Iterable[Mapping[str, Any]]:
+        with args.source.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ReplayContractError(
+                        f"source line {line_number} is invalid JSON"
+                    ) from exc
+                if type(value) is not dict:
+                    raise ReplayContractError(f"source line {line_number} is not an object")
+                yield value
+
+    structural = validate_structural_sidecar(source_rows(), sidecar_rows)
+    seed_source = GitSeedSource(args.seed_repo, MOONSHINER_REVISION)
+    seed_evidence = validate_seed_repository(seed_source)
+    if __package__:
+        from .fable5_import import (
+            _decontamination_reason,
+            _load_exclusion,
+            convert_trajectory,
+            select_terminal_row,
         )
-    ):
-        raise ReplayContractError("policy input must bind exact language digests")
-    if (
-        type(admission_payload) is not dict
-        or set(admission_payload) != {"schema_version", "admitted_languages"}
-        or admission_payload["schema_version"] != 1
-        or type(admission_payload["admitted_languages"]) is not list
-        or any(
-            language not in {"python", "rust", "cpp"}
-            for language in admission_payload["admitted_languages"]
+    else:  # pragma: no cover
+        from fable5_import import (  # type: ignore[no-redef]
+            _decontamination_reason,
+            _load_exclusion,
+            convert_trajectory,
+            select_terminal_row,
         )
-        or len(set(admission_payload["admitted_languages"]))
-        != len(admission_payload["admitted_languages"])
-    ):
-        raise ReplayContractError("admission input must bind exact admitted languages")
-    digests = policy_payload["language_digests"]
-    admitted = frozenset(admission_payload["admitted_languages"])
-    rows: list[EligibilityCandidate] = []
-    eligibility_fields = {field.name for field in dataclasses.fields(EligibilityCandidate)}
-    for line_number, line in enumerate(args.sidecar.read_text(encoding="utf-8").splitlines(), 1):
-        try:
-            payload = json.loads(line)
-            if type(payload) is not dict or set(payload) != eligibility_fields:
-                raise ReplayContractError(
-                    f"sidecar line {line_number} is missing an explicit gate"
+    exclusions = tuple(_load_exclusion(path) for path in args.exclusion)
+    candidates: list[EligibilityCandidate] = []
+    with tempfile.TemporaryDirectory(prefix="fable-inventory-") as temporary:
+        workspace = Path(temporary)
+        for index, record in enumerate(structural):
+            selected = select_terminal_row(record["row"])
+            language = record["language"]
+            try:
+                contract = materialize_seed(
+                    seed_source,
+                    record["task"],
+                    workspace / f"seed-{index}",
                 )
-            row = EligibilityCandidate(**payload)
-            rows.append(
-                dataclasses.replace(
-                    row,
-                    language_digest_present=(
-                        row.language_digest_present and row.language in digests
-                    ),
-                    admission_valid=(row.admission_valid and row.language in admitted),
+            except ReplayContractError:
+                candidates.append(
+                    EligibilityCandidate(
+                        trajectory_id=record["trajectory_id"],
+                        task=record["task"],
+                        language=language,
+                        # Earlier gates are neutral so the exclusive partition
+                        # records this row at the first provable seed failure.
+                        operations_supported=True,
+                        decontaminated=True,
+                        git_seed_valid=False,
+                        reference_patch_valid=False,
+                        language_digest_present=language in dict(policy.images),
+                        admission_valid=language in admitted,
+                    )
+                )
+                continue
+            try:
+                plan = canonical_mutation_plan(
+                    selected.messages,
+                    frozenset(contract.protected_paths),
+                    contract.verify_cmd,
+                )
+                operations_supported = bool(plan.operations)
+            except (ReplayContractError, ValueError):
+                operations_supported = False
+            reference_ok = True
+            try:
+                preflight_reference_patch(contract, workspace / f"reference-{index}")
+            except ReplayContractError:
+                reference_ok = False
+            try:
+                converted = convert_trajectory(selected, contract)
+                content_sha = _sha256(_canonical_json(converted))
+                contaminated = _decontamination_reason(
+                    selected, content_sha, exclusions
+                )
+            except (ReplayContractError, ValueError):
+                # Conversion failures are already operation failures; avoid
+                # misclassifying them as contamination in the exclusive sum.
+                contaminated = None
+            candidates.append(
+                EligibilityCandidate(
+                    trajectory_id=record["trajectory_id"],
+                    task=record["task"],
+                    language=language,
+                    operations_supported=operations_supported,
+                    decontaminated=contaminated is None,
+                    git_seed_valid=True,
+                    reference_patch_valid=reference_ok,
+                    language_digest_present=language in dict(policy.images),
+                    admission_valid=language in admitted,
                 )
             )
-        except (json.JSONDecodeError, TypeError) as exc:
-            raise ReplayContractError(f"sidecar line {line_number} is invalid") from exc
-    inventory = build_eligibility_inventory(rows)
+    bindings = EligibilityBindings(
+        source_sha256=_sha256_path(args.source),
+        sidecar_sha256=_sha256_path(args.sidecar),
+        policy_sha256=policy_sha,
+        admission_sha256=admission_document["admission_sha256"],
+        seed_evidence_sha256=seed_evidence["seed_evidence_sha256"],
+        seed_commit_sha=seed_evidence["source_commit_sha"],
+        seed_tree_sha=seed_evidence["tasks_seed_tree_sha"],
+    )
+    inventory = build_eligibility_inventory(candidates, bindings)
     smoke_payload = json.loads(args.smoke_manifest.read_text(encoding="utf-8"))
     if type(smoke_payload) is not list or any(type(value) is not str for value in smoke_payload):
         raise ReplayContractError("smoke manifest input must be an explicit trajectory ID list")
     smoke = build_smoke_manifest(inventory, smoke_payload)
-    args.out.mkdir(parents=True, exist_ok=True)
-    _atomic_write_0600(args.out / "eligibility.json", _canonical_json(inventory) + b"\n")
-    _atomic_write_0600(args.out / "smoke.json", _canonical_json(smoke) + b"\n")
+    output_fd = _open_real_private_directory(args.out, create=True)
+    output_identity = _private_directory_identity(
+        output_fd, label="output directory"
+    )
+
+    def assert_output_identity() -> None:
+        _assert_path_directory_identity(
+            args.out,
+            output_fd,
+            output_identity,
+            label="output directory",
+        )
+
+    try:
+        for name, payload in (
+            ("eligibility.json", inventory),
+            ("smoke.json", smoke),
+        ):
+            _atomic_write_0600_at(
+                output_fd,
+                name,
+                _canonical_json(payload) + b"\n",
+                before_rename=assert_output_identity,
+                after_rename=lambda _fd, _name: assert_output_identity(),
+            )
+            assert_output_identity()
+    finally:
+        os.close(output_fd)
     return 0
 
 
@@ -3791,6 +4503,7 @@ __all__ = [
     "ControlSetEvidence",
     "DockerExecutor",
     "DockerPolicy",
+    "EligibilityBindings",
     "EligibilityCandidate",
     "GitSeedSource",
     "MOONSHINER_REVISION",
@@ -3805,6 +4518,8 @@ __all__ = [
     "canonical_mutation_plan",
     "build_eligibility_inventory",
     "build_smoke_manifest",
+    "admission_artifact",
+    "docker_policy_artifact",
     "functional_admission_probe",
     "materialize_seed",
     "preflight_reference_patch",
@@ -3813,7 +4528,10 @@ __all__ = [
     "replay_evidence_payload",
     "trajectory_identity",
     "verify_candidate",
+    "validate_admission_artifact",
     "validate_replay_evidence_payload",
+    "validate_seed_repository",
+    "validate_structural_sidecar",
 ]
 
 

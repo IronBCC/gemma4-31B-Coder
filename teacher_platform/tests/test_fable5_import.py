@@ -2341,6 +2341,7 @@ def test_replay_gate_requires_exact_noncontrol_hash_bound_evidence(
                 candidate.seed.verify_cmd.encode()
             ).hexdigest(),
             protected_paths=tuple(sorted(candidate.seed.protected_paths)),
+            policy_output_limit_bytes=4 * 1024**2,
             strict_run_count=2,
         )
 
@@ -2530,6 +2531,7 @@ def _joined_evidence(
         "verifier_sha256": hashlib.sha256(verifier.encode()).hexdigest(),
         "source_verify_timeout": None,
         "effective_verify_timeout": 300,
+        "policy_output_limit_bytes": 4 * 1024**2,
         "executor_runs": [run_contract, run_contract],
     }
     return replay_module.ReplayEvidence(
@@ -2553,6 +2555,7 @@ def _joined_evidence(
         300,
         "fable-docker-v1",
         "registry.example/python@sha256:" + "9" * 64,
+        4 * 1024**2,
         "27.5.1",
         hashlib.sha256(
             json.dumps(

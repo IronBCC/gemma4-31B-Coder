@@ -1231,6 +1231,7 @@ class ReplayEvidence:
     candidate_diff_sha256: str = ""
     verifier_sha256: str = ""
     protected_paths: tuple[str, ...] = ()
+    policy_output_limit_bytes: int = 0
     strict_run_count: int = 0
 
 
@@ -1833,6 +1834,8 @@ def _replay_matches(
         and evidence.task_tree_sha == candidate.seed.task_tree_sha
         and evidence.protected_paths == tuple(sorted(candidate.seed.protected_paths))
         and evidence.strict_run_count == 2
+        and type(evidence.policy_output_limit_bytes) is int
+        and evidence.policy_output_limit_bytes > 0
         and all(
             re.fullmatch(r"[0-9a-f]{64}", value) is not None
             for value in (
@@ -2964,6 +2967,7 @@ def _load_replay_ledger(
             candidate_diff_sha256=source["candidate_diff_sha256"],
             verifier_sha256=source["verifier_sha256"],
             protected_paths=tuple(pair[0] for pair in source["protected_sha256"]),
+            policy_output_limit_bytes=source["policy_output_limit_bytes"],
             strict_run_count=len(source["runs"]),
         )
         if joined.trajectory_id in records:

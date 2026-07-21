@@ -220,6 +220,8 @@ The pilot output is `data/fable5_agentic_pilot_v1/`:
   summary, and CC BY attribution;
 - `replay.jsonl`: one evidence record per attempted task, containing hashes and
   log references but no protected test contents;
+- `original_terminal_rows.jsonl`: mode-`0600`, hash-bound replay sidecar for
+  structurally selected terminal rows; it is never a training input;
 - `rejected.jsonl`: task ID plus bounded reason codes only, without secrets or
   protected test content.
 

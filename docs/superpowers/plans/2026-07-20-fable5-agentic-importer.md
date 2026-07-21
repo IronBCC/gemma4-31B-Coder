@@ -210,7 +210,7 @@ git commit -m "feat: normalize Fable tools to native bash"
 
 **Interfaces:**
 - Consumes: `convert_trajectory` from Task 2; injected `token_counter(messages)`, `source_metadata()`, and `replay(task, commands)` callbacks.
-- Produces: `build_fable5_pilot(rows, config) -> BuildResult`, CLI `python -m teacher_platform.fable5_import`, `train.jsonl`, `manifest.json`, `rejected.jsonl`.
+- Produces: `build_fable5_pilot(rows, config) -> BuildResult`, CLI `python -m teacher_platform.fable5_import`, `train.jsonl`, mode-`0600` `original_terminal_rows.jsonl`, `manifest.json`, `rejected.jsonl`.
 
 - [ ] **Step 1: Write failing pipeline tests**
 
@@ -274,7 +274,9 @@ The CLI accepts:
 Resolve and validate the source LFS metadata before streaming. Load the
 tokenizer once, then submit only message lists to a `ThreadPoolExecutor`. Write
 to temporary files and atomically replace final outputs only after arithmetic
-and hash checks pass. Emit progress at 100 terminal-trajectory boundaries with
+and hash checks pass. Preserve selected source terminal rows only in a
+mode-`0600`, hash-bound `original_terminal_rows.jsonl` replay sidecar; never
+expose it as training input. Emit progress at 100 terminal-trajectory boundaries with
 elapsed time and ETA; do not poll externally.
 
 - [ ] **Step 4: Run all importer tests and focused project regressions**

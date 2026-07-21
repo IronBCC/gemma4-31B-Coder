@@ -15,7 +15,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections import Counter, defaultdict
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1104,7 +1104,7 @@ def convert_trajectory(
         raise UnsupportedTrajectoryTool(
             "trajectory must contain exactly one non-observation user problem turn"
         )
-    problem_text = problem_turns[0]["content"]
+    problem_text = validate_fable_user_prompt(problem_turns[0]["content"])
     results_by_id = {
         message["tool_call_id"]: message["content"]
         for message in messages
@@ -1227,51 +1227,215 @@ class BuildConfig:
     max_output: int = 0
     max_tokens: int = 49_152
     workers: int = 8
+    token_batch_size: int = 16
+    token_batch_bytes: int = 32 * 1024 * 1024
     metadata_only: bool = False
     source_contract: Any = field(default_factory=SourceContract)
     progress: Callable[[str], None] | None = None
 
 
 @dataclass(frozen=True)
+class PublishedRows(Sequence[dict[str, Any]]):
+    path: Path
+    count: int
+
+    def __len__(self) -> int:
+        return self.count
+
+    def __iter__(self):
+        if self.count == 0 or not self.path.exists():
+            return
+        with self.path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    yield json.loads(line)
+
+    def __getitem__(self, index: int | slice):
+        values = tuple(self)
+        return values[index]
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, PublishedRows):
+            return tuple(self) == tuple(other)
+        if isinstance(other, (tuple, list)):
+            return tuple(self) == tuple(other)
+        return False
+
+
+@dataclass(frozen=True)
 class BuildResult:
-    rows: tuple[dict[str, Any], ...]
+    rows: PublishedRows
     manifest: dict[str, Any]
     rejected: tuple[dict[str, str], ...]
 
 
-@dataclass
-class _Candidate:
-    selected: SelectedTrajectory
-    trajectory_id: str
-    source_terminal_sha256: str
-    seed: SeedContract
-    converted: dict[str, Any]
-    content_sha256: str
-    first_edit_index: int
-    max_read_streak: int
-    normalized_command_count: int
-    canonical_terminal_sha256: str
-    token_count: int = 0
-
-    @property
-    def representative_key(self) -> tuple[int, int, int, int, str]:
-        return (
-            self.first_edit_index,
-            self.max_read_streak,
-            self.normalized_command_count,
-            self.token_count,
-            self.canonical_terminal_sha256,
-        )
-
-
 _SCHEMA_VERSION: Final = "fable5-agentic-pilot-v1"
 _REPRESENTATIVE_VERSION: Final = 1
-_CATEGORY_REJECT_RE: Final = re.compile(
-    r"(?:^|[-_ ])(?:seed[-_ ]?authoring|non[-_ ]?code|research|scheduling|"
-    r"web|memory|instruction[-_ ]?following)(?:$|[-_ ])",
-    re.IGNORECASE,
+AUDITED_CODE_CATEGORIES: Final[frozenset[str]] = frozenset(
+    {
+        "build-analytics",
+        "build-automata",
+        "build-batching",
+        "build-cli",
+        "build-codec",
+        "build-concurrency",
+        "build-config",
+        "build-datastruct",
+        "build-datetime",
+        "build-db",
+        "build-deps",
+        "build-diff",
+        "build-encoding",
+        "build-finance",
+        "build-fs",
+        "build-game",
+        "build-graph",
+        "build-history",
+        "build-html",
+        "build-http",
+        "build-inference",
+        "build-interpreter",
+        "build-iterator",
+        "build-lang",
+        "build-lexing",
+        "build-lib",
+        "build-logs",
+        "build-matching",
+        "build-monitoring",
+        "build-net",
+        "build-ops",
+        "build-parsing",
+        "build-queue",
+        "build-ratelimit",
+        "build-rendering",
+        "build-resilience",
+        "build-scheduler",
+        "build-scheduling",
+        "build-search",
+        "build-solver",
+        "build-state",
+        "build-statemachine",
+        "build-stats",
+        "build-strings",
+        "build-templating",
+        "build-text",
+        "build-validation",
+        "build-web",
+        "build-webhooks",
+        "compilefix-cpp",
+        "compilefix-py",
+        "compilefix-rust",
+        "data-migration",
+        "debug",
+        "debug-argparse",
+        "debug-async",
+        "debug-bytes-text",
+        "debug-collections",
+        "debug-concurrency",
+        "debug-date-math",
+        "debug-datetime",
+        "debug-errors",
+        "debug-exception-shadowing",
+        "debug-float-ordering",
+        "debug-float-precision",
+        "debug-generator-exhaustion",
+        "debug-identity-equality",
+        "debug-integration",
+        "debug-late-binding",
+        "debug-logic",
+        "debug-map-order",
+        "debug-multibug",
+        "debug-mutable-default",
+        "debug-mutation-iteration",
+        "debug-numeric",
+        "debug-pipeline",
+        "debug-resource-leak",
+        "debug-runtime",
+        "debug-shallow-copy",
+        "debug-sorting",
+        "debug-state",
+        "debug-subprocess",
+        "debug-unicode",
+        "debug-web",
+        "debug-webstack",
+        "escape-bytes",
+        "escape-config",
+        "escape-format",
+        "escape-fstring",
+        "escape-parser",
+        "escape-rawstring",
+        "escape-regex",
+        "escape-yaml",
+        "feature-auth",
+        "feature-billing",
+        "feature-cli",
+        "feature-concurrency",
+        "feature-config",
+        "feature-data",
+        "feature-feeds",
+        "feature-fs",
+        "feature-integration",
+        "feature-markdown",
+        "feature-plugins",
+        "feature-pricing",
+        "feature-reporting",
+        "feature-search",
+        "feature-security",
+        "feature-streaming",
+        "feature-terminal",
+        "feature-validation",
+        "feature-web",
+        "feature-webhooks",
+        "full-distill-brownfield-orientation",
+        "full-distill-version-migration",
+        "full-distill/data-migration",
+        "perf-dedupe",
+        "perf-memo",
+        "perf-scan",
+        "project-api",
+        "project-cli",
+        "project-config",
+        "project-data",
+        "project-etl",
+        "project-integration",
+        "project-migration",
+        "project-ops",
+        "project-plugins",
+        "project-quoting",
+        "project-scheduler",
+        "project-sitegen",
+        "project-state",
+        "project-storage",
+        "project-tool",
+        "project-wiki",
+        "refactor-arch",
+        "refactor-pipeline",
+        "syntax-cpp",
+        "syntax-py",
+        "syntax-rust",
+        "warnfix-cpp",
+        "warnfix-py",
+        "warnfix-rust",
+    }
 )
 _WORD_RE: Final = re.compile(r"[\w]+", re.UNICODE)
+_PROMPT_SECRET_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\b(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
+    re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"(?i)\bAuthorization\s*:\s*Bearer\s+[A-Za-z0-9._~+/-]{12,}"),
+    re.compile(
+        r"(?i)\b(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*"
+        r"[A-Za-z0-9._~+/-]{12,}"
+    ),
+    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+)
+_PROMPT_HOST_PATH_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"/(?:Users|home)/[^/\s]+/(?:[^\s]+/)*"),
+    re.compile(r"/(?:media|mnt)/[^/\s]+/(?:[^\s]+/)*"),
+    re.compile(r"/private/var/(?:[^\s]+/)*"),
+    re.compile(r"[A-Za-z]:\\Users\\[^\\\s]+\\", re.IGNORECASE),
+)
 _VERIFY_PATTERNS: Final[dict[CanonicalLanguage, re.Pattern[str]]] = {
     "python": re.compile(
         r"(?:(?:env PYTHONDONTWRITEBYTECODE=1 )?(?:python|python3)"
@@ -1294,7 +1458,13 @@ _SOURCE_SUFFIXES: Final[dict[CanonicalLanguage, frozenset[str]]] = {
     "cpp": frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}),
 }
 _REJECTED_MUTATION_COMPONENT_RE: Final = re.compile(
-    r"^(?:tests?|fixtures?|benchmarks?|generated|vendor|third[_-]?party)$",
+    r"^(?:tests?|testdata|fixtures?|benches|benchmarks?|generated|vendor|third[_-]?party)$",
+    re.IGNORECASE,
+)
+_REJECTED_MUTATION_BASENAME_RE: Final = re.compile(
+    r"^(?:conftest|tests?|test_.+|.+_test|fixtures?|fixture_.+|.+_fixture|"
+    r"benches|benchmarks?|benchmark_.+|.+_benchmark|generated|vendor)"
+    r"(?:\.[A-Za-z0-9]+)?$",
     re.IGNORECASE,
 )
 
@@ -1397,6 +1567,18 @@ def _problem_text(selected: SelectedTrajectory) -> str:
     return problems[0]
 
 
+def validate_fable_user_prompt(prompt: str) -> str:
+    """Fail closed on credentials and local host paths before prompt import."""
+
+    if type(prompt) is not str:
+        raise ValueError("unsafe_user_prompt_type")
+    if any(pattern.search(prompt) for pattern in _PROMPT_SECRET_PATTERNS):
+        raise ValueError("unsafe_user_prompt_secret")
+    if any(pattern.search(prompt) for pattern in _PROMPT_HOST_PATH_PATTERNS):
+        raise ValueError("unsafe_user_prompt_host_path")
+    return prompt
+
+
 def _bounded_detail(detail: object) -> str:
     text = " ".join(str(detail).replace("\x00", "").split())
     return text[:240]
@@ -1416,6 +1598,26 @@ def _record_rejection(
     )
 
 
+def _stable_conversion_subreason(error: BaseException) -> str:
+    if isinstance(error, RowRejected):
+        return f"source_{error.reason.value}"[:64]
+    message = str(error)
+    checks = (
+        ("unsupported Fable tool", "unsupported_tool_name"),
+        ("malformed Fable tool", "malformed_tool_call"),
+        ("malformed JSON", "malformed_arguments"),
+        ("arguments must be an object", "malformed_arguments"),
+        ("unsupported", "unsupported_arguments"),
+        ("ambiguous_bash_mutation", "ambiguous_bash_mutation"),
+        ("protected path", "protected_mutation_path"),
+        ("path", "unsafe_path"),
+    )
+    for marker, reason in checks:
+        if marker in message:
+            return reason
+    return "unsupported_conversion"
+
+
 def _raw_terminal(row: object) -> bool:
     return (
         type(row) is dict
@@ -1426,7 +1628,7 @@ def _raw_terminal(row: object) -> bool:
 
 
 def _category_allowed(category: str) -> bool:
-    return not _CATEGORY_REJECT_RE.search(category)
+    return category in AUDITED_CODE_CATEGORIES
 
 
 def _trajectory_identity(row: dict[str, Any], task: str) -> tuple[str, str, bytes]:
@@ -1520,7 +1722,13 @@ def _operation_behavior(
     for mutation_path in mutation_paths:
         path = PurePosixPath(mutation_path)
         relative_parts = path.parts[2:] if path.parts[:2] == ("/", "testbed") else path.parts
-        if any(_REJECTED_MUTATION_COMPONENT_RE.fullmatch(part) for part in relative_parts[:-1]):
+        if any(
+            _REJECTED_MUTATION_COMPONENT_RE.fullmatch(part)
+            for part in relative_parts
+        ) or (
+            relative_parts
+            and _REJECTED_MUTATION_BASENAME_RE.fullmatch(relative_parts[-1])
+        ):
             has_rejected_mutation_path = True
         if path.suffix.casefold() in _SOURCE_SUFFIXES[language]:
             has_source_edit = True
@@ -1559,11 +1767,13 @@ def _excluded(
     return None
 
 
-def _replay_matches(candidate: _Candidate, evidence: ReplayEvidence | None) -> bool:
+def _replay_matches(
+    candidate: ReplayCandidate, evidence: ReplayEvidence | None
+) -> bool:
     return bool(
         evidence is not None
-        and evidence.resolved
-        and not evidence.control
+        and evidence.resolved is True
+        and evidence.control is False
         and evidence.namespace == "candidate"
         and not evidence.namespace.startswith("controls")
         and evidence.trajectory_id == candidate.trajectory_id
@@ -1591,6 +1801,35 @@ def _write_fsynced(path: Path, data: bytes, *, mode: int = 0o644) -> None:
         os.close(descriptor)
 
 
+def _write_jsonl_fsynced(
+    path: Path,
+    values: Iterable[Any],
+    *,
+    mode: int = 0o644,
+    serialized_lines: bool = False,
+) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    count = 0
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            for value in values:
+                if serialized_lines:
+                    if type(value) is not str or not value.endswith("\n"):
+                        raise ValueError("serialized JSONL value must be a newline-terminated string")
+                    data = value.encode("utf-8")
+                else:
+                    data = _canonical_json_bytes(value) + b"\n"
+                handle.write(data)
+                digest.update(data)
+                count += 1
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest(), count
+
+
 def _fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:
@@ -1601,7 +1840,7 @@ def _fsync_directory(path: Path) -> None:
 
 def _publish_directory(
     out: Path,
-    rows: list[dict[str, Any]],
+    rows: Iterable[dict[str, Any]],
     sidecar_records: Iterable[str],
     rejected: list[dict[str, str]],
     replay_records: list[dict[str, Any]],
@@ -1614,33 +1853,47 @@ def _publish_directory(
     stage = out.parent / f".{out.name}.{uuid.uuid4().hex}.tmp"
     stage.mkdir(mode=0o700)
     try:
-        train_bytes = b"".join(_canonical_json_bytes(row) + b"\n" for row in rows)
-        rejected_bytes = b"".join(
-            _canonical_json_bytes(row) + b"\n"
-            for row in sorted(
-                rejected,
-                key=lambda value: (value["task"], value["reason"], value["detail"]),
-            )
-        )
-        replay_bytes = b"".join(
-            _canonical_json_bytes(row) + b"\n" for row in replay_records
-        )
-        sidecar_bytes = "".join(sidecar_records).encode("utf-8")
         if not manifest.get("metadata_only"):
-            _write_fsynced(stage / "train.jsonl", train_bytes)
-            _write_fsynced(
-                stage / "original_terminal_rows.jsonl", sidecar_bytes, mode=0o600
+            output_sha256, output_count = _write_jsonl_fsynced(
+                stage / "train.jsonl", rows
             )
-            _write_fsynced(stage / "rejected.jsonl", rejected_bytes)
-            _write_fsynced(stage / "replay.jsonl", replay_bytes)
+            sidecar_sha256, sidecar_count = _write_jsonl_fsynced(
+                stage / "original_terminal_rows.jsonl",
+                sidecar_records,
+                mode=0o600,
+                serialized_lines=True,
+            )
+            rejected_sha256, rejected_count = _write_jsonl_fsynced(
+                stage / "rejected.jsonl",
+                sorted(
+                    rejected,
+                    key=lambda value: (
+                        value["task"],
+                        value["reason"],
+                        value["detail"],
+                    ),
+                ),
+            )
+            replay_sha256, replay_count = _write_jsonl_fsynced(
+                stage / "replay.jsonl", replay_records
+            )
             manifest.update(
                 {
-                    "output_sha256": _sha256_bytes(train_bytes),
-                    "sidecar_sha256": _sha256_bytes(sidecar_bytes),
-                    "rejected_sha256": _sha256_bytes(rejected_bytes),
-                    "replay_sha256": _sha256_bytes(replay_bytes),
+                    "output_sha256": output_sha256,
+                    "sidecar_sha256": sidecar_sha256,
+                    "rejected_sha256": rejected_sha256,
+                    "replay_sha256": replay_sha256,
                 }
             )
+            expected_counts = {
+                "output": output_count,
+                "sidecar": sidecar_count,
+                "rejected": rejected_count,
+                "replay": replay_count,
+            }
+            if output_count != manifest["output"]:
+                raise RuntimeError("staged output row count mismatch")
+            manifest["artifact_row_counts"] = expected_counts
             expected_hashes = {
                 "train.jsonl": manifest["output_sha256"],
                 "original_terminal_rows.jsonl": manifest["sidecar_sha256"],
@@ -1697,12 +1950,15 @@ def build_fable5_pilot(
         raise ValueError("max_tokens must be a positive integer")
     if type(config.workers) is not int or config.workers <= 0:
         raise ValueError("workers must be a positive integer")
+    if type(config.token_batch_size) is not int or config.token_batch_size <= 0:
+        raise ValueError("token_batch_size must be a positive integer")
+    if type(config.token_batch_bytes) is not int or config.token_batch_bytes <= 0:
+        raise ValueError("token_batch_bytes must be a positive integer")
     if not config.skip_replay and config.replay_lookup is None and not config.metadata_only:
         raise ValueError("replay evidence is required unless --skip-replay is set")
 
     counts = _empty_counts()
     rejected: list[dict[str, str]] = []
-    candidates: list[_Candidate] = []
     replay_records: list[dict[str, Any]] = []
     tool_names: Counter[str] = Counter()
     argument_keys: Counter[str] = Counter()
@@ -1724,6 +1980,29 @@ def build_fable5_pilot(
     database = sqlite3.connect(work_root / "sidecar.sqlite3")
     database.execute(
         "CREATE TABLE sidecar (language TEXT, task TEXT, trajectory_id TEXT, record TEXT)"
+    )
+    database.execute(
+        """
+        CREATE TABLE candidates (
+            candidate_key INTEGER PRIMARY KEY AUTOINCREMENT,
+            task TEXT NOT NULL,
+            language TEXT NOT NULL,
+            category TEXT NOT NULL,
+            trajectory_id TEXT NOT NULL,
+            source_terminal_sha256 TEXT NOT NULL,
+            fixture_sha256 TEXT NOT NULL,
+            verify_cmd TEXT NOT NULL,
+            protected_paths_json TEXT NOT NULL,
+            converted_json TEXT NOT NULL,
+            content_sha256 TEXT NOT NULL,
+            first_edit_index INTEGER NOT NULL,
+            max_read_streak INTEGER NOT NULL,
+            normalized_command_count INTEGER NOT NULL,
+            canonical_terminal_sha256 TEXT NOT NULL,
+            token_count INTEGER,
+            status TEXT NOT NULL
+        )
+        """
     )
     try:
         for raw_row in rows:
@@ -1791,18 +2070,21 @@ def build_fable5_pilot(
                 continue
             try:
                 selected = select_terminal_row(raw_row)
-                trajectory_id, terminal_sha, terminal_bytes = _trajectory_identity(
-                    raw_row, selected.task
-                )
             except RowRejected as exc:
                 counts["structure_drop"] += 1
                 _record_rejection(rejected, task, "structure_drop", exc.reason.value)
                 continue
+            if config.metadata_only:
+                counts["metadata_eligible"] += 1
+                continue
+            trajectory_id, terminal_sha, _ = _trajectory_identity(
+                raw_row, selected.task
+            )
             sidecar_record = {
                 "trajectory_id": trajectory_id,
                 "source_instance_id": selected.task,
                 "source_terminal_sha256": terminal_sha,
-                "row": json.loads(terminal_bytes),
+                "row": raw_row,
             }
             database.execute(
                 "INSERT INTO sidecar VALUES (?, ?, ?, ?)",
@@ -1813,9 +2095,6 @@ def build_fable5_pilot(
                     _canonical_json_bytes(sidecar_record).decode("utf-8") + "\n",
                 ),
             )
-            if config.metadata_only:
-                counts["metadata_eligible"] += 1
-                continue
             if any(
                 selected.task in record.instance_ids for record in config.exclusions
             ):
@@ -1825,6 +2104,17 @@ def build_fable5_pilot(
                     selected.task,
                     "contamination_drop",
                     "exact_instance_id",
+                )
+                continue
+            try:
+                validate_fable_user_prompt(_problem_text(selected))
+            except (UnsupportedTrajectoryTool, ValueError) as exc:
+                counts["contamination_drop"] += 1
+                _record_rejection(
+                    rejected,
+                    selected.task,
+                    "contamination_drop",
+                    str(exc),
                 )
                 continue
             try:
@@ -1844,7 +2134,10 @@ def build_fable5_pilot(
             except (RowRejected, UnsupportedTrajectoryTool, ValueError) as exc:
                 counts["unsupported_tool"] += 1
                 _record_rejection(
-                    rejected, selected.task, "unsupported_tool", type(exc).__name__
+                    rejected,
+                    selected.task,
+                    "unsupported_tool",
+                    _stable_conversion_subreason(exc),
                 )
                 continue
             converted["instance_id"] = trajectory_id
@@ -1878,19 +2171,32 @@ def build_fable5_pilot(
                     rejected, selected.task, "behavior_drop", ",".join(reasons)
                 )
                 continue
-            candidates.append(
-                _Candidate(
-                    selected=selected,
-                    trajectory_id=trajectory_id,
-                    source_terminal_sha256=terminal_sha,
-                    seed=seed,
-                    converted=converted,
-                    content_sha256=content_sha,
-                    first_edit_index=first_edit,
-                    max_read_streak=max_streak,
-                    normalized_command_count=command_count,
-                    canonical_terminal_sha256=terminal_sha,
-                )
+            database.execute(
+                """
+                INSERT INTO candidates (
+                    task, language, category, trajectory_id,
+                    source_terminal_sha256, fixture_sha256, verify_cmd,
+                    protected_paths_json, converted_json, content_sha256,
+                    first_edit_index, max_read_streak, normalized_command_count,
+                    canonical_terminal_sha256, token_count, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'candidate')
+                """,
+                (
+                    selected.task,
+                    selected.language,
+                    selected.category,
+                    trajectory_id,
+                    terminal_sha,
+                    seed.fixture_sha256,
+                    seed.verify_cmd,
+                    _canonical_json_bytes(list(seed.protected_paths)).decode("utf-8"),
+                    _canonical_json_bytes(converted).decode("utf-8"),
+                    content_sha,
+                    first_edit,
+                    max_streak,
+                    command_count,
+                    terminal_sha,
+                ),
             )
 
         database.commit()
@@ -1904,100 +2210,206 @@ def build_fable5_pilot(
                 f"{config.source_contract.expected_terminal_trajectories}, got {terminal_seen}"
             )
 
-        if not config.metadata_only and candidates:
-            message_lists = [candidate.converted["messages"] for candidate in candidates]
-            with ThreadPoolExecutor(max_workers=config.workers) as executor:
-                token_counts = list(executor.map(config.token_counter, message_lists))
-            budget_candidates: list[_Candidate] = []
-            for candidate, token_count in zip(candidates, token_counts, strict=True):
-                if type(token_count) is not int or token_count < 0:
-                    raise ValueError(
-                        "token counter must return a nonnegative exact integer"
-                    )
-                if token_count > config.max_tokens:
-                    counts["token_drop"] += 1
-                    _record_rejection(
-                        rejected,
-                        candidate.selected.task,
-                        "token_drop",
-                        f"tokens={token_count}",
-                    )
-                    continue
-                candidate.token_count = token_count
-                budget_candidates.append(candidate)
-            candidates = budget_candidates
+        if not config.metadata_only:
+            token_cursor = database.execute(
+                "SELECT candidate_key, task, converted_json FROM candidates "
+                "WHERE status = 'candidate' ORDER BY candidate_key"
+            )
 
-        by_task: dict[str, list[_Candidate]] = defaultdict(list)
-        for candidate in candidates:
-            by_task[candidate.selected.task].append(candidate)
-        representatives: list[_Candidate] = []
+            def flush_token_batch(
+                executor: ThreadPoolExecutor,
+                batch: list[tuple[int, str, list[dict[str, Any]]]],
+            ) -> None:
+                if not batch:
+                    return
+                token_counts = list(
+                    executor.map(config.token_counter, [item[2] for item in batch])
+                )
+                for (candidate_key, candidate_task, _messages), token_count in zip(
+                    batch, token_counts, strict=True
+                ):
+                    if type(token_count) is not int or token_count < 0:
+                        raise ValueError(
+                            "token counter must return a nonnegative exact integer"
+                        )
+                    if token_count > config.max_tokens:
+                        counts["token_drop"] += 1
+                        _record_rejection(
+                            rejected,
+                            candidate_task,
+                            "token_drop",
+                            f"tokens={token_count}",
+                        )
+                        status = "token_drop"
+                    else:
+                        status = "token_ok"
+                    database.execute(
+                        "UPDATE candidates SET token_count = ?, status = ? "
+                        "WHERE candidate_key = ?",
+                        (token_count, status, candidate_key),
+                    )
+
+            batch: list[tuple[int, str, list[dict[str, Any]]]] = []
+            batch_bytes = 0
+            with ThreadPoolExecutor(max_workers=config.workers) as executor:
+                for candidate_key, candidate_task, converted_json in token_cursor:
+                    estimated_bytes = max(1, len(converted_json) * 4)
+                    if batch and (
+                        len(batch) >= config.token_batch_size
+                        or batch_bytes + estimated_bytes > config.token_batch_bytes
+                    ):
+                        flush_token_batch(executor, batch)
+                        batch.clear()
+                        batch_bytes = 0
+                    converted_row = json.loads(converted_json)
+                    batch.append(
+                        (candidate_key, candidate_task, converted_row["messages"])
+                    )
+                    batch_bytes += estimated_bytes
+                flush_token_batch(executor, batch)
+            database.commit()
+
         representative_manifest: list[dict[str, Any]] = []
-        for task in sorted(by_task):
-            task_candidates = sorted(
-                by_task[task], key=lambda candidate: candidate.representative_key
-            )
-            chosen = task_candidates[0]
-            representatives.append(chosen)
-            representative_manifest.append(
-                {
-                    "task": task,
-                    "trajectory_id": chosen.trajectory_id,
-                    "first_edit_index": chosen.first_edit_index,
-                    "max_read_streak": chosen.max_read_streak,
-                    "normalized_command_count": chosen.normalized_command_count,
-                    "rendered_token_count": chosen.token_count,
-                    "canonical_terminal_sha256": chosen.canonical_terminal_sha256,
-                }
-            )
-            for duplicate in task_candidates[1:]:
+        current_task: str | None = None
+        representative_cursor = database.execute(
+            """
+            SELECT candidate_key, task, trajectory_id, first_edit_index,
+                   max_read_streak, normalized_command_count, token_count,
+                   canonical_terminal_sha256
+            FROM candidates WHERE status = 'token_ok'
+            ORDER BY task, first_edit_index, max_read_streak,
+                     normalized_command_count, token_count,
+                     canonical_terminal_sha256
+            """
+        )
+        for (
+            candidate_key,
+            task,
+            trajectory_id,
+            first_edit_index,
+            max_read_streak,
+            command_count,
+            token_count,
+            terminal_sha,
+        ) in representative_cursor:
+            if task != current_task:
+                current_task = task
+                database.execute(
+                    "UPDATE candidates SET status = 'representative' "
+                    "WHERE candidate_key = ?",
+                    (candidate_key,),
+                )
+                representative_manifest.append(
+                    {
+                        "task": task,
+                        "trajectory_id": trajectory_id,
+                        "first_edit_index": first_edit_index,
+                        "max_read_streak": max_read_streak,
+                        "normalized_command_count": command_count,
+                        "rendered_token_count": token_count,
+                        "canonical_terminal_sha256": terminal_sha,
+                    }
+                )
+            else:
                 counts["duplicate_drop"] += 1
                 _record_rejection(
                     rejected,
-                    duplicate.selected.task,
+                    task,
                     "duplicate_drop",
                     "nonrepresentative terminal trajectory",
                 )
+                database.execute(
+                    "UPDATE candidates SET status = 'duplicate_drop' "
+                    "WHERE candidate_key = ?",
+                    (candidate_key,),
+                )
 
         content_seen: set[str] = set()
-        unique_candidates: list[_Candidate] = []
-        for candidate in sorted(
-            representatives,
-            key=lambda value: (value.selected.language, value.selected.task),
+        eligible_unique_task_ceiling = 0
+        for candidate_key, task, content_sha in database.execute(
+            "SELECT candidate_key, task, content_sha256 FROM candidates "
+            "WHERE status = 'representative' ORDER BY language, task"
         ):
-            if candidate.content_sha256 in content_seen:
+            if content_sha in content_seen:
                 counts["duplicate_drop"] += 1
                 _record_rejection(
                     rejected,
-                    candidate.selected.task,
+                    task,
                     "duplicate_drop",
                     "duplicate canonical message content",
                 )
-                continue
-            content_seen.add(candidate.content_sha256)
-            unique_candidates.append(candidate)
-        eligible_unique_task_ceiling = len(unique_candidates)
-
-        replayed: list[_Candidate] = []
-        for candidate in unique_candidates:
-            if config.skip_replay:
-                replayed.append(candidate)
-                continue
-            evidence = config.replay_lookup(
-                ReplayCandidate(
-                    trajectory_id=candidate.trajectory_id,
-                    source_terminal_sha256=candidate.source_terminal_sha256,
-                    content_sha256=candidate.content_sha256,
-                    seed=candidate.seed,
+                database.execute(
+                    "UPDATE candidates SET status = 'duplicate_drop' "
+                    "WHERE candidate_key = ?",
+                    (candidate_key,),
                 )
-            ) if config.replay_lookup else None
-            if not _replay_matches(candidate, evidence):
+                continue
+            content_seen.add(content_sha)
+            eligible_unique_task_ceiling += 1
+            database.execute(
+                "UPDATE candidates SET status = 'unique_candidate' "
+                "WHERE candidate_key = ?",
+                (candidate_key,),
+            )
+
+        replay_cursor = database.execute(
+            """
+            SELECT candidate_key, task, trajectory_id,
+                   source_terminal_sha256, content_sha256,
+                   fixture_sha256, verify_cmd, protected_paths_json
+            FROM candidates WHERE status = 'unique_candidate'
+            ORDER BY language, task
+            """
+        )
+        for (
+            candidate_key,
+            task,
+            trajectory_id,
+            source_terminal_sha,
+            content_sha,
+            fixture_sha,
+            verify_cmd,
+            protected_paths_json,
+        ) in replay_cursor:
+            if config.skip_replay:
+                database.execute(
+                    "UPDATE candidates SET status = 'replay_ok' "
+                    "WHERE candidate_key = ?",
+                    (candidate_key,),
+                )
+                continue
+            replay_candidate = ReplayCandidate(
+                trajectory_id=trajectory_id,
+                source_terminal_sha256=source_terminal_sha,
+                content_sha256=content_sha,
+                seed=SeedContract(
+                    task=task,
+                    protected_paths=tuple(json.loads(protected_paths_json)),
+                    verify_cmd=verify_cmd,
+                    fixture_sha256=fixture_sha,
+                ),
+            )
+            evidence = (
+                config.replay_lookup(replay_candidate)
+                if config.replay_lookup
+                else None
+            )
+            if not _replay_matches(replay_candidate, evidence):
                 counts["replay_drop"] += 1
                 _record_rejection(
-                    rejected, candidate.selected.task, "replay_drop", "evidence mismatch"
+                    rejected, task, "replay_drop", "evidence_mismatch"
+                )
+                database.execute(
+                    "UPDATE candidates SET status = 'replay_drop' "
+                    "WHERE candidate_key = ?",
+                    (candidate_key,),
                 )
                 continue
-            candidate.converted["replay_pending"] = False
-            replayed.append(candidate)
+            database.execute(
+                "UPDATE candidates SET status = 'replay_ok' "
+                "WHERE candidate_key = ?",
+                (candidate_key,),
+            )
             replay_records.append(
                 {
                     "trajectory_id": evidence.trajectory_id,
@@ -2010,21 +2422,30 @@ def build_fable5_pilot(
                 }
             )
 
-        replayed.sort(key=lambda value: (value.selected.language, value.selected.task))
-        if config.max_output and len(replayed) > config.max_output:
-            overflow = replayed[config.max_output :]
-            replayed = replayed[: config.max_output]
-            counts["output_limit_drop"] += len(overflow)
-            for candidate in overflow:
+        output_index = 0
+        for candidate_key, task in database.execute(
+            "SELECT candidate_key, task FROM candidates "
+            "WHERE status = 'replay_ok' ORDER BY language, task"
+        ):
+            if config.max_output and output_index >= config.max_output:
+                counts["output_limit_drop"] += 1
                 _record_rejection(
                     rejected,
-                    candidate.selected.task,
+                    task,
                     "output_limit_drop",
                     f"max_output={config.max_output}",
                 )
+                status = "output_limit_drop"
+            else:
+                counts["output"] += 1
+                output_index += 1
+                status = "output"
+            database.execute(
+                "UPDATE candidates SET status = ? WHERE candidate_key = ?",
+                (status, candidate_key),
+            )
 
-        output_rows = [candidate.converted for candidate in replayed]
-        counts["output"] = len(output_rows)
+        database.commit()
         arithmetic_buckets = [
             "nonterminal",
             "validation",
@@ -2046,13 +2467,35 @@ def build_fable5_pilot(
                 f"manifest arithmetic mismatch: streamed={streamed}, buckets={arithmetic_sum}"
             )
 
-        per_language = Counter(candidate.selected.language for candidate in replayed)
-        per_category = Counter(candidate.selected.category for candidate in replayed)
+        per_language = Counter(
+            {
+                language: count
+                for language, count in database.execute(
+                    "SELECT language, COUNT(*) FROM candidates "
+                    "WHERE status = 'output' GROUP BY language"
+                )
+            }
+        )
+        per_category = Counter(
+            {
+                category: count
+                for category, count in database.execute(
+                    "SELECT category, COUNT(*) FROM candidates "
+                    "WHERE status = 'output' GROUP BY category"
+                )
+            }
+        )
         identity_payload = [
-            {"task": candidate.selected.task, "trajectory_id": candidate.trajectory_id}
-            for candidate in replayed
+            {"task": task, "trajectory_id": trajectory_id}
+            for task, trajectory_id in database.execute(
+                "SELECT task, trajectory_id FROM candidates "
+                "WHERE status = 'output' ORDER BY language, task"
+            )
         ]
         rejection_reason_counts = Counter(row["reason"] for row in rejected)
+        rejection_subreason_counts = Counter(
+            f"{row['reason']}:{row['detail']}" for row in rejected
+        )
         exclusion_contract = [
             {
                 "instance_ids": sorted(record.instance_ids),
@@ -2079,6 +2522,8 @@ def build_fable5_pilot(
                 "max_output": config.max_output,
                 "max_tokens": config.max_tokens,
                 "workers": config.workers,
+                "token_batch_size": config.token_batch_size,
+                "token_batch_bytes": config.token_batch_bytes,
                 "skip_replay": config.skip_replay,
                 "max_first_edit_index": 10,
                 "max_read_streak": 5,
@@ -2094,19 +2539,36 @@ def build_fable5_pilot(
             "per_language": dict(sorted(per_language.items())),
             "per_category": dict(sorted(per_category.items())),
             "first_edit_histogram": _histogram(
-                candidate.first_edit_index for candidate in replayed
+                value[0]
+                for value in database.execute(
+                    "SELECT first_edit_index FROM candidates WHERE status = 'output'"
+                )
             ),
             "read_streak_histogram": _histogram(
-                candidate.max_read_streak for candidate in replayed
+                value[0]
+                for value in database.execute(
+                    "SELECT max_read_streak FROM candidates WHERE status = 'output'"
+                )
             ),
-            "token_histogram": _histogram(candidate.token_count for candidate in replayed),
+            "token_histogram": _histogram(
+                value[0]
+                for value in database.execute(
+                    "SELECT token_count FROM candidates WHERE status = 'output'"
+                )
+            ),
             "tool_name_counts": dict(sorted(tool_names.items())),
             "tool_argument_key_counts": dict(sorted(argument_keys.items())),
             "rejection_reason_counts": dict(sorted(rejection_reason_counts.items())),
+            "rejection_subreason_counts": dict(
+                sorted(rejection_subreason_counts.items())
+            ),
             "exclusion_contract_sha256": _sha256_bytes(
                 _canonical_json_bytes(exclusion_contract)
             ),
             "eligible_unique_task_ceiling_before_replay": eligible_unique_task_ceiling,
+            "candidate_store": "sqlite",
+            "token_batch_size": config.token_batch_size,
+            "token_batch_bytes": config.token_batch_bytes,
             "representative_version": _REPRESENTATIVE_VERSION,
             "representative_tuple": [
                 "first_edit_index",
@@ -2133,22 +2595,33 @@ def build_fable5_pilot(
                 "greghavens/moonshiner"
             ),
         }
-        sidecar_records = (
-            row[0]
-            for row in database.execute(
-                "SELECT record FROM sidecar ORDER BY language, task, trajectory_id"
+        def output_rows() -> Iterable[dict[str, Any]]:
+            for (converted_json,) in database.execute(
+                "SELECT converted_json FROM candidates "
+                "WHERE status = 'output' ORDER BY language, task"
+            ):
+                yield json.loads(converted_json)
+
+        sidecar_records: Iterable[str]
+        if config.metadata_only:
+            sidecar_records = ()
+        else:
+            sidecar_records = (
+                row[0]
+                for row in database.execute(
+                    "SELECT record FROM sidecar ORDER BY language, task, trajectory_id"
+                )
             )
-        )
         published_manifest = _publish_directory(
             out,
-            output_rows,
+            output_rows(),
             sidecar_records,
             rejected,
             replay_records,
             manifest,
         )
         return BuildResult(
-            rows=tuple(output_rows),
+            rows=PublishedRows(out / "train.jsonl", counts["output"]),
             manifest=published_manifest,
             rejected=tuple(
                 sorted(
@@ -2292,19 +2765,60 @@ def _load_exclusion(path: Path) -> ExclusionRecord:
 
 def _load_replay_ledger(path: Path) -> dict[str, ReplayEvidence]:
     records: dict[str, ReplayEvidence] = {}
+    required_fields = {
+        "trajectory_id",
+        "source_terminal_sha256",
+        "candidate_content_sha256",
+        "fixture_sha256",
+        "resolved",
+        "control",
+        "namespace",
+    }
     with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
+        for line_number, line in enumerate(handle, start=1):
             if not line.strip():
                 continue
-            payload = json.loads(line)
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"replay ledger line {line_number} is not valid JSON"
+                ) from exc
+            if type(payload) is not dict or set(payload) != required_fields:
+                raise ValueError(
+                    f"replay ledger line {line_number} must have the exact schema"
+                )
+            for field_name in (
+                "trajectory_id",
+                "source_terminal_sha256",
+                "candidate_content_sha256",
+                "fixture_sha256",
+            ):
+                value = payload[field_name]
+                if type(value) is not str or not re.fullmatch(r"[0-9a-f]{64}", value):
+                    raise ValueError(
+                        f"replay ledger line {line_number} has invalid {field_name}"
+                    )
+            if type(payload["resolved"]) is not bool:
+                raise ValueError(
+                    f"replay ledger line {line_number} resolved must be a boolean"
+                )
+            if type(payload["control"]) is not bool:
+                raise ValueError(
+                    f"replay ledger line {line_number} control must be a boolean"
+                )
+            if type(payload["namespace"]) is not str or not payload["namespace"]:
+                raise ValueError(
+                    f"replay ledger line {line_number} namespace must be explicit"
+                )
             evidence = ReplayEvidence(
                 trajectory_id=payload["trajectory_id"],
                 source_terminal_sha256=payload["source_terminal_sha256"],
                 candidate_content_sha256=payload["candidate_content_sha256"],
                 fixture_sha256=payload["fixture_sha256"],
                 resolved=payload["resolved"],
-                control=payload.get("control", False),
-                namespace=payload.get("namespace", "candidate"),
+                control=payload["control"],
+                namespace=payload["namespace"],
             )
             if evidence.trajectory_id in records:
                 raise ValueError(f"duplicate replay trajectory {evidence.trajectory_id}")

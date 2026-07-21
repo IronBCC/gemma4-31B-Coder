@@ -9,6 +9,7 @@ import re
 import stat
 import subprocess
 import sys
+import tracemalloc
 from dataclasses import dataclass
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -36,6 +37,7 @@ from fable5_import import (  # noqa: E402
     SelectedTrajectory,
     SourceContract,
     VerifierEvidenceOp,
+    _load_replay_ledger,
     build_fable5_pilot,
     canonical_language,
     convert_trajectory,
@@ -46,6 +48,7 @@ from fable5_import import (  # noqa: E402
     seed_contract_from_git_objects,
     token_gate,
     translate_fable_tool_call,
+    validate_fable_user_prompt,
     validate_moonshiner_revision,
     validate_source_messages,
 )
@@ -1871,6 +1874,191 @@ def test_behavior_rejects_non_source_mutation(tmp_path: Path) -> None:
     assert "no_source_edit" in result.rejected[0]["detail"]
 
 
+@pytest.mark.parametrize(
+    ("language", "path"),
+    [
+        ("python", "test_new.py"),
+        ("python", "src/tests.py"),
+        ("python", "src/test_helpers.py"),
+        ("python", "src/helpers_test.py"),
+        ("python", "src/conftest.py"),
+        ("python", "src/fixture.py"),
+        ("python", "src/benchmark.py"),
+        ("python", "generated/model.py"),
+        ("python", "vendor/model.py"),
+        ("rust", "src/tests.rs"),
+        ("rust", "benches/benchmark.rs"),
+        ("cpp", "src/parser_test.cpp"),
+        ("cpp", "fixtures/parser.cpp"),
+    ],
+)
+def test_behavior_rejects_root_and_nested_test_fixture_benchmark_mutations(
+    tmp_path: Path, language: str, path: str
+) -> None:
+    task = f"{language}-{hashlib.sha256(path.encode()).hexdigest()[:8]}"
+    row, verify = pipeline_row(task, language=language)
+    edit_call = next(
+        message["tool_calls"][0]
+        for message in row["messages"]
+        if message["role"] == "assistant"
+        and message.get("tool_calls")
+        and message["tool_calls"][0]["id"] == "edit"
+    )
+    edit_call["function"]["arguments"]["file_path"] = path
+
+    result = build_fable5_pilot(
+        [row],
+        fixture_build_config(tmp_path / task, [row], {task: verify}),
+    )
+
+    assert result.rows == ()
+    assert "rejected_mutation_path" in result.rejected[0]["detail"]
+
+
+def test_behavior_allows_honest_source_name_containing_test_substring(
+    tmp_path: Path,
+) -> None:
+    row, verify = pipeline_row("py-contest")
+    edit_call = next(
+        message["tool_calls"][0]
+        for message in row["messages"]
+        if message["role"] == "assistant"
+        and message.get("tool_calls")
+        and message["tool_calls"][0]["id"] == "edit"
+    )
+    edit_call["function"]["arguments"]["file_path"] = "src/contest.py"
+
+    result = build_fable5_pilot(
+        [row],
+        fixture_build_config(
+            tmp_path / "dataset", [row], {"py-contest": verify}
+        ),
+    )
+
+    assert len(result.rows) == 1
+
+
+@pytest.mark.parametrize(
+    "category",
+    [
+        "debug",
+        "debug-runtime",
+        "build-lib",
+        "feature-auth",
+        "project-cli",
+        "compilefix-py",
+        "escape-regex",
+        "perf-memo",
+        "refactor-pipeline",
+        "syntax-py",
+        "warnfix-py",
+        "data-migration",
+        "full-distill-version-migration",
+        "full-distill/data-migration",
+    ],
+)
+def test_category_allowlist_accepts_audited_code_families(
+    tmp_path: Path, category: str
+) -> None:
+    task = f"py-{hashlib.sha256(category.encode()).hexdigest()[:8]}"
+    row, verify = pipeline_row(task, category=category)
+    result = build_fable5_pilot(
+        [row], fixture_build_config(tmp_path / task, [row], {task: verify})
+    )
+    assert len(result.rows) == 1
+
+
+@pytest.mark.parametrize(
+    "category",
+    [
+        "en",
+        "generic",
+        "unknown",
+        "web",
+        "memory",
+        "instruction-following",
+        "build-unseen-family",
+        "debug-unseen-family",
+    ],
+)
+def test_category_allowlist_rejects_unknown_and_noncode_labels(
+    tmp_path: Path, category: str
+) -> None:
+    task = f"py-{category}"
+    row, verify = pipeline_row(task, category=category)
+    result = build_fable5_pilot(
+        [row], fixture_build_config(tmp_path / task, [row], {task: verify})
+    )
+    assert result.rows == ()
+    assert result.manifest["category_drop"] == 1
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Use token=ghp_abcdefghijklmnopqrstuvwxyz0123456789 to reproduce.",
+        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+        "Here is the key: AKIAABCDEFGHIJKLMNOP",
+        "Read /Users/alice/projects/private-repo/config.py before fixing it.",
+        "The checkout is /home/runner/work/private/repo and the bug is there.",
+        "Inspect C:\\Users\\alice\\projects\\secret\\main.py.",
+    ],
+)
+def test_user_prompt_scan_rejects_secrets_and_host_paths(prompt: str) -> None:
+    with pytest.raises(ValueError, match="unsafe_user_prompt"):
+        validate_fable_user_prompt(prompt)
+
+
+def test_user_prompt_scan_allows_safe_task_text_and_testbed_path() -> None:
+    prompt = "Fix the parser under /testbed/src/parser.py; token means a lexer token."
+    assert validate_fable_user_prompt(prompt) == prompt
+
+
+def test_build_rejects_unsafe_user_prompt_before_conversion(tmp_path: Path) -> None:
+    row, verify = pipeline_row(
+        "py-secret-prompt", problem="Use ghp_abcdefghijklmnopqrstuvwxyz0123456789 to fix it."
+    )
+
+    result = build_fable5_pilot(
+        [row],
+        fixture_build_config(
+            tmp_path / "dataset", [row], {"py-secret-prompt": verify}
+        ),
+    )
+
+    assert result.rows == ()
+    assert result.manifest["contamination_drop"] == 1
+    assert result.rejected[0]["detail"] == "unsafe_user_prompt_secret"
+
+
+def test_conversion_rejections_keep_bounded_machine_subreasons(
+    tmp_path: Path,
+) -> None:
+    row, verify = pipeline_row("py-unsupported")
+    read_call = next(
+        message["tool_calls"][0]
+        for message in row["messages"]
+        if message["role"] == "assistant"
+        and message.get("tool_calls")
+        and message["tool_calls"][0]["id"] == "read-0"
+    )
+    read_call["function"] = {"name": "WebSearch", "arguments": {"query": "x"}}
+
+    result = build_fable5_pilot(
+        [row],
+        fixture_build_config(
+            tmp_path / "dataset", [row], {"py-unsupported": verify}
+        ),
+    )
+
+    assert result.rows == ()
+    assert result.rejected[0]["detail"] == "unsupported_tool_name"
+    assert result.manifest["rejection_subreason_counts"] == {
+        "unsupported_tool:unsupported_tool_name": 1
+    }
+    assert len(result.rejected[0]["detail"]) <= 64
+
+
 def test_manifest_counts_malformed_steps_as_structure_not_prefix(
     tmp_path: Path,
 ) -> None:
@@ -2057,6 +2245,132 @@ def test_replay_gate_requires_exact_noncontrol_hash_bound_evidence(
     assert rejected.manifest["replay_drop"] == 1
 
 
+@pytest.mark.parametrize("resolved", ["false", 1, 0, None])
+def test_replay_gate_rejects_nonboolean_resolved_identity(
+    tmp_path: Path, resolved: object
+) -> None:
+    row, verify = pipeline_row("py-replay-typed")
+
+    def replay_lookup(candidate):
+        return ReplayEvidence(
+            trajectory_id=candidate.trajectory_id,
+            source_terminal_sha256=candidate.source_terminal_sha256,
+            candidate_content_sha256=candidate.content_sha256,
+            fixture_sha256=candidate.seed.fixture_sha256,
+            resolved=resolved,
+            control=False,
+            namespace="candidate",
+        )
+
+    result = build_fable5_pilot(
+        [row],
+        fixture_build_config(
+            tmp_path / str(resolved),
+            [row],
+            {"py-replay-typed": verify},
+            skip_replay=False,
+            replay_lookup=replay_lookup,
+        ),
+    )
+
+    assert result.rows == ()
+    assert result.manifest["replay_drop"] == 1
+
+
+@pytest.mark.parametrize("control", ["false", 0, 1, None])
+def test_replay_gate_requires_control_is_exactly_false(
+    tmp_path: Path, control: object
+) -> None:
+    row, verify = pipeline_row("py-replay-control")
+
+    def replay_lookup(candidate):
+        return ReplayEvidence(
+            trajectory_id=candidate.trajectory_id,
+            source_terminal_sha256=candidate.source_terminal_sha256,
+            candidate_content_sha256=candidate.content_sha256,
+            fixture_sha256=candidate.seed.fixture_sha256,
+            resolved=True,
+            control=control,
+            namespace="candidate",
+        )
+
+    result = build_fable5_pilot(
+        [row],
+        fixture_build_config(
+            tmp_path / str(control),
+            [row],
+            {"py-replay-control": verify},
+            skip_replay=False,
+            replay_lookup=replay_lookup,
+        ),
+    )
+    assert result.rows == ()
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda row: row.pop("control"),
+        lambda row: row.pop("namespace"),
+        lambda row: row.update(extra="not allowed"),
+        lambda row: row.update(resolved="false"),
+        lambda row: row.update(control=0),
+        lambda row: row.update(namespace=7),
+        lambda row: row.update(trajectory_id="bad"),
+        lambda row: row.update(source_terminal_sha256="g" * 64),
+        lambda row: row.update(candidate_content_sha256="a" * 63),
+        lambda row: row.update(fixture_sha256=None),
+    ],
+)
+def test_replay_ledger_requires_exact_explicit_schema_and_hashes(
+    tmp_path: Path, mutate
+) -> None:
+    record = {
+        "trajectory_id": "a" * 64,
+        "source_terminal_sha256": "b" * 64,
+        "candidate_content_sha256": "c" * 64,
+        "fixture_sha256": "d" * 64,
+        "resolved": True,
+        "control": False,
+        "namespace": "candidate",
+    }
+    mutate(record)
+    ledger = tmp_path / "replay.jsonl"
+    ledger.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="replay ledger"):
+        _load_replay_ledger(ledger)
+
+
+def test_replay_gate_rejects_controls_namespace_even_when_resolved(
+    tmp_path: Path,
+) -> None:
+    row, verify = pipeline_row("py-replay-namespace")
+
+    def replay_lookup(candidate):
+        return ReplayEvidence(
+            trajectory_id=candidate.trajectory_id,
+            source_terminal_sha256=candidate.source_terminal_sha256,
+            candidate_content_sha256=candidate.content_sha256,
+            fixture_sha256=candidate.seed.fixture_sha256,
+            resolved=True,
+            control=False,
+            namespace="controls/reference",
+        )
+
+    result = build_fable5_pilot(
+        [row],
+        fixture_build_config(
+            tmp_path / "dataset",
+            [row],
+            {"py-replay-namespace": verify},
+            skip_replay=False,
+            replay_lookup=replay_lookup,
+        ),
+    )
+    assert result.rows == ()
+
+
 def test_failed_publish_leaves_no_partial_final_dataset(tmp_path: Path) -> None:
     row, verify = pipeline_row("py-fail")
 
@@ -2092,3 +2406,102 @@ def test_metadata_only_validates_raw_arithmetic_without_training_jsonl(
     assert result.manifest["streamed"] == 1
     assert not (config.out / "train.jsonl").exists()
     assert (config.out / "manifest.json").exists()
+    assert not (config.out / "original_terminal_rows.jsonl").exists()
+
+
+def test_build_memory_is_bounded_by_token_batch_not_candidate_corpus(
+    tmp_path: Path,
+) -> None:
+    row_count = 24
+    payload_bytes = 1_000_000
+    contract = FixtureSourceContract(
+        expected_rows=row_count, expected_terminal_trajectories=row_count
+    )
+
+    def rows():
+        for index in range(row_count):
+            task = f"py-memory-{index:03d}"
+            row, _ = pipeline_row(task, problem=f"Fix source task {index}.")
+            row["messages"][-1]["content"] = "x" * payload_bytes + str(index)
+            yield row
+
+    def seed_contract(task: str) -> SeedContract:
+        return SeedContract(
+            task=task,
+            protected_paths=("tests/test_contract.py",),
+            verify_cmd="python -m pytest -q",
+            fixture_sha256=hashlib.sha256(task.encode()).hexdigest(),
+        )
+
+    config = BuildConfig(
+        out=tmp_path / "bounded",
+        source_metadata=SourceMetadata(
+            dataset_id=DATASET_ID,
+            dataset_revision=DATASET_REVISION,
+            source_lfs_sha256=SOURCE_LFS_SHA256,
+            source_bytes=SOURCE_BYTES,
+        ),
+        token_counter=lambda _messages: 4_096,
+        seed_contract=seed_contract,
+        skip_replay=True,
+        max_output=1,
+        workers=2,
+        token_batch_size=2,
+        token_batch_bytes=3_000_000,
+        source_contract=contract,
+    )
+
+    tracemalloc.start()
+    result = build_fable5_pilot(rows(), config)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert len(result.rows) == 1
+    assert peak < 16_000_000
+    assert result.manifest["candidate_store"] == "sqlite"
+    assert result.manifest["token_batch_size"] == 2
+    assert result.manifest["token_batch_bytes"] == 3_000_000
+
+
+def test_metadata_only_does_not_retain_or_emit_terminal_sidecar_payloads(
+    tmp_path: Path,
+) -> None:
+    payload_bytes = 16_000_000
+
+    def measure(row_count: int) -> tuple[int, BuildResult, BuildConfig]:
+        contract = FixtureSourceContract(
+            expected_rows=row_count, expected_terminal_trajectories=row_count
+        )
+
+        def rows():
+            for index in range(row_count):
+                row, _ = pipeline_row(f"py-meta-memory-{row_count}-{index}")
+                row["messages"][-1]["content"] = "m" * payload_bytes
+                yield row
+
+        config = BuildConfig(
+            out=tmp_path / f"metadata-{row_count}",
+            source_metadata=SourceMetadata(
+                dataset_id=DATASET_ID,
+                dataset_revision=DATASET_REVISION,
+                source_lfs_sha256=SOURCE_LFS_SHA256,
+                source_bytes=SOURCE_BYTES,
+            ),
+            token_counter=lambda _messages: 0,
+            seed_contract=lambda task: (_ for _ in ()).throw(RuntimeError(task)),
+            skip_replay=True,
+            metadata_only=True,
+            source_contract=contract,
+        )
+        tracemalloc.start()
+        result = build_fable5_pilot(rows(), config)
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        return peak, result, config
+
+    small_peak, _, _ = measure(2)
+    large_peak, result, config = measure(8)
+
+    assert large_peak <= small_peak * 1.25
+    assert result.manifest["metadata_only"] is True
+    assert not (config.out / "original_terminal_rows.jsonl").exists()

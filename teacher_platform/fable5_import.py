@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 import shlex
@@ -379,6 +380,10 @@ class VerifierEvidenceOp:
     description: str | None = None
     timeout: int | None = None
 
+    @property
+    def command_sha256(self) -> str:
+        return hashlib.sha256(self.command.encode("utf-8")).hexdigest()
+
 
 @dataclass(frozen=True)
 class FableReadOp:
@@ -522,14 +527,20 @@ def _runtime_confinement_lines(
 ) -> list[str]:
     lines = [
         "from pathlib import Path",
-        "root = Path('/testbed').resolve()",
+        "workspace = Path('/testbed')",
+        "root = workspace.resolve()",
         f"path = Path({json.dumps(path)})",
     ]
     if kind == "mutation":
         lines.extend(
             [
-                "parent = path.parent.resolve()",
-                "candidate = path.resolve() if path.exists() else parent / path.name",
+                "relative = path.relative_to(workspace)",
+                "cursor = workspace",
+                "for component in relative.parts:",
+                "    cursor = cursor / component",
+                "    if cursor.is_symlink():",
+                "        raise SystemExit(f'mutation path contains symlink {cursor}')",
+                "candidate = path.resolve(strict=False)",
             ]
         )
     else:
@@ -576,6 +587,8 @@ def _runtime_confinement_lines(
                 "        raise SystemExit(f'mutation resolves to protected path {protected}')",
             ]
         )
+    if kind == "mutation":
+        lines.append("path = candidate")
     return lines
 
 
@@ -624,7 +637,6 @@ _BASH_ALLOWED_SIMPLE: Final = frozenset(
         "cut",
         "diff",
         "echo",
-        "file",
         "grep",
         "head",
         "jq",
@@ -742,7 +754,8 @@ def _audit_read_only_bash(command: str) -> str:
             if len(segment) < 2 or segment[1] not in _READ_ONLY_GIT_SUBCOMMANDS:
                 raise UnsupportedTrajectoryTool("Bash uses mutating git command")
             if any(
-                token in {"-O", "--ext-diff", "--textconv"}
+                token.startswith("-O")
+                or token in {"--ext-diff", "--textconv"}
                 or token.startswith("--open-files-in-pager")
                 or token.startswith("--output")
                 for token in segment[2:]
@@ -776,7 +789,13 @@ def _normalize_trusted_verifier_commands(
             raise UnsupportedTrajectoryTool(
                 "trusted verifier commands must be single-line and NUL-free"
             )
-        normalized.add(command.strip())
+        try:
+            command.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise UnsupportedTrajectoryTool(
+                "trusted verifier commands must be valid UTF-8"
+            ) from exc
+        normalized.add(command)
     return frozenset(normalized)
 
 
@@ -807,7 +826,11 @@ def parse_fable_tool_call(
             )
         else:
             timeout = None
-        normalized_command = command.strip()
+        try:
+            command.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise UnsupportedTrajectoryTool("Bash command must be valid UTF-8") from exc
+        normalized_command = command
         trusted = _normalize_trusted_verifier_commands(trusted_verifier_commands)
         operation_type: type[ReadOnlyBashOp] | type[VerifierEvidenceOp]
         if normalized_command in trusted:

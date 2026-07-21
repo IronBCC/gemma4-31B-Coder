@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -409,7 +410,56 @@ def test_exact_injected_verifier_is_typed_evidence(command: str) -> None:
     )
 
     assert operation == VerifierEvidenceOp(command=command)
+    assert operation.command_sha256 == hashlib.sha256(
+        command.encode("utf-8")
+    ).hexdigest()
     assert lower_fable_operation(operation) == command
+
+
+@pytest.mark.parametrize(
+    "changed_command",
+    [
+        " cargo test --offline",
+        "cargo test --offline ",
+        "cargo  test --offline",
+        "cargo test  --offline",
+        "cargo test --offline\r\n",
+        "cargo test --offline\n",
+        "cargo test '--offline'",
+    ],
+)
+def test_trusted_verifier_matching_is_byte_exact(changed_command: str) -> None:
+    with pytest.raises(ValueError, match="ambiguous_bash_mutation"):
+        parse_fable_tool_call(
+            fable_tool_call("Bash", {"command": changed_command}),
+            frozenset(),
+            trusted_verifier_commands=frozenset({"cargo test --offline"}),
+        )
+
+
+def test_exact_trusted_verifier_preserves_leading_and_repeated_spaces() -> None:
+    command = " cargo  test --offline"
+
+    operation = parse_fable_tool_call(
+        fable_tool_call("Bash", {"command": command}),
+        frozenset(),
+        trusted_verifier_commands=frozenset({command}),
+    )
+
+    assert operation == VerifierEvidenceOp(command=command)
+
+
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
+def test_trusted_verifier_inventory_rejects_multiline_commands(
+    line_ending: str,
+) -> None:
+    command = f"cargo test --offline{line_ending}"
+    with pytest.raises(ValueError, match="single-line"):
+        parse_fable_tool_call(
+            fable_tool_call("Bash", {"command": command}),
+            frozenset(),
+            trusted_verifier_commands=frozenset({command}),
+        )
 
 
 def test_read_only_bash_is_typed_separately_from_verifier_evidence() -> None:
@@ -561,6 +611,7 @@ def test_bash_translation_rejects_unsafe_or_semantic_options(
         ("printf -v TARGET value", "ambiguous_bash_mutation"),
         ("git diff --ext-diff", "ambiguous_bash_mutation"),
         ("git grep -O rm parser", "ambiguous_bash_mutation"),
+        ("git grep -Osh parser src", "ambiguous_bash_mutation"),
         ("tree -o src/lib.rs", "ambiguous_bash_mutation"),
     ],
 )
@@ -571,6 +622,25 @@ def test_bash_translation_fails_closed_for_mutation_and_ambiguous_construction(
         translate_fable_tool_call(
             fable_tool_call("Bash", {"command": command}),
             frozenset({"tests/test_contract.py"}),
+        )
+
+
+def test_file_compile_mode_is_proven_mutating_and_rejected(tmp_path: Path) -> None:
+    (tmp_path / "magic").write_text("0 string TEST test-value\n", encoding="utf-8")
+    raw = subprocess.run(
+        ["file", "-C", "-m", "magic"],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert raw.returncode == 0
+    assert (tmp_path / "magic.mgc").is_file()
+
+    with pytest.raises(ValueError, match="ambiguous_bash_mutation"):
+        parse_fable_tool_call(
+            fable_tool_call("Bash", {"command": "file -C -m magic"}),
+            frozenset(),
         )
 
 
@@ -748,6 +818,63 @@ def test_mutation_translation_rejects_hardlink_identity_of_protected_file(
 
     assert result.returncode != 0
     assert protected.read_text(encoding="utf-8") == "SAFE"
+
+
+@pytest.mark.parametrize("tool_name", ["Write", "Edit"])
+def test_mutation_translation_rejects_broken_leaf_symlink_before_io(
+    tmp_path: Path, tool_name: str
+) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-{tool_name.lower()}-outside"
+    outside.mkdir()
+    outside_target = outside / "new.txt"
+    (tmp_path / "alias.py").symlink_to(outside_target)
+    arguments: dict[str, object]
+    if tool_name == "Write":
+        arguments = {"file_path": "alias.py", "content": "PWN"}
+    else:
+        arguments = {
+            "file_path": "alias.py",
+            "old_string": "SAFE",
+            "new_string": "PWN",
+        }
+    command = translate_fable_tool_call(
+        fable_tool_call(tool_name, arguments), frozenset()
+    )
+
+    result = _run_in_testbed(command, tmp_path)
+
+    assert result.returncode != 0
+    assert "symlink" in result.stderr
+    assert not outside_target.exists()
+
+
+@pytest.mark.parametrize("tool_name", ["Write", "Edit"])
+def test_mutation_translation_rejects_any_in_workspace_symlink_component(
+    tmp_path: Path, tool_name: str
+) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    target = real / "target.py"
+    target.write_text("SAFE", encoding="utf-8")
+    (tmp_path / "alias-dir").symlink_to(real, target_is_directory=True)
+    arguments: dict[str, object]
+    if tool_name == "Write":
+        arguments = {"file_path": "alias-dir/target.py", "content": "PWN"}
+    else:
+        arguments = {
+            "file_path": "alias-dir/target.py",
+            "old_string": "SAFE",
+            "new_string": "PWN",
+        }
+    command = translate_fable_tool_call(
+        fable_tool_call(tool_name, arguments), frozenset()
+    )
+
+    result = _run_in_testbed(command, tmp_path)
+
+    assert result.returncode != 0
+    assert "symlink" in result.stderr
+    assert target.read_text(encoding="utf-8") == "SAFE"
 
 
 def test_edit_translation_requires_exact_one_match_without_mutation(

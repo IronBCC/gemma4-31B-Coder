@@ -3489,7 +3489,13 @@ def test_inventory_cli_rename_race_preserves_victim_and_leaves_no_owned_output(
         replay.main(argv)
     assert marker.read_text(encoding="utf-8") == "unchanged"
     assert out.is_symlink()
-    assert not any(path.name.startswith(".out.") for path in tmp_path.iterdir())
+    staging = [path for path in tmp_path.iterdir() if path.name.startswith(".out.")]
+    assert len(staging) == 1
+    assert stat.S_IMODE(staging[0].stat().st_mode) == 0o700
+    assert sorted(path.name for path in staging[0].iterdir()) == [
+        "eligibility.json",
+        "smoke.json",
+    ]
 
 
 def test_inventory_cli_refuses_symlink_output_without_touching_victim(
@@ -3506,6 +3512,35 @@ def test_inventory_cli_refuses_symlink_output_without_touching_victim(
         replay.main(argv)
     assert marker.read_text(encoding="utf-8") == "unchanged"
     assert out.is_symlink()
+
+
+def test_inventory_cli_never_rolls_back_committed_directory_after_path_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv, out, _exclusion = _inventory_cli_fixture(tmp_path, monkeypatch)
+    victim = tmp_path / "victim"
+    victim.mkdir(mode=0o700)
+    marker = victim / "marker"
+    marker.write_text("unchanged", encoding="utf-8")
+    moved = tmp_path / "committed-owned"
+    original_rename = replay._rename_directory_noreplace
+
+    def swap_output_after_commit(
+        parent_fd: int, staging_name: str, output_name: str
+    ) -> None:
+        original_rename(parent_fd, staging_name, output_name)
+        os.rename(output_name, moved.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.symlink(victim, output_name, dir_fd=parent_fd)
+
+    monkeypatch.setattr(replay, "_rename_directory_noreplace", swap_output_after_commit)
+    assert replay.main(argv) == 0
+    assert marker.read_text(encoding="utf-8") == "unchanged"
+    assert out.is_symlink()
+    assert sorted(path.name for path in moved.iterdir()) == [
+        "eligibility.json",
+        "smoke.json",
+    ]
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in moved.iterdir())
 
 
 class FakeRestrictedExecutor:

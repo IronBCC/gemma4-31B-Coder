@@ -4109,36 +4109,6 @@ def _assert_owned_manifest_directory(
         raise ReplayContractError(f"{label} identity changed")
 
 
-def _remove_owned_manifest_directory(
-    parent_fd: int,
-    name: str,
-    directory_fd: int,
-    identity: tuple[int, int],
-    expected_files: Mapping[str, bytes],
-) -> None:
-    for filename, expected in expected_files.items():
-        try:
-            current = _read_bound_file_at(directory_fd, filename)
-        except ReplayContractError:
-            continue
-        if current != expected:
-            continue
-        try:
-            os.unlink(filename, dir_fd=directory_fd)
-        except FileNotFoundError:
-            pass
-    try:
-        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except (FileNotFoundError, OSError):
-        return
-    if stat.S_ISDIR(named.st_mode) and _directory_entry_identity(named) == identity:
-        try:
-            os.rmdir(name, dir_fd=parent_fd)
-            os.fsync(parent_fd)
-        except OSError:
-            pass
-
-
 def _publish_manifest_directory(
     output: Path,
     payloads: Mapping[str, bytes],
@@ -4157,7 +4127,6 @@ def _publish_manifest_directory(
     staging_fd = -1
     staging_name = f".{output_name}.{secrets.token_hex(16)}.staging"
     staging_identity: tuple[int, int] | None = None
-    published = False
     try:
         try:
             fcntl.flock(parent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -4220,34 +4189,11 @@ def _publish_manifest_directory(
             pass
         else:
             raise ReplayContractError("output already exists")
+        # This no-replace rename is the publication linearization point. All
+        # fallible contract validation is complete before it. Once it succeeds,
+        # this process never deletes or path-validates the committed directory.
         _rename_directory_noreplace(parent_fd, staging_name, output_name)
-        published = True
         os.fsync(parent_fd)
-
-        validate_inputs()
-        assert_parent_identity()
-        assert staging_identity is not None
-        _assert_owned_manifest_directory(
-            parent_fd,
-            output_name,
-            staging_fd,
-            staging_identity,
-            label="output directory",
-        )
-        for filename, expected in payloads.items():
-            if _read_bound_file_at(staging_fd, filename) != expected:
-                raise ReplayContractError("published manifest hash mismatch")
-        os.fsync(staging_fd)
-    except Exception:
-        if staging_fd >= 0 and staging_identity is not None:
-            _remove_owned_manifest_directory(
-                parent_fd,
-                output_name if published else staging_name,
-                staging_fd,
-                staging_identity,
-                payloads,
-            )
-        raise
     finally:
         if staging_fd >= 0:
             os.close(staging_fd)

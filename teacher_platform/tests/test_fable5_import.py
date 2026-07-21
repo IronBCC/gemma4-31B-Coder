@@ -5,8 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import stat
 import subprocess
 import sys
+from dataclasses import dataclass
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -18,22 +21,32 @@ from fable5_import import (  # noqa: E402
     DATASET_REVISION,
     EXPECTED_ROWS,
     EXPECTED_TERMINAL_TRAJECTORIES,
+    BuildConfig,
+    ExclusionRecord,
     FableEditOp,
     FableWriteOp,
     ReadOnlyBashOp,
+    ReplayEvidence,
     SOURCE_BYTES,
     SOURCE_LFS_SHA256,
+    SeedContract,
+    SourceMetadata,
     DropReason,
     RowRejected,
     SelectedTrajectory,
     SourceContract,
     VerifierEvidenceOp,
+    build_fable5_pilot,
     canonical_language,
     convert_trajectory,
     lower_fable_operation,
+    normalized_word_13gram_overlap,
     parse_fable_tool_call,
     select_terminal_row,
+    seed_contract_from_git_objects,
+    token_gate,
     translate_fable_tool_call,
+    validate_moonshiner_revision,
     validate_source_messages,
 )
 
@@ -142,6 +155,39 @@ def test_source_contract_rejects_alternate_provenance(
 ) -> None:
     with pytest.raises(TypeError):
         SourceContract(**override)  # type: ignore[arg-type]
+
+
+def test_moonshiner_revision_is_exactly_pinned() -> None:
+    validate_moonshiner_revision("436316e8f86eb136d5ce3ec95a1a6f48c1d7f940")
+    with pytest.raises(ValueError, match="Moonshiner revision mismatch"):
+        validate_moonshiner_revision("main")
+
+
+def test_seed_contract_uses_only_pinned_git_object_inventory() -> None:
+    task_json = json.dumps(
+        {
+            "id": "py-contract",
+            "verify_cmd": "python3 test_contract.py",
+            "test_files": ["test_contract.py"],
+        }
+    ).encode()
+    entries = (
+        ("100644", "blob", "a" * 40, "tasks/seeds/py-contract/task.json"),
+        ("100644", "blob", "b" * 40, "tasks/seeds/py-contract/files/source.py"),
+    )
+
+    contract = seed_contract_from_git_objects("py-contract", task_json, entries)
+
+    assert contract.task == "py-contract"
+    assert contract.verify_cmd == "python3 test_contract.py"
+    assert contract.protected_paths == ("test_contract.py",)
+    assert re.fullmatch(r"[0-9a-f]{64}", contract.fixture_sha256)
+    with pytest.raises(ValueError, match="symlink"):
+        seed_contract_from_git_objects(
+            "py-contract",
+            task_json,
+            (*entries, ("120000", "blob", "c" * 40, "tasks/seeds/py-contract/files/link")),
+        )
 
 
 @pytest.mark.parametrize(
@@ -1470,3 +1516,579 @@ def test_conversion_serializes_parallel_calls_and_pairs_results_by_id() -> None:
         "tool_calls": [],
         "loss": True,
     }
+
+
+@dataclass(frozen=True)
+class FixtureSourceContract:
+    dataset_id: str = DATASET_ID
+    dataset_revision: str = DATASET_REVISION
+    source_lfs_sha256: str = SOURCE_LFS_SHA256
+    source_bytes: int = SOURCE_BYTES
+    expected_rows: int = 1
+    expected_terminal_trajectories: int = 1
+
+
+def pipeline_messages(
+    *,
+    language: str = "python",
+    reads: int = 1,
+    repeated_reads: bool = False,
+    include_edit: bool = True,
+    include_verify: bool = True,
+    problem: str = "Fix the source implementation without changing tests.",
+) -> tuple[list[dict[str, object]], str]:
+    verify_commands = {
+        "python": "python -m pytest -q",
+        "rust": "cargo test --offline",
+        "cpp": "cmake --build build && ctest --test-dir build",
+    }
+    messages: list[dict[str, object]] = [
+        {"role": "system", "content": "Use tools carefully."},
+        {"role": "user", "content": problem},
+    ]
+    assistant_steps = 0
+    for index in range(reads):
+        call_id = f"read-{index}"
+        path_index = 0 if repeated_reads else index
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "Inspect the implementation.",
+                    "tool_calls": [
+                        fable_tool_call(
+                            "Read",
+                            {"file_path": f"src/module_{path_index}.py"},
+                            call_id=call_id,
+                        )
+                    ],
+                },
+                {"role": "tool", "tool_call_id": call_id, "content": "source"},
+            ]
+        )
+        assistant_steps += 1
+    if include_edit:
+        source_paths = {
+            "python": "src/module.py",
+            "rust": "src/lib.rs",
+            "cpp": "src/module.cpp",
+        }
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "Apply the narrow source fix.",
+                    "tool_calls": [
+                        fable_tool_call(
+                            "Write",
+                            {
+                                "file_path": source_paths[language],
+                                "content": "FIXED = True\n",
+                            },
+                            call_id="edit",
+                        )
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "edit", "content": "wrote"},
+            ]
+        )
+        assistant_steps += 1
+    verify_command = verify_commands[language]
+    if include_verify:
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "Run the pinned verifier.",
+                    "tool_calls": [
+                        fable_tool_call(
+                            "Bash",
+                            {"command": verify_command},
+                            call_id="verify",
+                        )
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "verify", "content": "passed"},
+            ]
+        )
+        assistant_steps += 1
+    messages.append({"role": "assistant", "content": "Implemented and verified."})
+    assistant_steps += 1
+    return messages, verify_command
+
+
+def pipeline_row(
+    task: str,
+    *,
+    language: str = "python",
+    category: str = "debug",
+    reads: int = 1,
+    repeated_reads: bool = False,
+    include_edit: bool = True,
+    include_verify: bool = True,
+    problem: str = "Fix the source implementation without changing tests.",
+    **updates: object,
+) -> tuple[dict[str, object], str]:
+    messages, verify_command = pipeline_messages(
+        language=language,
+        reads=reads,
+        repeated_reads=repeated_reads,
+        include_edit=include_edit,
+        include_verify=include_verify,
+        problem=problem,
+    )
+    assistant_steps = sum(message["role"] == "assistant" for message in messages)
+    row = fable_row(
+        task=task,
+        lang=language,
+        category=category,
+        assistant_step=assistant_steps,
+        assistant_steps=assistant_steps,
+        messages=messages,
+        **updates,
+    )
+    return row, verify_command
+
+
+def fixture_build_config(
+    out: Path,
+    rows: list[dict[str, object]],
+    verify_commands: dict[str, str],
+    *,
+    token_counter=lambda _messages: 4_096,
+    exclusions: tuple[ExclusionRecord, ...] = (),
+    skip_replay: bool = True,
+    replay_lookup=None,
+    max_output: int = 0,
+    metadata_only: bool = False,
+) -> BuildConfig:
+    terminal_count = sum(
+        type(row.get("assistant_step")) is int
+        and type(row.get("assistant_steps")) is int
+        and row["assistant_step"] == row["assistant_steps"]
+        for row in rows
+    )
+    contract = FixtureSourceContract(
+        expected_rows=len(rows), expected_terminal_trajectories=terminal_count
+    )
+
+    def seed_contract(task: str) -> SeedContract:
+        return SeedContract(
+            task=task,
+            protected_paths=("tests/test_contract.py",),
+            verify_cmd=verify_commands[task],
+            fixture_sha256=hashlib.sha256(task.encode()).hexdigest(),
+        )
+
+    return BuildConfig(
+        out=out,
+        source_metadata=SourceMetadata(
+            dataset_id=DATASET_ID,
+            dataset_revision=DATASET_REVISION,
+            source_lfs_sha256=SOURCE_LFS_SHA256,
+            source_bytes=SOURCE_BYTES,
+        ),
+        token_counter=token_counter,
+        seed_contract=seed_contract,
+        exclusions=exclusions,
+        replay_lookup=replay_lookup,
+        skip_replay=skip_replay,
+        max_output=max_output,
+        metadata_only=metadata_only,
+        source_contract=contract,
+        workers=2,
+    )
+
+
+def test_token_gate_budget_is_inclusive() -> None:
+    assert token_gate([], lambda _messages: 49_152, max_tokens=49_152) == 49_152
+    with pytest.raises(RowRejected, match="token_budget"):
+        token_gate([], lambda _messages: 49_153, max_tokens=49_152)
+
+
+def test_metadata_drift_fails_before_consuming_rows_or_publishing(
+    tmp_path: Path,
+) -> None:
+    row, verify_command = pipeline_row("py-one")
+    consumed = False
+
+    def rows():
+        nonlocal consumed
+        consumed = True
+        yield row
+
+    config = fixture_build_config(
+        tmp_path / "dataset", [row], {"py-one": verify_command}
+    )
+    config = BuildConfig(
+        **{
+            **config.__dict__,
+            "source_metadata": SourceMetadata(
+                dataset_id=DATASET_ID,
+                dataset_revision="main",
+                source_lfs_sha256=SOURCE_LFS_SHA256,
+                source_bytes=SOURCE_BYTES,
+            ),
+        }
+    )
+
+    with pytest.raises(ValueError, match="dataset_revision"):
+        build_fable5_pilot(rows(), config)
+
+    assert consumed is False
+    assert not config.out.exists()
+
+
+def test_manifest_arithmetic_identity_hashes_and_publish_are_deterministic(
+    tmp_path: Path,
+) -> None:
+    rust, rust_verify = pipeline_row("rs-two", language="rust")
+    python, python_verify = pipeline_row("py-one", language="python")
+    nonterminal = dict(python, task="py-prefix", assistant_step=1)
+    validation = dict(python, task="py-val", split="val")
+    language = dict(python, task="go-drop", lang="go")
+    category = dict(python, task="py-web", category="web")
+    rows = [rust, nonterminal, validation, language, category, python]
+    verify = {"rs-two": rust_verify, "py-one": python_verify}
+    config = fixture_build_config(tmp_path / "a", rows, verify)
+
+    result = build_fable5_pilot(iter(rows), config)
+    reversed_config = fixture_build_config(tmp_path / "b", list(reversed(rows)), verify)
+    reversed_result = build_fable5_pilot(iter(reversed(rows)), reversed_config)
+
+    assert [row["source_instance_id"] for row in result.rows] == ["py-one", "rs-two"]
+    assert [row["instance_id"] for row in result.rows] == sorted(
+        row["instance_id"] for row in result.rows
+    )
+    assert all(row["instance_id"] != row["source_instance_id"] for row in result.rows)
+    assert all(row["source"].endswith(row["instance_id"]) for row in result.rows)
+    assert result.rows == reversed_result.rows
+    manifest = result.manifest
+    assert manifest["streamed"] == sum(
+        manifest[key] for key in manifest["arithmetic_buckets"]
+    )
+    assert manifest["streamed"] == len(rows)
+    assert manifest["nonterminal"] == 1
+    assert manifest["validation"] == 1
+    assert manifest["language_drop"] == 1
+    assert manifest["category_drop"] == 1
+    assert manifest["output"] == 2
+    assert manifest["controls_in_training"] == 0
+    assert manifest["replay_state"] == "pending"
+    assert manifest["output_sha256"] == hashlib.sha256(
+        (config.out / "train.jsonl").read_bytes()
+    ).hexdigest()
+    assert manifest["sidecar_sha256"] == hashlib.sha256(
+        (config.out / "original_terminal_rows.jsonl").read_bytes()
+    ).hexdigest()
+    assert stat.S_IMODE(
+        (config.out / "original_terminal_rows.jsonl").stat().st_mode
+    ) == 0o600
+    assert not (tmp_path / "a.tmp").exists()
+
+
+def test_behavior_gate_rejects_late_reads_repeats_and_missing_verify(
+    tmp_path: Path,
+) -> None:
+    cases = [
+        pipeline_row("late", reads=10),
+        pipeline_row("streak", reads=6),
+        pipeline_row("repeat", reads=2, repeated_reads=True),
+        pipeline_row("no-verify", include_verify=False),
+    ]
+    for index, (row, verify_command) in enumerate(cases):
+        result = build_fable5_pilot(
+            [row],
+            fixture_build_config(
+                tmp_path / f"case-{index}",
+                [row],
+                {str(row["task"]): verify_command},
+            ),
+        )
+        assert result.rows == ()
+        assert result.manifest["behavior_drop"] == 1
+        assert result.rejected[0]["reason"] == "behavior_drop"
+
+
+@pytest.mark.parametrize(
+    ("language", "verify_command"),
+    [
+        ("python", "python3 test_contract.py"),
+        (
+            "python",
+            "env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py' -v",
+        ),
+        ("python", "bash run_verify.sh"),
+        ("rust", "cargo test --offline"),
+        ("rust", "bash run_verify.sh"),
+        ("cpp", "make test"),
+    ],
+)
+def test_behavior_accepts_exact_pinned_language_verifier_forms(
+    tmp_path: Path, language: str, verify_command: str
+) -> None:
+    row, _ = pipeline_row(f"{language}-verify", language=language)
+    verify_call = next(
+        message["tool_calls"][0]
+        for message in row["messages"]
+        if message["role"] == "assistant"
+        and message.get("tool_calls")
+        and message["tool_calls"][0]["id"] == "verify"
+    )
+    verify_call["function"]["arguments"] = {"command": verify_command}
+
+    result = build_fable5_pilot(
+        [row],
+        fixture_build_config(
+            tmp_path / f"{language}-{hashlib.sha256(verify_command.encode()).hexdigest()[:8]}",
+            [row],
+            {f"{language}-verify": verify_command},
+        ),
+    )
+
+    assert len(result.rows) == 1
+
+
+def test_behavior_rejects_non_source_mutation(tmp_path: Path) -> None:
+    row, verify = pipeline_row("py-readme")
+    edit_call = next(
+        message["tool_calls"][0]
+        for message in row["messages"]
+        if message["role"] == "assistant"
+        and message.get("tool_calls")
+        and message["tool_calls"][0]["id"] == "edit"
+    )
+    edit_call["function"]["arguments"]["file_path"] = "README.md"
+
+    result = build_fable5_pilot(
+        [row],
+        fixture_build_config(
+            tmp_path / "dataset", [row], {"py-readme": verify}
+        ),
+    )
+
+    assert result.rows == ()
+    assert "no_source_edit" in result.rejected[0]["detail"]
+
+
+def test_manifest_counts_malformed_steps_as_structure_not_prefix(
+    tmp_path: Path,
+) -> None:
+    row, verify = pipeline_row("py-malformed-step")
+    row["assistant_step"] = True
+    contract = FixtureSourceContract(expected_rows=1, expected_terminal_trajectories=0)
+    config = fixture_build_config(
+        tmp_path / "dataset", [row], {"py-malformed-step": verify}
+    )
+    config = BuildConfig(**{**config.__dict__, "source_contract": contract})
+
+    result = build_fable5_pilot([row], config)
+
+    assert result.manifest["structure_drop"] == 1
+    assert result.manifest["nonterminal"] == 0
+
+
+def test_manifest_has_stable_rejection_reason_counts(tmp_path: Path) -> None:
+    row, verify = pipeline_row("py-no-verify", include_verify=False)
+
+    result = build_fable5_pilot(
+        [row],
+        fixture_build_config(
+            tmp_path / "dataset", [row], {"py-no-verify": verify}
+        ),
+    )
+
+    assert result.manifest["rejection_reason_counts"] == {"behavior_drop": 1}
+
+
+def test_overlap_gate_handles_threshold_and_short_texts() -> None:
+    candidate = " ".join(f"word{index}" for index in range(20))
+    eighty_percent = " ".join(
+        [*(f"word{index}" for index in range(19)), "changed-last"]
+    )
+    below = " ".join(
+        [*(f"word{index}" for index in range(17)), "changed-a", "changed-b", "changed-c"]
+    )
+
+    assert normalized_word_13gram_overlap(candidate, eighty_percent) >= 0.8
+    assert normalized_word_13gram_overlap(candidate, below) < 0.8
+    assert normalized_word_13gram_overlap("Short SAME text", "short same text") == 1.0
+    assert normalized_word_13gram_overlap("short one", "short two") == 0.0
+
+
+def test_exact_id_and_content_exclusions_are_decontamination_drops(
+    tmp_path: Path,
+) -> None:
+    by_id, verify_id = pipeline_row("excluded-id")
+    by_text, verify_text = pipeline_row("excluded-text", problem="Exact held out prompt")
+    exclusions = (
+        ExclusionRecord(
+            instance_ids=frozenset({"excluded-id"}),
+            texts=("Exact held out prompt",),
+        ),
+    )
+    rows = [by_text, by_id]
+    result = build_fable5_pilot(
+        rows,
+        fixture_build_config(
+            tmp_path / "dataset",
+            rows,
+            {"excluded-id": verify_id, "excluded-text": verify_text},
+            exclusions=exclusions,
+        ),
+    )
+
+    assert result.rows == ()
+    assert result.manifest["contamination_drop"] == 2
+
+
+def test_content_dedup_and_task_representative_are_input_order_independent(
+    tmp_path: Path,
+) -> None:
+    better, verify = pipeline_row("same-task", reads=1)
+    worse, _ = pipeline_row("same-task", reads=2)
+    rows = [worse, better]
+    result = build_fable5_pilot(
+        rows,
+        fixture_build_config(
+            tmp_path / "dataset", rows, {"same-task": verify}
+        ),
+    )
+
+    assert len(result.rows) == 1
+    assert result.manifest["duplicate_drop"] == 1
+    assert result.manifest["representative_version"] == 1
+    assert result.manifest["representatives"][0]["first_edit_index"] == 2
+
+
+def test_token_drop_and_max_output_happen_after_all_quality_gates(
+    tmp_path: Path,
+) -> None:
+    first, first_verify = pipeline_row("a-task")
+    second, second_verify = pipeline_row("b-task")
+    over, over_verify = pipeline_row("c-over")
+    counts = {"a-task": 49_152, "b-task": 1, "c-over": 49_153}
+
+    def count(messages: list[dict[str, object]]) -> int:
+        problem = messages[1]["content"]
+        for task, value in counts.items():
+            if task.replace("-task", "") in str(problem):
+                return value
+        return 49_153 if "c-over" in str(problem) else 1
+
+    # Use task-specific problem text so the injected exact counter can identify rows.
+    first, first_verify = pipeline_row("a-task", problem="a task")
+    second, second_verify = pipeline_row("b-task", problem="b task")
+    over, over_verify = pipeline_row("c-over", problem="c-over")
+    counts_by_prompt = {"a task": 49_152, "b task": 1, "c-over": 49_153}
+
+    def exact_count(messages):
+        text = str(messages[1]["content"])
+        return next(value for key, value in counts_by_prompt.items() if key in text)
+
+    rows = [over, second, first]
+    result = build_fable5_pilot(
+        rows,
+        fixture_build_config(
+            tmp_path / "dataset",
+            rows,
+            {
+                "a-task": first_verify,
+                "b-task": second_verify,
+                "c-over": over_verify,
+            },
+            token_counter=exact_count,
+            max_output=1,
+        ),
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0]["source_instance_id"] == "a-task"
+    assert result.manifest["token_drop"] == 1
+    assert result.manifest["output_limit_drop"] == 1
+    assert result.manifest["token_histogram"] == {"49152": 1}
+
+
+def test_replay_gate_requires_exact_noncontrol_hash_bound_evidence(
+    tmp_path: Path,
+) -> None:
+    row, verify = pipeline_row("py-replay")
+
+    def replay_lookup(candidate):
+        return ReplayEvidence(
+            trajectory_id=candidate.trajectory_id,
+            source_terminal_sha256=candidate.source_terminal_sha256,
+            candidate_content_sha256=candidate.content_sha256,
+            fixture_sha256=candidate.seed.fixture_sha256,
+            resolved=True,
+            control=False,
+            namespace="candidate",
+        )
+
+    result = build_fable5_pilot(
+        [row],
+        fixture_build_config(
+            tmp_path / "pass",
+            [row],
+            {"py-replay": verify},
+            skip_replay=False,
+            replay_lookup=replay_lookup,
+        ),
+    )
+    assert len(result.rows) == 1
+    assert result.manifest["replay_state"] == "verified"
+    assert result.rows[0]["replay_pending"] is False
+
+    def control_lookup(candidate):
+        evidence = replay_lookup(candidate)
+        return ReplayEvidence(**{**evidence.__dict__, "control": True})
+
+    rejected = build_fable5_pilot(
+        [row],
+        fixture_build_config(
+            tmp_path / "fail",
+            [row],
+            {"py-replay": verify},
+            skip_replay=False,
+            replay_lookup=control_lookup,
+        ),
+    )
+    assert rejected.rows == ()
+    assert rejected.manifest["replay_drop"] == 1
+
+
+def test_failed_publish_leaves_no_partial_final_dataset(tmp_path: Path) -> None:
+    row, verify = pipeline_row("py-fail")
+
+    def fail_counter(_messages):
+        raise RuntimeError("injected token failure")
+
+    config = fixture_build_config(
+        tmp_path / "dataset",
+        [row],
+        {"py-fail": verify},
+        token_counter=fail_counter,
+    )
+    with pytest.raises(RuntimeError, match="injected token failure"):
+        build_fable5_pilot([row], config)
+    assert not config.out.exists()
+    assert not list(tmp_path.glob(".dataset.*.tmp"))
+
+
+def test_metadata_only_validates_raw_arithmetic_without_training_jsonl(
+    tmp_path: Path,
+) -> None:
+    row, verify = pipeline_row("py-meta")
+    config = fixture_build_config(
+        tmp_path / "metadata",
+        [row],
+        {"py-meta": verify},
+        metadata_only=True,
+    )
+
+    result = build_fable5_pilot([row], config)
+
+    assert result.manifest["metadata_only"] is True
+    assert result.manifest["streamed"] == 1
+    assert not (config.out / "train.jsonl").exists()
+    assert (config.out / "manifest.json").exists()

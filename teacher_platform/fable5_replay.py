@@ -29,6 +29,7 @@ if __package__:  # Support both ``python -m teacher_platform...`` and local test
         FableWriteOp,
         ReadOnlyBashOp,
         VerifierEvidenceOp,
+        _rejected_mutation_family,
         parse_fable_tool_call,
     )
 else:  # pragma: no cover - the branch is exercised by local tests.
@@ -38,6 +39,7 @@ else:  # pragma: no cover - the branch is exercised by local tests.
         FableWriteOp,
         ReadOnlyBashOp,
         VerifierEvidenceOp,
+        _rejected_mutation_family,
         parse_fable_tool_call,
     )
 
@@ -334,9 +336,15 @@ def _validate_archive(
     if set(records) != set(git_entries):
         raise ReplayContractError("archive file set does not match pinned Git tree")
     for path, record in records.items():
-        git_mode, _ = git_entries[path]
+        git_mode, git_object_id = git_entries[path]
         if record.mode != git_mode:
             raise ReplayContractError("archive mode does not match pinned Git tree")
+        algorithm = hashlib.sha1 if len(git_object_id) == 40 else hashlib.sha256
+        blob_header = b"blob " + str(len(record.data)).encode("ascii") + b"\0"
+        if algorithm(blob_header + record.data).hexdigest() != git_object_id:
+            raise ReplayContractError(
+                "archive bytes do not match pinned Git blob object ID"
+            )
     return tuple(records[path] for path in sorted(records, key=lambda p: p.encode()))
 
 
@@ -597,6 +605,14 @@ def _operation_payload(operation: FableWriteOp | FableEditOp) -> dict[str, Any]:
     return {"type": type(operation).__name__, **dataclasses.asdict(operation)}
 
 
+def _operation_sha256(
+    operations: Sequence[FableWriteOp | FableEditOp],
+) -> str:
+    return _sha256(
+        _canonical_json([_operation_payload(operation) for operation in operations])
+    )
+
+
 def canonical_mutation_plan(
     messages: Sequence[Mapping[str, Any]],
     protected_paths: frozenset[str],
@@ -634,10 +650,9 @@ def canonical_mutation_plan(
             else:
                 # Read/Glob/Grep are observation-only and never affect reconstruction.
                 continue
-    payload = [_operation_payload(operation) for operation in operations]
     return MutationPlan(
         operations=tuple(operations),
-        operation_sha256=_sha256(_canonical_json(payload)),
+        operation_sha256=_operation_sha256(operations),
         verifier_sha256=verifier_sha,
         verifier_evidence_count=verifier_count,
     )
@@ -650,77 +665,290 @@ def _candidate_relative(path: str) -> str:
     return _relative_path(path.removeprefix(prefix), field_name="mutation path")
 
 
-def _revalidate_ancestors(root: Path, relative: str) -> Path:
-    root_stat = os.stat(root, follow_symlinks=False)
-    if not stat.S_ISDIR(root_stat.st_mode) or root.is_symlink():
-        raise ReplayContractError("candidate root is not a real directory")
-    cursor = root
+def _is_rejected_mutation_path(relative: str) -> bool:
     parts = PurePosixPath(relative).parts
-    for part in parts[:-1]:
-        cursor = cursor / part
-        try:
-            item = os.stat(cursor, follow_symlinks=False)
-        except FileNotFoundError as exc:
-            raise ReplayContractError("mutation parent does not exist") from exc
-        if not stat.S_ISDIR(item.st_mode) or cursor.is_symlink():
-            raise ReplayContractError("mutation ancestor is a symlink or special file")
-    target = root.joinpath(*parts)
-    try:
-        target.relative_to(root)
-    except ValueError as exc:
-        raise ReplayContractError("mutation target escapes candidate root") from exc
-    return target
+    return any(
+        _rejected_mutation_family(
+            part,
+            basename=index == len(parts) - 1,
+        )
+        for index, part in enumerate(parts)
+    )
 
 
-def _target_stat(target: Path) -> os.stat_result | None:
-    try:
-        item = os.stat(target, follow_symlinks=False)
-    except FileNotFoundError:
-        return None
-    if stat.S_ISLNK(item.st_mode):
-        raise ReplayContractError("mutation target is a symlink")
-    if not stat.S_ISREG(item.st_mode):
-        raise ReplayContractError("mutation target is a special file")
-    if item.st_nlink != 1:
-        raise ReplayContractError("mutation target has a hardlink alias")
+def _validate_mutation_plan(contract: SeedContract, plan: MutationPlan) -> None:
+    if type(plan) is not MutationPlan:
+        raise ReplayContractError("mutation plan must use the exact canonical type")
+    if plan.verifier_sha256 != contract.verifier_sha256:
+        raise ReplayContractError("mutation plan verifier does not match seed contract")
+    expected_protected = tuple(
+        sorted(f"/testbed/{path}" for path in contract.protected_paths)
+    )
+    for operation in plan.operations:
+        if type(operation) not in {FableWriteOp, FableEditOp}:
+            raise ReplayContractError(
+                "mutation plan requires an exact Write/Edit operation type"
+            )
+        if operation.protected_paths != expected_protected:
+            raise ReplayContractError("operation protected_paths binding mismatch")
+        relative = _candidate_relative(operation.path)
+        if _is_rejected_mutation_path(relative):
+            raise ReplayContractError(
+                f"rejected mutation path family: {relative}"
+            )
+    if _operation_sha256(plan.operations) != plan.operation_sha256:
+        raise ReplayContractError("mutation plan operation hash mismatch")
+
+
+_DIRECTORY_OPEN_FLAGS: Final = (
+    os.O_RDONLY
+    | os.O_DIRECTORY
+    | os.O_NOFOLLOW
+    | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+def _identity(item: os.stat_result) -> tuple[int, int, int, int]:
+    return (item.st_dev, item.st_ino, item.st_mode, item.st_nlink)
+
+
+def _validate_directory_descriptor(descriptor: int, context: str) -> os.stat_result:
+    item = os.fstat(descriptor)
+    if not stat.S_ISDIR(item.st_mode) or item.st_nlink < 1:
+        raise ReplayContractError(f"{context} is not a stable directory")
     return item
 
 
-def _check_protected_aliases(root: Path, target: Path, contract: SeedContract) -> None:
+def _open_directory_path(path: Path, context: str) -> tuple[int, os.stat_result]:
+    try:
+        before = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISDIR(before.st_mode):
+            raise ReplayContractError(f"{context} is a symlink or special path")
+        descriptor = os.open(path, _DIRECTORY_OPEN_FLAGS)
+    except ReplayContractError:
+        raise
+    except OSError as exc:
+        raise ReplayContractError(f"cannot open confined {context}") from exc
+    try:
+        opened = _validate_directory_descriptor(descriptor, context)
+        if _identity(opened) != _identity(before):
+            raise ReplayContractError(f"{context} identity changed before open")
+        return descriptor, opened
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_directory_at(
+    parent_descriptor: int, component: str, context: str
+) -> tuple[int, os.stat_result]:
+    try:
+        descriptor = os.open(
+            component,
+            _DIRECTORY_OPEN_FLAGS,
+            dir_fd=parent_descriptor,
+        )
+    except OSError as exc:
+        raise ReplayContractError(f"{context} is missing, linked, or not a directory") from exc
+    try:
+        return descriptor, _validate_directory_descriptor(descriptor, context)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _walk_directories(
+    root_descriptor: int,
+    components: Sequence[str],
+) -> tuple[int, tuple[tuple[str, tuple[int, int, int, int]], ...]]:
+    current = os.dup(root_descriptor)
+    identities: list[tuple[str, tuple[int, int, int, int]]] = []
+    try:
+        for component in components:
+            child, child_stat = _open_directory_at(
+                current, component, f"mutation ancestor {component!r}"
+            )
+            os.close(current)
+            current = child
+            identities.append((component, _identity(child_stat)))
+        return current, tuple(identities)
+    except Exception:
+        os.close(current)
+        raise
+
+
+def _target_stat_at(
+    parent_descriptor: int,
+    basename: str,
+    *,
+    context: str = "mutation target",
+) -> os.stat_result | None:
+    try:
+        item = os.stat(
+            basename,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ReplayContractError(f"cannot inspect confined {context}") from exc
+    if stat.S_ISLNK(item.st_mode):
+        raise ReplayContractError(f"{context} is a symlink")
+    if not stat.S_ISREG(item.st_mode):
+        raise ReplayContractError(f"{context} is a special file")
+    if item.st_nlink != 1:
+        raise ReplayContractError(f"{context} has a hardlink alias")
+    return item
+
+
+@dataclass(frozen=True)
+class _MutationBoundary:
+    root: Path
+    relative: str
+    parent_components: tuple[str, ...]
+    basename: str
+    root_descriptor: int
+    parent_descriptor: int
+    root_identity: tuple[int, int, int, int]
+    ancestor_identities: tuple[tuple[str, tuple[int, int, int, int]], ...]
+    parent_identity: tuple[int, int, int, int]
+    target_before: os.stat_result | None
+
+    def close(self) -> None:
+        os.close(self.parent_descriptor)
+        os.close(self.root_descriptor)
+
+
+def _open_mutation_boundary(root: Path, relative: str) -> _MutationBoundary:
+    parts = PurePosixPath(relative).parts
+    root_descriptor, root_stat = _open_directory_path(root, "candidate root")
+    try:
+        parent_descriptor, ancestor_identities = _walk_directories(
+            root_descriptor, parts[:-1]
+        )
+        try:
+            parent_stat = _validate_directory_descriptor(
+                parent_descriptor, "mutation parent"
+            )
+            target_before = _target_stat_at(parent_descriptor, parts[-1])
+            return _MutationBoundary(
+                root=root,
+                relative=relative,
+                parent_components=tuple(parts[:-1]),
+                basename=parts[-1],
+                root_descriptor=root_descriptor,
+                parent_descriptor=parent_descriptor,
+                root_identity=_identity(root_stat),
+                ancestor_identities=ancestor_identities,
+                parent_identity=_identity(parent_stat),
+                target_before=target_before,
+            )
+        except Exception:
+            os.close(parent_descriptor)
+            raise
+    except Exception:
+        os.close(root_descriptor)
+        raise
+
+
+def _stat_relative_under_root(
+    root_descriptor: int, relative: str, *, context: str
+) -> os.stat_result:
+    parts = PurePosixPath(relative).parts
+    parent_descriptor, _ = _walk_directories(root_descriptor, parts[:-1])
+    try:
+        item = _target_stat_at(parent_descriptor, parts[-1], context=context)
+        if item is None:
+            raise ReplayContractError(f"{context} is missing")
+        return item
+    finally:
+        os.close(parent_descriptor)
+
+
+def _check_protected_aliases(
+    boundary: _MutationBoundary, contract: SeedContract
+) -> None:
+    if boundary.relative in contract.protected_paths:
+        raise ReplayContractError("mutation targets a protected path")
     for protected in contract.protected_paths:
-        protected_target = root.joinpath(*PurePosixPath(protected).parts)
-        protected_stat = _target_stat(protected_target)
-        target_stat = _target_stat(target)
-        if target == protected_target:
-            raise ReplayContractError("mutation targets a protected path")
+        protected_stat = _stat_relative_under_root(
+            boundary.root_descriptor,
+            protected,
+            context=f"protected path {protected!r}",
+        )
         if (
-            target_stat is not None
-            and protected_stat is not None
-            and (target_stat.st_dev, target_stat.st_ino)
+            boundary.target_before is not None
+            and (boundary.target_before.st_dev, boundary.target_before.st_ino)
             == (protected_stat.st_dev, protected_stat.st_ino)
         ):
             raise ReplayContractError("mutation targets a protected alias")
 
 
-def _open_mutation_target(
-    target: Path, before: os.stat_result | None, *, create: bool
-) -> int:
-    flags = os.O_RDWR | os.O_NOFOLLOW
+def _confirm_mutation_boundary(boundary: _MutationBoundary) -> None:
+    if _identity(os.fstat(boundary.root_descriptor)) != boundary.root_identity:
+        raise ReplayContractError("candidate root descriptor identity changed")
+    if _identity(os.fstat(boundary.parent_descriptor)) != boundary.parent_identity:
+        raise ReplayContractError("mutation parent descriptor identity changed")
+
+    fresh_root, fresh_root_stat = _open_directory_path(
+        boundary.root, "candidate root"
+    )
+    try:
+        if _identity(fresh_root_stat) != boundary.root_identity:
+            raise ReplayContractError("candidate root path identity changed")
+        fresh_parent, fresh_identities = _walk_directories(
+            fresh_root, boundary.parent_components
+        )
+        try:
+            if fresh_identities != boundary.ancestor_identities:
+                raise ReplayContractError("mutation ancestor identity changed")
+            if _identity(os.fstat(fresh_parent)) != boundary.parent_identity:
+                raise ReplayContractError("mutation parent path identity changed")
+        finally:
+            os.close(fresh_parent)
+    finally:
+        os.close(fresh_root)
+
+    target_now = _target_stat_at(
+        boundary.parent_descriptor,
+        boundary.basename,
+    )
+    if (target_now is None) != (boundary.target_before is None):
+        raise ReplayContractError("mutation target existence changed before open")
+    if target_now is not None and boundary.target_before is not None:
+        if _identity(target_now) != _identity(boundary.target_before):
+            raise ReplayContractError("mutation target identity changed before open")
+
+
+def _open_mutation_target(boundary: _MutationBoundary, *, create: bool) -> int:
+    _confirm_mutation_boundary(boundary)
+    flags = os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     if create:
         flags |= os.O_CREAT | os.O_EXCL
-    descriptor = os.open(target, flags, 0o666)
-    opened = os.fstat(descriptor)
-    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+    try:
+        descriptor = os.open(
+            boundary.basename,
+            flags,
+            0o666,
+            dir_fd=boundary.parent_descriptor,
+        )
+    except OSError as exc:
+        raise ReplayContractError("cannot open confined mutation target") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise ReplayContractError(
+                "opened mutation target is not a unique regular file"
+            )
+        if boundary.target_before is not None and _identity(opened) != _identity(
+            boundary.target_before
+        ):
+            raise ReplayContractError("mutation target identity changed before open")
+        return descriptor
+    except Exception:
         os.close(descriptor)
-        raise ReplayContractError("opened mutation target is not a unique regular file")
-    if before is not None and (
-        opened.st_dev,
-        opened.st_ino,
-        opened.st_nlink,
-    ) != (before.st_dev, before.st_ino, before.st_nlink):
-        os.close(descriptor)
-        raise ReplayContractError("mutation target identity changed before open")
-    return descriptor
+        raise
 
 
 def _apply_operation(
@@ -731,42 +959,46 @@ def _apply_operation(
     relative = _candidate_relative(operation.path)
     if relative in contract.protected_paths:
         raise ReplayContractError("mutation targets a protected path")
-    target = _revalidate_ancestors(root, relative)
-    _check_protected_aliases(root, target, contract)
-    before = _target_stat(target)
-    if isinstance(operation, FableEditOp) and before is None:
-        raise ReplayContractError("edit target does not exist")
-    descriptor = _open_mutation_target(
-        target, before, create=isinstance(operation, FableWriteOp) and before is None
-    )
+    boundary = _open_mutation_boundary(root, relative)
     try:
-        if isinstance(operation, FableWriteOp):
-            if before is None:
-                os.fchmod(descriptor, 0o644)
-            data = operation.content.encode("utf-8")
-        else:
-            chunks: list[bytes] = []
-            while chunk := os.read(descriptor, 1024 * 1024):
-                chunks.append(chunk)
-            data = b"".join(chunks)
-            old = operation.old_string.encode("utf-8")
-            new = operation.new_string.encode("utf-8")
-            matches = data.count(old)
-            if operation.replace_all and matches < 1:
-                raise ReplayContractError("edit expected at least one match")
-            if not operation.replace_all and matches != 1:
-                raise ReplayContractError(
-                    f"edit expected exactly one match, found {matches}"
-                )
-            data = data.replace(old, new)
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        os.ftruncate(descriptor, 0)
-        view = memoryview(data)
-        while view:
-            written = os.write(descriptor, view)
-            view = view[written:]
+        _check_protected_aliases(boundary, contract)
+        before = boundary.target_before
+        if isinstance(operation, FableEditOp) and before is None:
+            raise ReplayContractError("edit target does not exist")
+        descriptor = _open_mutation_target(
+            boundary,
+            create=isinstance(operation, FableWriteOp) and before is None,
+        )
+        try:
+            if isinstance(operation, FableWriteOp):
+                if before is None:
+                    os.fchmod(descriptor, 0o644)
+                data = operation.content.encode("utf-8")
+            else:
+                chunks: list[bytes] = []
+                while chunk := os.read(descriptor, 1024 * 1024):
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+                old = operation.old_string.encode("utf-8")
+                new = operation.new_string.encode("utf-8")
+                matches = data.count(old)
+                if operation.replace_all and matches < 1:
+                    raise ReplayContractError("edit expected at least one match")
+                if not operation.replace_all and matches != 1:
+                    raise ReplayContractError(
+                        f"edit expected exactly one match, found {matches}"
+                    )
+                data = data.replace(old, new)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.ftruncate(descriptor, 0)
+            view = memoryview(data)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+        finally:
+            os.close(descriptor)
     finally:
-        os.close(descriptor)
+        boundary.close()
 
 
 def _copy_fixture(contract: SeedContract, destination: Path) -> tuple[_InventoryFile, ...]:
@@ -798,8 +1030,7 @@ def reconstruct_candidate(
 ) -> CandidateState:
     """Apply only typed declarative mutations to a fresh seed copy."""
 
-    if plan.verifier_sha256 != contract.verifier_sha256:
-        raise ReplayContractError("mutation plan verifier does not match seed contract")
+    _validate_mutation_plan(contract, plan)
     destination = Path(destination)
     baseline = _copy_fixture(contract, destination)
     baseline_by_path = {record.path: record for record in baseline}
@@ -830,6 +1061,8 @@ def reconstruct_candidate(
         raise ReplayContractError("empty candidate diff")
     if any(path in contract.protected_paths for path in changed):
         raise ReplayContractError("candidate diff contains a protected path")
+    if any(_is_rejected_mutation_path(path) for path in changed):
+        raise ReplayContractError("candidate diff contains a rejected path family")
     diff_payload = []
     for path in changed:
         before = baseline_by_path.get(path)
@@ -839,10 +1072,18 @@ def reconstruct_candidate(
                 "path": path,
                 "before": None
                 if before is None
-                else {"mode": before.mode, "length": len(before.data), "sha256": _sha256(before.data)},
+                else {
+                    "mode": before.mode,
+                    "length": len(before.data),
+                    "sha256": _sha256(before.data),
+                },
                 "after": None
                 if after is None
-                else {"mode": after.mode, "length": len(after.data), "sha256": _sha256(after.data)},
+                else {
+                    "mode": after.mode,
+                    "length": len(after.data),
+                    "sha256": _sha256(after.data),
+                },
             }
         )
     return CandidateState(
@@ -856,10 +1097,12 @@ def reconstruct_candidate(
     )
 
 
-def _patch_path(value: str) -> str:
+def _patch_path(value: str, *, strip_transport_prefix: bool) -> str:
     if value == "/dev/null":
         return value
-    if value.startswith("a/") or value.startswith("b/"):
+    if strip_transport_prefix and (
+        value.startswith("a/") or value.startswith("b/")
+    ):
         value = value[2:]
     return _relative_path(value, field_name="patch path")
 
@@ -910,13 +1153,17 @@ def _parse_reference_patch(
         if match is None:
             raise ReplayContractError("reference_patch_invalid_path_header")
         old_header, new_header = match.groups()
-        old_path = _patch_path(old_header)
-        new_path = _patch_path(new_header)
+        old_path = _patch_path(old_header, strip_transport_prefix=False)
+        new_path = _patch_path(new_header, strip_transport_prefix=False)
         markers = [line for line in section.splitlines() if line.startswith(("--- ", "+++ "))]
         if len(markers) < 2:
             raise ReplayContractError("reference_patch_mode_only")
-        parsed_old = _patch_path(markers[0][4:].split("\t", 1)[0])
-        parsed_new = _patch_path(markers[1][4:].split("\t", 1)[0])
+        parsed_old = _patch_path(
+            markers[0][4:].split("\t", 1)[0], strip_transport_prefix=True
+        )
+        parsed_new = _patch_path(
+            markers[1][4:].split("\t", 1)[0], strip_transport_prefix=True
+        )
         if parsed_old not in {old_path, "/dev/null"} or parsed_new not in {
             new_path,
             "/dev/null",

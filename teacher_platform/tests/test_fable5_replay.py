@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import io
 import json
@@ -15,6 +16,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import fable5_replay as replay  # noqa: E402
 from fable5_import import (  # noqa: E402
     DATASET_REVISION,
     FableEditOp,
@@ -63,6 +65,12 @@ def _patch(target: str = "src.py") -> bytes:
     ).encode()
 
 
+def _git_blob_oid(data: bytes) -> str:
+    return hashlib.sha1(
+        b"blob " + str(len(data)).encode() + b"\0" + data
+    ).hexdigest()
+
+
 def _archive(
     *,
     task_json: bytes | None = None,
@@ -107,11 +115,24 @@ def _tree_entries(
     extra: tuple[tuple[str, str, str, str], ...] = (),
 ) -> bytes:
     prefix = f"tasks/seeds/{TASK}"
+    task_json = _task_json()
+    patch = _patch()
+
     rows = [
-        ("100644", "blob", "1" * 40, f"{prefix}/task.json"),
-        ("100644", "blob", "2" * 40, f"{prefix}/reference_fix.patch"),
-        (f"100{source_mode:o}", "blob", "3" * 40, f"{prefix}/files/src.py"),
-        ("100644", "blob", "4" * 40, f"{prefix}/files/test_src.py"),
+        ("100644", "blob", _git_blob_oid(task_json), f"{prefix}/task.json"),
+        ("100644", "blob", _git_blob_oid(patch), f"{prefix}/reference_fix.patch"),
+        (
+            f"100{source_mode:o}",
+            "blob",
+            _git_blob_oid(b"old\n"),
+            f"{prefix}/files/src.py",
+        ),
+        (
+            "100644",
+            "blob",
+            _git_blob_oid(b"assert True\n"),
+            f"{prefix}/files/test_src.py",
+        ),
         *extra,
     ]
     return b"".join(
@@ -123,7 +144,7 @@ def _tree_entries(
 class FakeGit:
     def __init__(self, archive: bytes, *, tree_entries: bytes | None = None) -> None:
         self.archive = archive
-        self.tree_entries = tree_entries or _tree_entries()
+        self.tree_entries = tree_entries or _tree_entries_from_archive(archive)
         self.calls: list[tuple[str, ...]] = []
 
     def __call__(self, argv: tuple[str, ...]) -> bytes:
@@ -160,6 +181,26 @@ class FakeGit:
         raise AssertionError(f"unexpected Git command: {argv!r}")
 
 
+def _tree_entries_from_archive(archive_bytes: bytes) -> bytes:
+    prefix = f"tasks/seeds/{TASK}/"
+    rows: list[tuple[str, str, str, str]] = []
+    with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
+        for member in archive:
+            if not member.isreg():
+                continue
+            handle = archive.extractfile(member)
+            assert handle is not None
+            data = handle.read()
+            oid = _git_blob_oid(data)
+            mode = "100755" if member.mode & 0o111 else "100644"
+            rows.append((mode, "blob", oid, member.name))
+    rows = [row for row in rows if row[3].startswith(prefix)]
+    return b"".join(
+        f"{mode} {kind} {oid}\t{path}".encode() + b"\0"
+        for mode, kind, oid, path in rows
+    )
+
+
 def _source(archive: bytes | None = None, *, tree_entries: bytes | None = None) -> GitSeedSource:
     return GitSeedSource(
         Path("/immutable/moonshiner.git"),
@@ -186,6 +227,14 @@ def _messages(*calls: dict[str, object]) -> list[dict[str, object]]:
         {"role": "user", "content": "fix it"},
         {"role": "assistant", "content": "plan", "tool_calls": list(calls)},
     ]
+
+
+def _plan_for(contract, *calls: dict[str, object]) -> MutationPlan:
+    return canonical_mutation_plan(
+        _messages(*calls),
+        frozenset(contract.protected_paths),
+        contract.verify_cmd,
+    )
 
 
 def test_git_seed_source_requires_the_pinned_commit() -> None:
@@ -257,10 +306,7 @@ def test_seed_contract_rejects_invalid_required_fields(
 
 def test_materialization_preserves_file_mode_and_hashes_bytes(tmp_path: Path) -> None:
     first = materialize_seed(
-        _source(
-            _archive(source=b"\xef\xbb\xbfcrlf\r\n", source_mode=0o755),
-            tree_entries=_tree_entries(source_mode=0o755),
-        ),
+        _source(_archive(source=b"\xef\xbb\xbfcrlf\r\n", source_mode=0o755)),
         TASK,
         tmp_path / "seed",
     )
@@ -269,10 +315,7 @@ def test_materialization_preserves_file_mode_and_hashes_bytes(tmp_path: Path) ->
 
     other_root = tmp_path / "other"
     second = materialize_seed(
-        _source(
-            _archive(source=b"\xef\xbb\xbfcrlf\n", source_mode=0o755),
-            tree_entries=_tree_entries(source_mode=0o755),
-        ),
+        _source(_archive(source=b"\xef\xbb\xbfcrlf\n", source_mode=0o755)),
         TASK,
         other_root,
     )
@@ -293,6 +336,16 @@ def test_inventory_hash_frames_sorted_path_mode_length_and_raw_bytes(tmp_path: P
         digest.update(len(data).to_bytes(8, "big"))
         digest.update(data)
     assert contract.inventory_sha256 == digest.hexdigest()
+
+
+def test_archive_bytes_must_match_pinned_git_blob_ids(tmp_path: Path) -> None:
+    archive = _archive()
+    entries = _tree_entries_from_archive(archive)
+    entries = entries.replace(_git_blob_oid(b"old\n").encode(), b"0" * 40, 1)
+    with pytest.raises(ReplayContractError, match="blob object ID"):
+        materialize_seed(
+            _source(archive, tree_entries=entries), TASK, tmp_path / "seed"
+        )
 
 
 @pytest.mark.parametrize(
@@ -365,7 +418,7 @@ def test_archive_rejects_noncanonical_empty_path_components(tmp_path: Path) -> N
         extra=((
             "100644",
             "blob",
-            "5" * 40,
+            _git_blob_oid(b"x"),
             f"tasks/seeds/{TASK}/files/pkg/extra.py",
         ),)
     )
@@ -511,10 +564,7 @@ def test_trajectory_identity_rejects_keys_that_collide_after_nfc() -> None:
 
 def test_reconstruct_write_and_edit_are_byte_exact_and_preserve_mode(tmp_path: Path) -> None:
     contract = materialize_seed(
-        _source(
-            _archive(source=b"\xef\xbb\xbfold\r\nold", source_mode=0o755),
-            tree_entries=_tree_entries(source_mode=0o755),
-        ),
+        _source(_archive(source=b"\xef\xbb\xbfold\r\nold", source_mode=0o755)),
         TASK,
         tmp_path / "seed",
     )
@@ -531,7 +581,7 @@ def test_reconstruct_write_and_edit_are_byte_exact_and_preserve_mode(tmp_path: P
         ),
         _call("Write", {"file_path": "new.py", "content": "尾\r\n"}, "write"),
     )
-    plan = canonical_mutation_plan(_messages(*calls), frozenset(), VERIFY_CMD)
+    plan = _plan_for(contract, *calls)
 
     state = reconstruct_candidate(contract, plan, tmp_path / "candidate")
 
@@ -545,10 +595,8 @@ def test_reconstruct_write_and_edit_are_byte_exact_and_preserve_mode(tmp_path: P
 
 def test_new_write_mode_is_deterministic_across_process_umask(tmp_path: Path) -> None:
     contract = _materialized(tmp_path)
-    plan = canonical_mutation_plan(
-        _messages(_call("Write", {"file_path": "new.py", "content": "x"})),
-        frozenset(),
-        VERIFY_CMD,
+    plan = _plan_for(
+        contract, _call("Write", {"file_path": "new.py", "content": "x"})
     )
     original_umask = os.umask(0o077)
     try:
@@ -565,13 +613,17 @@ def test_edit_validates_match_count_before_mutating(
     archive = _archive(source=b"old old\n") if not replace_all else _archive()
     contract = _materialized(tmp_path, archive)
     old = "missing" if replace_all else "old"
-    plan = MutationPlan(
-        operations=(
-            FableEditOp("/testbed/src.py", old, "x", replace_all, ()),
+    plan = _plan_for(
+        contract,
+        _call(
+            "Edit",
+            {
+                "file_path": "src.py",
+                "old_string": old,
+                "new_string": "x",
+                "replace_all": replace_all,
+            },
         ),
-        operation_sha256="0" * 64,
-        verifier_sha256=contract.verifier_sha256,
-        verifier_evidence_count=0,
     )
     destination = tmp_path / "candidate"
     with pytest.raises(ReplayContractError, match="match"):
@@ -583,10 +635,8 @@ def test_edit_validates_match_count_before_mutating(
 
 def test_reconstruction_requires_nonempty_source_diff(tmp_path: Path) -> None:
     contract = _materialized(tmp_path)
-    no_change = canonical_mutation_plan(
-        _messages(_call("Write", {"file_path": "src.py", "content": "old\n"})),
-        frozenset(),
-        VERIFY_CMD,
+    no_change = _plan_for(
+        contract, _call("Write", {"file_path": "src.py", "content": "old\n"})
     )
     with pytest.raises(ReplayContractError, match="empty candidate diff"):
         reconstruct_candidate(contract, no_change, tmp_path / "candidate")
@@ -595,10 +645,8 @@ def test_reconstruction_requires_nonempty_source_diff(tmp_path: Path) -> None:
 def test_reconstruction_detects_seed_drift_before_copy(tmp_path: Path) -> None:
     contract = _materialized(tmp_path)
     (contract.files_root / "src.py").write_text("tampered")
-    plan = canonical_mutation_plan(
-        _messages(_call("Write", {"file_path": "src.py", "content": "new"})),
-        frozenset(),
-        VERIFY_CMD,
+    plan = _plan_for(
+        contract, _call("Write", {"file_path": "src.py", "content": "new"})
     )
     with pytest.raises(ReplayContractError, match="immutable seed inventory changed"):
         reconstruct_candidate(contract, plan, tmp_path / "candidate")
@@ -608,13 +656,14 @@ def test_reconstruction_revalidates_symlinks_and_hardlinks_before_each_mutation(
     tmp_path: Path,
 ) -> None:
     contract = _materialized(tmp_path)
-    first = FableWriteOp("/testbed/alias.py", "x", ())
-    second = FableEditOp("/testbed/src.py", "old", "new", False, ())
-    plan = MutationPlan(
-        operations=(first, second),
-        operation_sha256="0" * 64,
-        verifier_sha256=contract.verifier_sha256,
-        verifier_evidence_count=0,
+    plan = _plan_for(
+        contract,
+        _call("Write", {"file_path": "alias.py", "content": "x"}, "write"),
+        _call(
+            "Edit",
+            {"file_path": "src.py", "old_string": "old", "new_string": "new"},
+            "edit",
+        ),
     )
     destination = tmp_path / "candidate"
 
@@ -627,27 +676,114 @@ def test_reconstruction_revalidates_symlinks_and_hardlinks_before_each_mutation(
         reconstruct_candidate(contract, plan, destination, before_operation=introduce_alias)
 
 
-def test_reconstruction_rejects_manual_protected_or_escaping_plan(tmp_path: Path) -> None:
+def test_descriptor_boundary_blocks_ancestor_swap_before_final_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prefix = f"tasks/seeds/{TASK}/files"
+    archive = _archive(
+        extra_members=((f"{prefix}/pkg/src.py", b"old\n", tarfile.REGTYPE, b""),)
+    )
+    contract = _materialized(tmp_path, archive)
+    plan = _plan_for(
+        contract, _call("Write", {"file_path": "pkg/src.py", "content": "PWN"})
+    )
+    destination = tmp_path / "candidate"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "src.py"
+    sentinel.write_bytes(b"SENTINEL")
+    original_check = replay._check_protected_aliases
+    swapped = False
+
+    def swap_after_alias_check(*args, **kwargs):
+        nonlocal swapped
+        result = original_check(*args, **kwargs)
+        if not swapped:
+            swapped = True
+            (destination / "pkg").rename(destination / "pkg-original")
+            (destination / "pkg").symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(replay, "_check_protected_aliases", swap_after_alias_check)
+    with pytest.raises(ReplayContractError):
+        reconstruct_candidate(contract, plan, destination)
+    assert swapped is True
+    assert sentinel.read_bytes() == b"SENTINEL"
+
+
+def test_reconstruction_rejects_operation_protected_set_mismatch_before_copy(
+    tmp_path: Path,
+) -> None:
     contract = _materialized(tmp_path)
-    for path, match in (("/testbed/test_src.py", "protected"), ("/etc/passwd", "outside")):
-        plan = MutationPlan(
-            operations=(FableWriteOp(path, "bad", ()),),
-            operation_sha256="0" * 64,
-            verifier_sha256=contract.verifier_sha256,
-            verifier_evidence_count=0,
-        )
-        with pytest.raises(ReplayContractError, match=match):
-            reconstruct_candidate(contract, plan, tmp_path / hashlib.sha256(path.encode()).hexdigest())
+    plan = canonical_mutation_plan(
+        _messages(_call("Write", {"file_path": "src.py", "content": "bad"})),
+        frozenset(),
+        contract.verify_cmd,
+    )
+    destination = tmp_path / "candidate"
+    with pytest.raises(ReplayContractError, match="protected_paths binding"):
+        reconstruct_candidate(contract, plan, destination)
+    assert not destination.exists()
+
+
+def test_reconstruction_rejects_stale_operation_hash_before_copy(tmp_path: Path) -> None:
+    contract = _materialized(tmp_path)
+    honest = _plan_for(
+        contract, _call("Write", {"file_path": "src.py", "content": "honest"})
+    )
+    altered_operation = dataclasses.replace(honest.operations[0], content="ALTERED")
+    altered = dataclasses.replace(honest, operations=(altered_operation,))
+    destination = tmp_path / "candidate"
+    with pytest.raises(ReplayContractError, match="operation hash mismatch"):
+        reconstruct_candidate(contract, altered, destination)
+    assert not destination.exists()
+
+
+def test_reconstruction_rejects_noncanonical_operation_type_before_copy(
+    tmp_path: Path,
+) -> None:
+    contract = _materialized(tmp_path)
+    honest = _plan_for(
+        contract, _call("Write", {"file_path": "src.py", "content": "honest"})
+    )
+    altered = dataclasses.replace(honest, operations=(object(),))
+    destination = tmp_path / "candidate"
+    with pytest.raises(ReplayContractError, match="exact Write/Edit operation type"):
+        reconstruct_candidate(contract, altered, destination)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tests/helper.py",
+        "fixtures/input.py",
+        "benchmarks/speed.py",
+        "generated/client.py",
+        "vendor/library.py",
+        "conftest.py",
+    ],
+)
+def test_reconstruction_rejects_importer_mutation_path_families_before_copy(
+    tmp_path: Path, path: str
+) -> None:
+    contract = _materialized(tmp_path)
+    plan = _plan_for(
+        contract, _call("Write", {"file_path": path, "content": "bad"})
+    )
+    destination = tmp_path / "candidate"
+    with pytest.raises(ReplayContractError, match="rejected mutation path family"):
+        reconstruct_candidate(contract, plan, destination)
+    assert not destination.exists()
 
 
 def test_reconstruction_hashes_are_deterministic_across_fresh_destinations(
     tmp_path: Path,
 ) -> None:
     contract = _materialized(tmp_path)
-    plan = canonical_mutation_plan(
-        _messages(_call("Edit", {"file_path": "src.py", "old_string": "old", "new_string": "new"})),
-        frozenset(),
-        VERIFY_CMD,
+    plan = _plan_for(
+        contract,
+        _call("Edit", {"file_path": "src.py", "old_string": "old", "new_string": "new"}),
     )
     one = reconstruct_candidate(contract, plan, tmp_path / "one")
     two = reconstruct_candidate(contract, plan, tmp_path / "two")
@@ -740,3 +876,15 @@ def test_reference_patch_apply_check_failure_is_stable_exclusion(tmp_path: Path)
     result = preflight_reference_patch(contract, executor=PatchExecutor(returncode=1))
     assert result.eligible is False
     assert result.exclusion_reason == "reference_patch_apply_check_failed"
+
+
+@pytest.mark.parametrize("repo_path", ["a/foo.py", "b/foo.py"])
+def test_reference_patch_strips_transport_prefix_exactly_once(
+    tmp_path: Path, repo_path: str
+) -> None:
+    contract = _materialized(tmp_path, _archive(patch=_patch(repo_path)))
+    executor = PatchExecutor()
+    result = preflight_reference_patch(contract, executor=executor)
+    assert result.eligible is True
+    assert result.targets == (repo_path,)
+    assert len(executor.calls) == 1

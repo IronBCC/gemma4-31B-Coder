@@ -145,11 +145,11 @@ class FakeGit:
     def __init__(self, archive: bytes, *, tree_entries: bytes | None = None) -> None:
         self.archive = archive
         self.tree_entries = tree_entries or _tree_entries_from_archive(archive)
-        self.calls: list[tuple[str, ...]] = []
+        self.calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
 
-    def __call__(self, argv: tuple[str, ...]) -> bytes:
-        self.calls.append(argv)
-        tail = argv[3:]
+    def __call__(self, argv: tuple[str, ...], env: dict[str, str]) -> bytes:
+        self.calls.append((argv, dict(env)))
+        tail = argv[4:]
         if tail == ("cat-file", "-e", f"{MOONSHINER_REVISION}^{{commit}}"):
             return b""
         if tail == ("rev-parse", f"{MOONSHINER_REVISION}^{{commit}}"):
@@ -259,8 +259,106 @@ def test_materialize_seed_admits_exact_commit_and_records_object_ids(tmp_path: P
     assert contract.files_root == tmp_path / "seed" / "files"
     assert contract.fixture_sha256 == contract.inventory_sha256
     assert (contract.files_root / "src.py").read_bytes() == b"old\n"
-    assert any(call[3] == "cat-file" for call in fake.calls)
-    assert any(call[3] == "archive" for call in fake.calls)
+    assert any(argv[4] == "cat-file" for argv, _env in fake.calls)
+    assert any(argv[4] == "archive" for argv, _env in fake.calls)
+
+
+def test_git_boundary_disables_replacements_lazy_fetch_and_inherited_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "url.https://attacker.invalid/.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "file://")
+    monkeypatch.setenv("GIT_OBJECT_DIRECTORY", str(tmp_path / "attacker-objects"))
+    monkeypatch.setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", str(tmp_path / "alternates"))
+    inherited_path = os.environ["PATH"]
+    monkeypatch.setenv("PATH", f"{tmp_path / 'attacker-bin'}:{inherited_path}")
+    fake = FakeGit(_archive())
+
+    materialize_seed(
+        GitSeedSource(
+            Path("/immutable/moonshiner.git"), MOONSHINER_REVISION, fake
+        ),
+        TASK,
+        tmp_path / "seed",
+    )
+
+    assert fake.calls
+    for argv, env in fake.calls:
+        assert argv[:4] == (
+            "git",
+            "--no-replace-objects",
+            "-C",
+            "/immutable/moonshiner.git",
+        )
+        assert env["GIT_NO_REPLACE_OBJECTS"] == "1"
+        assert env["GIT_NO_LAZY_FETCH"] == "1"
+        assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert env["GIT_CONFIG_GLOBAL"] == os.devnull
+        assert env["GIT_CONFIG_COUNT"] == "0"
+        assert env["GIT_TERMINAL_PROMPT"] == "0"
+        assert env["GIT_ALLOW_PROTOCOL"] == "file"
+        assert env["PATH"] == os.defpath
+        assert "GIT_CONFIG_KEY_0" not in env
+        assert "GIT_CONFIG_VALUE_0" not in env
+        assert "GIT_OBJECT_DIRECTORY" not in env
+        assert "GIT_ALTERNATE_OBJECT_DIRECTORIES" not in env
+
+
+def test_real_git_replace_cannot_change_pinned_commit_tree_or_archive(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> bytes:
+        return subprocess.run(
+            ("git", "-C", str(repo), *args),
+            check=True,
+            capture_output=True,
+        ).stdout
+
+    git("init")
+    git("config", "user.name", "Replay Test")
+    git("config", "user.email", "replay@example.invalid")
+    tracked = repo / "value.txt"
+    tracked.write_text("A\n")
+    git("add", "value.txt")
+    git("commit", "-m", "A")
+    commit_a = git("rev-parse", "HEAD").decode().strip()
+    tree_a = git("rev-parse", f"{commit_a}^{{tree}}").decode().strip()
+
+    tracked.write_text("B\n")
+    git("commit", "-am", "B")
+    commit_b = git("rev-parse", "HEAD").decode().strip()
+    git("replace", commit_a, commit_b)
+
+    assert git("show", f"{commit_a}:value.txt") == b"B\n"
+
+    def pinned(*args: str) -> bytes:
+        return replay._run_git(
+            (
+                "git",
+                "--no-replace-objects",
+                "-C",
+                str(repo),
+                *args,
+            ),
+            replay._sanitized_git_environment(),
+        )
+
+    assert pinned("rev-parse", f"{commit_a}^{{commit}}") == (
+        commit_a + "\n"
+    ).encode()
+    assert pinned("rev-parse", f"{commit_a}^{{tree}}") == (tree_a + "\n").encode()
+    assert pinned("show", f"{commit_a}:value.txt") == b"A\n"
+    archive_bytes = pinned(
+        "archive", "--format=tar", commit_a, "--", "value.txt"
+    )
+    with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
+        extracted = archive.extractfile("value.txt")
+        assert extracted is not None
+        assert extracted.read() == b"A\n"
 
 
 def test_missing_timeout_uses_recorded_policy_default(tmp_path: Path) -> None:

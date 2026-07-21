@@ -56,7 +56,7 @@ class ReplayContractError(ValueError):
 
 
 class GitRunner(Protocol):
-    def __call__(self, argv: tuple[str, ...]) -> bytes: ...
+    def __call__(self, argv: tuple[str, ...], env: Mapping[str, str]) -> bytes: ...
 
 
 class PatchExecutor(Protocol):
@@ -65,9 +65,34 @@ class PatchExecutor(Protocol):
     ) -> subprocess.CompletedProcess[bytes]: ...
 
 
-def _run_git(argv: tuple[str, ...]) -> bytes:
+def _sanitized_git_environment() -> dict[str, str]:
+    """Return a minimal, non-interactive environment for pinned object reads."""
+
+    return {
+        "PATH": os.defpath,
+        "HOME": os.devnull,
+        "XDG_CONFIG_HOME": os.devnull,
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_ALLOW_PROTOCOL": "file",
+        "GIT_CONFIG_COUNT": "0",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "never",
+    }
+
+
+def _run_git(argv: tuple[str, ...], env: Mapping[str, str]) -> bytes:
     try:
-        return subprocess.run(argv, check=True, capture_output=True).stdout
+        return subprocess.run(
+            argv,
+            check=True,
+            capture_output=True,
+            env=dict(env),
+        ).stdout
     except (OSError, subprocess.CalledProcessError) as exc:
         raise ReplayContractError(f"pinned Git command failed: {argv!r}") from exc
 
@@ -432,9 +457,9 @@ def _inventory_from_root(root: Path) -> tuple[_InventoryFile, ...]:
 
 
 def _git_output(source: GitSeedSource, *args: str) -> bytes:
-    argv = ("git", "-C", str(source.repo), *args)
+    argv = ("git", "--no-replace-objects", "-C", str(source.repo), *args)
     try:
-        return source.runner(argv)
+        return source.runner(argv, _sanitized_git_environment())
     except ReplayContractError:
         raise
     except Exception as exc:

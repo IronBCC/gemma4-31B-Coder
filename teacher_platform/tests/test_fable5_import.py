@@ -18,6 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fable5_import import (  # noqa: E402
+    AUDITED_CODE_CATEGORIES,
     DATASET_ID,
     DATASET_REVISION,
     EXPECTED_ROWS,
@@ -1881,9 +1882,23 @@ def test_behavior_rejects_non_source_mutation(tmp_path: Path) -> None:
         ("python", "src/tests.py"),
         ("python", "src/test_helpers.py"),
         ("python", "src/helpers_test.py"),
+        ("python", "src/.test_helpers.py"),
+        ("python", "test_support/helpers.py"),
+        ("python", "test-support/helpers.py"),
+        ("python", "testing/helpers.py"),
+        ("python", "test_data/helpers.py"),
+        ("python", "test-data/helpers.py"),
+        ("python", "__tests__/helpers.py"),
+        ("python", "spec/helpers.py"),
+        ("python", "specs/helpers.py"),
+        ("python", "src/parser_spec.py"),
+        ("python", "src/spec_parser.py"),
         ("python", "src/conftest.py"),
         ("python", "src/fixture.py"),
+        ("python", "src/fixture_data.py"),
         ("python", "src/benchmark.py"),
+        ("python", "bench/helpers.py"),
+        ("python", "src/parser_bench.py"),
         ("python", "generated/model.py"),
         ("python", "vendor/model.py"),
         ("rust", "src/tests.rs"),
@@ -1915,10 +1930,12 @@ def test_behavior_rejects_root_and_nested_test_fixture_benchmark_mutations(
     assert "rejected_mutation_path" in result.rejected[0]["detail"]
 
 
-def test_behavior_allows_honest_source_name_containing_test_substring(
-    tmp_path: Path,
+@pytest.mark.parametrize("path", ["src/contest.py", "src/latest.py", "src/protest.py"])
+def test_behavior_allows_honest_source_names_containing_test_substring(
+    tmp_path: Path, path: str
 ) -> None:
-    row, verify = pipeline_row("py-contest")
+    task = f"py-{Path(path).stem}"
+    row, verify = pipeline_row(task)
     edit_call = next(
         message["tool_calls"][0]
         for message in row["messages"]
@@ -1926,16 +1943,57 @@ def test_behavior_allows_honest_source_name_containing_test_substring(
         and message.get("tool_calls")
         and message["tool_calls"][0]["id"] == "edit"
     )
-    edit_call["function"]["arguments"]["file_path"] = "src/contest.py"
+    edit_call["function"]["arguments"]["file_path"] = path
 
     result = build_fable5_pilot(
         [row],
         fixture_build_config(
-            tmp_path / "dataset", [row], {"py-contest": verify}
+            tmp_path / "dataset", [row], {task: verify}
         ),
     )
 
     assert len(result.rows) == 1
+
+
+PINNED_ACCEPTED_CATEGORY_INVENTORY = frozenset(
+    """
+    build-analytics build-automata build-batching build-cli build-codec
+    build-compiler build-concurrency build-config build-datastruct build-datetime
+    build-db build-deps build-diff build-encoding build-finance build-fs build-game
+    build-graph build-history build-html build-http build-inference build-interpreter
+    build-iterator build-lang build-lexing build-lib build-logs build-matching
+    build-monitoring build-net build-ops build-parsing build-queue build-ratelimit
+    build-rendering build-resilience build-scheduler build-scheduling build-search
+    build-solver build-state build-statemachine build-stats build-strings
+    build-templating build-text build-validation build-web build-webhooks
+    build-workflow compilefix-cpp compilefix-py compilefix-rust data-migration debug
+    debug-argparse debug-async debug-bytes-text debug-collections debug-concurrency
+    debug-date-math debug-datetime debug-deps debug-errors debug-exception-shadowing
+    debug-float-ordering debug-float-precision debug-generator-exhaustion
+    debug-identity-equality debug-integration debug-late-binding debug-logic
+    debug-map-order debug-multibug debug-mutable-default debug-mutation-iteration
+    debug-numeric debug-pipeline debug-resource-leak debug-runtime debug-shallow-copy
+    debug-sorting debug-state debug-subprocess debug-unicode debug-web debug-webstack
+    escape-bytes escape-config escape-format escape-fstring escape-parser
+    escape-rawstring escape-regex escape-yaml feature-auth feature-billing feature-cli
+    feature-concurrency feature-config feature-data feature-deps feature-feeds
+    feature-fs feature-integration feature-markdown feature-plugins feature-pricing
+    feature-reporting feature-search feature-security feature-streaming
+    feature-terminal feature-validation feature-web feature-webhooks
+    full-distill-brownfield-orientation full-distill-version-migration
+    full-distill/data-migration perf-dedupe perf-memo perf-scan project-api project-cli
+    project-config project-data project-etl project-integration project-migration
+    project-ops project-plugins project-quoting project-scheduler project-sitegen
+    project-state project-storage project-tool project-wiki refactor-arch
+    refactor-pipeline syntax-cpp syntax-py syntax-rust warnfix-cpp warnfix-py
+    warnfix-rust
+    """.split()
+)
+
+
+def test_category_allowlist_equals_pinned_canonical_alias_inventory() -> None:
+    assert len(PINNED_ACCEPTED_CATEGORY_INVENTORY) == 147
+    assert AUDITED_CODE_CATEGORIES == PINNED_ACCEPTED_CATEGORY_INVENTORY
 
 
 @pytest.mark.parametrize(
@@ -1943,8 +2001,12 @@ def test_behavior_allows_honest_source_name_containing_test_substring(
     [
         "debug",
         "debug-runtime",
+        "debug-deps",
         "build-lib",
+        "build-compiler",
+        "build-workflow",
         "feature-auth",
+        "feature-deps",
         "project-cli",
         "compilefix-py",
         "escape-regex",
@@ -1999,8 +2061,12 @@ def test_category_allowlist_rejects_unknown_and_noncode_labels(
         "Use token=ghp_abcdefghijklmnopqrstuvwxyz0123456789 to reproduce.",
         "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
         "Here is the key: AKIAABCDEFGHIJKLMNOP",
+        "AWS_SECRET_ACCESS_KEY=abcdefghijklmnopqrstuvwxyz1234567890",
+        "OPENAI_API_KEY='abcdefghijklmnopqrstuvwxyz1234567890'",
+        'password="abcdefghijklmnopqrstuvwxyz"',
         "Read /Users/alice/projects/private-repo/config.py before fixing it.",
         "The checkout is /home/runner/work/private/repo and the bug is there.",
+        "Inspect /root/private/repo/main.py before fixing it.",
         "Inspect C:\\Users\\alice\\projects\\secret\\main.py.",
     ],
 )
@@ -2014,21 +2080,43 @@ def test_user_prompt_scan_allows_safe_task_text_and_testbed_path() -> None:
     assert validate_fable_user_prompt(prompt) == prompt
 
 
-def test_build_rejects_unsafe_user_prompt_before_conversion(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("prompt", "detail"),
+    [
+        (
+            "Use ghp_abcdefghijklmnopqrstuvwxyz0123456789 to fix it.",
+            "unsafe_user_prompt_secret",
+        ),
+        (
+            "AWS_SECRET_ACCESS_KEY=abcdefghijklmnopqrstuvwxyz1234567890",
+            "unsafe_user_prompt_secret",
+        ),
+        (
+            "OPENAI_API_KEY='abcdefghijklmnopqrstuvwxyz1234567890'",
+            "unsafe_user_prompt_secret",
+        ),
+        ('password="abcdefghijklmnopqrstuvwxyz"', "unsafe_user_prompt_secret"),
+        ("Inspect /root/private/repo/main.py.", "unsafe_user_prompt_host_path"),
+    ],
+)
+def test_build_rejects_unsafe_user_prompt_before_conversion(
+    tmp_path: Path, prompt: str, detail: str
+) -> None:
+    task = f"py-secret-prompt-{hashlib.sha256(prompt.encode()).hexdigest()[:8]}"
     row, verify = pipeline_row(
-        "py-secret-prompt", problem="Use ghp_abcdefghijklmnopqrstuvwxyz0123456789 to fix it."
+        task, problem=prompt
     )
 
     result = build_fable5_pilot(
         [row],
         fixture_build_config(
-            tmp_path / "dataset", [row], {"py-secret-prompt": verify}
+            tmp_path / task, [row], {task: verify}
         ),
     )
 
     assert result.rows == ()
     assert result.manifest["contamination_drop"] == 1
-    assert result.rejected[0]["detail"] == "unsafe_user_prompt_secret"
+    assert result.rejected[0]["detail"] == detail
 
 
 def test_conversion_rejections_keep_bounded_machine_subreasons(

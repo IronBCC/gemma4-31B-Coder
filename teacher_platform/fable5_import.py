@@ -1278,6 +1278,7 @@ AUDITED_CODE_CATEGORIES: Final[frozenset[str]] = frozenset(
         "build-batching",
         "build-cli",
         "build-codec",
+        "build-compiler",
         "build-concurrency",
         "build-config",
         "build-datastruct",
@@ -1322,6 +1323,7 @@ AUDITED_CODE_CATEGORIES: Final[frozenset[str]] = frozenset(
         "build-validation",
         "build-web",
         "build-webhooks",
+        "build-workflow",
         "compilefix-cpp",
         "compilefix-py",
         "compilefix-rust",
@@ -1334,6 +1336,7 @@ AUDITED_CODE_CATEGORIES: Final[frozenset[str]] = frozenset(
         "debug-concurrency",
         "debug-date-math",
         "debug-datetime",
+        "debug-deps",
         "debug-errors",
         "debug-exception-shadowing",
         "debug-float-ordering",
@@ -1372,6 +1375,7 @@ AUDITED_CODE_CATEGORIES: Final[frozenset[str]] = frozenset(
         "feature-concurrency",
         "feature-config",
         "feature-data",
+        "feature-deps",
         "feature-feeds",
         "feature-fs",
         "feature-integration",
@@ -1425,8 +1429,10 @@ _PROMPT_SECRET_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\b"),
     re.compile(r"(?i)\bAuthorization\s*:\s*Bearer\s+[A-Za-z0-9._~+/-]{12,}"),
     re.compile(
-        r"(?i)\b(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*"
-        r"[A-Za-z0-9._~+/-]{12,}"
+        r"(?i)(?<![A-Za-z0-9_])(?:"
+        r"[A-Za-z][A-Za-z0-9_]*(?:API_KEY|ACCESS_TOKEN|SECRET_ACCESS_KEY|PASSWORD)"
+        r"|api[_-]?key|access[_-]?token|password|secret"
+        r")(?![A-Za-z0-9_])\s*[:=]\s*[\"']?[A-Za-z0-9._~+/-]{12,}[\"']?"
     ),
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
 )
@@ -1434,6 +1440,7 @@ _PROMPT_HOST_PATH_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"/(?:Users|home)/[^/\s]+/(?:[^\s]+/)*"),
     re.compile(r"/(?:media|mnt)/[^/\s]+/(?:[^\s]+/)*"),
     re.compile(r"/private/var/(?:[^\s]+/)*"),
+    re.compile(r"/root(?:/[^\s]*)?"),
     re.compile(r"[A-Za-z]:\\Users\\[^\\\s]+\\", re.IGNORECASE),
 )
 _VERIFY_PATTERNS: Final[dict[CanonicalLanguage, re.Pattern[str]]] = {
@@ -1457,15 +1464,33 @@ _SOURCE_SUFFIXES: Final[dict[CanonicalLanguage, frozenset[str]]] = {
     "rust": frozenset({".rs"}),
     "cpp": frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}),
 }
-_REJECTED_MUTATION_COMPONENT_RE: Final = re.compile(
-    r"^(?:tests?|testdata|fixtures?|benches|benchmarks?|generated|vendor|third[_-]?party)$",
-    re.IGNORECASE,
+_REJECTED_MUTATION_FAMILY_TOKENS: Final[frozenset[str]] = frozenset(
+    {
+        "bench",
+        "benches",
+        "benchmark",
+        "benchmarking",
+        "benchmarks",
+        "fixture",
+        "fixtures",
+        "generated",
+        "spec",
+        "specs",
+        "test",
+        "testing",
+        "tests",
+        "vendor",
+    }
 )
-_REJECTED_MUTATION_BASENAME_RE: Final = re.compile(
-    r"^(?:conftest|tests?|test_.+|.+_test|fixtures?|fixture_.+|.+_fixture|"
-    r"benches|benchmarks?|benchmark_.+|.+_benchmark|generated|vendor)"
-    r"(?:\.[A-Za-z0-9]+)?$",
-    re.IGNORECASE,
+_REJECTED_MUTATION_FAMILY_COMPOUNDS: Final[frozenset[str]] = frozenset(
+    {
+        "conftest",
+        "fixturedata",
+        "testdata",
+        "testfixtures",
+        "testsupport",
+        "thirdparty",
+    }
 )
 
 
@@ -1723,11 +1748,11 @@ def _operation_behavior(
         path = PurePosixPath(mutation_path)
         relative_parts = path.parts[2:] if path.parts[:2] == ("/", "testbed") else path.parts
         if any(
-            _REJECTED_MUTATION_COMPONENT_RE.fullmatch(part)
-            for part in relative_parts
-        ) or (
-            relative_parts
-            and _REJECTED_MUTATION_BASENAME_RE.fullmatch(relative_parts[-1])
+            _rejected_mutation_family(
+                part,
+                basename=index == len(relative_parts) - 1,
+            )
+            for index, part in enumerate(relative_parts)
         ):
             has_rejected_mutation_path = True
         if path.suffix.casefold() in _SOURCE_SUFFIXES[language]:
@@ -1780,6 +1805,20 @@ def _replay_matches(
         and evidence.source_terminal_sha256 == candidate.source_terminal_sha256
         and evidence.candidate_content_sha256 == candidate.content_sha256
         and evidence.fixture_sha256 == candidate.seed.fixture_sha256
+    )
+
+
+def _rejected_mutation_family(component: str, *, basename: bool) -> bool:
+    """Classify forbidden test/fixture/benchmark path families by tokens."""
+
+    value = component.casefold().lstrip(".")
+    if basename:
+        value = value.split(".", 1)[0]
+    tokens = tuple(token for token in re.split(r"[-_.]+", value) if token)
+    collapsed = "".join(tokens)
+    return bool(
+        set(tokens).intersection(_REJECTED_MUTATION_FAMILY_TOKENS)
+        or collapsed in _REJECTED_MUTATION_FAMILY_COMPOUNDS
     )
 
 

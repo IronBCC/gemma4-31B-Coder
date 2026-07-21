@@ -652,9 +652,6 @@ _BASH_EXACT_READ_ONLY_ARGV: Final = frozenset(
         ("ls", "."),
         ("ls", "-la"),
         ("ls", "-la", "."),
-        ("git", "status", "--short"),
-        ("git", "diff"),
-        ("git", "diff", "--stat"),
     }
 )
 
@@ -733,10 +730,7 @@ def _audit_read_only_bash(command: str) -> str:
     argv = tuple(segment)
     if argv in _BASH_EXACT_READ_ONLY_ARGV:
         return command
-    if len(segment) == 4 and segment[:3] == ["git", "diff", "--"]:
-        _normalize_fable_path(segment[3])
-        return command
-    if executable == "git" and (len(segment) < 2 or segment[1] not in {"diff", "status"}):
+    if executable == "git":
         raise UnsupportedTrajectoryTool("Bash uses mutating git command")
     raise UnsupportedTrajectoryTool("Bash command is outside the exact read-only grammar")
 
@@ -932,7 +926,7 @@ def lower_fable_operation(operation: FableOperation) -> str:
             )
             + [
                 "import base64",
-                f"content = base64.b64decode({payload!r}).decode('utf-8')",
+                f"content = base64.b64decode({payload!r})",
                 "flags = os.O_WRONLY | os.O_NOFOLLOW",
                 "if pre_stat is None:",
                 "    flags |= os.O_CREAT | os.O_EXCL",
@@ -948,7 +942,7 @@ def lower_fable_operation(operation: FableOperation) -> str:
                 "    ):",
                 "        raise SystemExit('mutation target identity changed before write')",
                 "    os.ftruncate(fd, 0)",
-                "    handle = os.fdopen(fd, 'w', encoding='utf-8')",
+                "    handle = os.fdopen(fd, 'wb')",
                 "    fd = None",
                 "    with handle:",
                 "        handle.write(content)",
@@ -970,8 +964,8 @@ def lower_fable_operation(operation: FableOperation) -> str:
             protected_paths=operation.protected_paths,
         ) + [
             "import base64",
-            f"old_string = base64.b64decode({old_payload!r}).decode('utf-8')",
-            f"new_string = base64.b64decode({new_payload!r}).decode('utf-8')",
+            f"old_bytes = base64.b64decode({old_payload!r})",
+            f"new_bytes = base64.b64decode({new_payload!r})",
             "if pre_stat is None:",
             "    raise SystemExit('edit target does not exist')",
             "fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)",
@@ -985,11 +979,11 @@ def lower_fable_operation(operation: FableOperation) -> str:
             "        or opened.st_nlink != pre_stat.st_nlink",
             "    ):",
             "        raise SystemExit('edit target identity changed before read')",
-            "    handle = os.fdopen(fd, 'r+', encoding='utf-8')",
+            "    handle = os.fdopen(fd, 'r+b')",
             "    fd = None",
             "    with handle:",
-            "        text = handle.read()",
-            "        matches = text.count(old_string)",
+            "        data = handle.read()",
+            "        matches = data.count(old_bytes)",
         ]
         if operation.replace_all:
             lines.extend(
@@ -1009,7 +1003,7 @@ def lower_fable_operation(operation: FableOperation) -> str:
             [
                 "        handle.seek(0)",
                 "        handle.truncate(0)",
-                "        handle.write(text.replace(old_string, new_string))",
+                "        handle.write(data.replace(old_bytes, new_bytes))",
                 "finally:",
                 "    if fd is not None:",
                 "        os.close(fd)",

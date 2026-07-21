@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from dataclasses import FrozenInstanceError
@@ -378,6 +379,23 @@ def _run_in_testbed(command: str, testbed: Path) -> subprocess.CompletedProcess[
     )
 
 
+def _init_hostile_git_repo(path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True)
+    (path / "tracked.txt").write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-qm", "seed"], cwd=path, check=True)
+
+
+def _write_executable_helper(path: Path, marker_name: str) -> None:
+    path.write_text(
+        f"#!/bin/sh\n: > {marker_name}\nprintf 'token\\n'\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
 def test_bash_translation_accepts_native_and_json_arguments() -> None:
     native = fable_tool_call(
         "Bash",
@@ -464,11 +482,11 @@ def test_trusted_verifier_inventory_rejects_multiline_commands(
 
 def test_read_only_bash_is_typed_separately_from_verifier_evidence() -> None:
     operation = parse_fable_tool_call(
-        fable_tool_call("Bash", {"command": "git diff -- src/lib.rs"}),
+        fable_tool_call("Bash", {"command": "ls -la ."}),
         frozenset(),
     )
 
-    assert operation == ReadOnlyBashOp(command="git diff -- src/lib.rs")
+    assert operation == ReadOnlyBashOp(command="ls -la .")
 
 
 @pytest.mark.parametrize(
@@ -678,6 +696,97 @@ def test_file_compile_mode_is_proven_mutating_and_rejected(tmp_path: Path) -> No
         )
 
 
+def test_git_diff_attribute_helper_is_proven_mutating_and_rejected(
+    tmp_path: Path,
+) -> None:
+    _init_hostile_git_repo(tmp_path)
+    (tmp_path / ".gitattributes").write_text("*.txt diff=evil\n", encoding="utf-8")
+    helper = tmp_path / "diff-helper.sh"
+    _write_executable_helper(helper, "attribute-helper-ran")
+    subprocess.run(
+        ["git", "config", "diff.evil.command", "./diff-helper.sh"],
+        cwd=tmp_path,
+        check=True,
+    )
+    (tmp_path / "tracked.txt").write_text("after\n", encoding="utf-8")
+
+    raw = subprocess.run(
+        ["git", "diff"], cwd=tmp_path, text=True, capture_output=True, check=False
+    )
+    assert raw.returncode == 0
+    assert (tmp_path / "attribute-helper-ran").exists()
+
+    with pytest.raises(ValueError, match="ambiguous_bash_mutation"):
+        parse_fable_tool_call(
+            fable_tool_call("Bash", {"command": "git diff"}), frozenset()
+        )
+
+
+def test_git_external_diff_environment_is_proven_mutating_and_rejected(
+    tmp_path: Path,
+) -> None:
+    _init_hostile_git_repo(tmp_path)
+    helper = tmp_path / "external-diff.sh"
+    _write_executable_helper(helper, "external-helper-ran")
+    (tmp_path / "tracked.txt").write_text("after\n", encoding="utf-8")
+    environment = os.environ.copy()
+    environment["GIT_EXTERNAL_DIFF"] = str(helper)
+
+    raw = subprocess.run(
+        ["git", "diff"],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert raw.returncode == 0
+    assert (tmp_path / "external-helper-ran").exists()
+
+    with pytest.raises(ValueError, match="ambiguous_bash_mutation"):
+        parse_fable_tool_call(
+            fable_tool_call("Bash", {"command": "git diff"}), frozenset()
+        )
+
+
+def test_git_status_fsmonitor_is_proven_mutating_and_rejected(tmp_path: Path) -> None:
+    _init_hostile_git_repo(tmp_path)
+    helper = tmp_path / "fsmonitor.sh"
+    _write_executable_helper(helper, "fsmonitor-helper-ran")
+    subprocess.run(
+        ["git", "config", "core.fsmonitor", "./fsmonitor.sh"],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    raw = subprocess.run(
+        ["git", "status", "--short"],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert raw.returncode == 0
+    assert (tmp_path / "fsmonitor-helper-ran").exists()
+
+    with pytest.raises(ValueError, match="ambiguous_bash_mutation"):
+        parse_fable_tool_call(
+            fable_tool_call("Bash", {"command": "git status --short"}),
+            frozenset(),
+        )
+
+
+def test_git_is_accepted_only_as_exact_trusted_verifier_evidence() -> None:
+    command = "git diff"
+    operation = parse_fable_tool_call(
+        fable_tool_call("Bash", {"command": command}),
+        frozenset(),
+        trusted_verifier_commands=frozenset({command}),
+    )
+
+    assert operation == VerifierEvidenceOp(command=command)
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -686,10 +795,6 @@ def test_file_compile_mode_is_proven_mutating_and_rejected(tmp_path: Path) -> No
         "ls .",
         "ls -la",
         "ls -la .",
-        "git status --short",
-        "git diff",
-        "git diff --stat",
-        "git diff -- src/lib.rs",
     ],
 )
 def test_bash_translation_preserves_exact_read_only_grammar(command: str) -> None:
@@ -726,6 +831,10 @@ def test_bash_translation_preserves_exact_read_only_grammar(command: str) -> Non
         "git log --oneline",
         "git show HEAD",
         "git grep parser src",
+        "git status --short",
+        "git diff",
+        "git diff --stat",
+        "git diff -- src/lib.rs",
         "git diff -- src/lib.rs src/main.rs",
     ],
 )
@@ -824,6 +933,20 @@ def test_write_translation_uses_literal_payload_and_blocks_symlink_escape(
     escaped_result = _run_in_testbed(escaped, tmp_path)
     assert escaped_result.returncode != 0
     assert not (outside / "pwned").exists()
+
+
+def test_write_translation_preserves_utf8_bytes_exactly(tmp_path: Path) -> None:
+    content = "\ufeffπρώτο\r\nlast"
+    command = translate_fable_tool_call(
+        fable_tool_call("Write", {"file_path": "exact.txt", "content": content}),
+        frozenset(),
+    )
+
+    result = _run_in_testbed(command, tmp_path)
+
+    assert result.returncode == 0
+    assert (tmp_path / "exact.txt").read_bytes() == content.encode("utf-8")
+    assert "os.fdopen(fd, 'wb')" in command
 
 
 def test_write_translation_rejects_protected_path() -> None:
@@ -1075,6 +1198,84 @@ def test_edit_translation_exact_one_mutates_one_match(tmp_path: Path) -> None:
 
     assert result.returncode == 0
     assert target.read_text(encoding="utf-8") == "before new after"
+
+
+@pytest.mark.parametrize(
+    ("initial", "old_string", "new_string", "expected"),
+    [
+        (
+            b"before\r\nold\r\nafter\r\n",
+            "old",
+            "new",
+            b"before\r\nnew\r\nafter\r\n",
+        ),
+        (
+            "\ufeffbefore old after".encode("utf-8"),
+            "old",
+            "new",
+            "\ufeffbefore new after".encode("utf-8"),
+        ),
+        (
+            "πριν old μετά\n".encode("utf-8"),
+            "old",
+            "νέο",
+            "πριν νέο μετά\n".encode("utf-8"),
+        ),
+        (b"before old", "old", "new", b"before new"),
+    ],
+)
+def test_edit_translation_preserves_all_unedited_bytes(
+    tmp_path: Path,
+    initial: bytes,
+    old_string: str,
+    new_string: str,
+    expected: bytes,
+) -> None:
+    target = tmp_path / "src/lib.rs"
+    target.parent.mkdir()
+    target.write_bytes(initial)
+    command = translate_fable_tool_call(
+        fable_tool_call(
+            "Edit",
+            {
+                "file_path": "src/lib.rs",
+                "old_string": old_string,
+                "new_string": new_string,
+            },
+        ),
+        frozenset(),
+    )
+
+    result = _run_in_testbed(command, tmp_path)
+
+    assert result.returncode == 0
+    assert target.read_bytes() == expected
+    assert "os.fdopen(fd, 'r+b')" in command
+
+
+@pytest.mark.parametrize("initial", [b"zero\r\nmatches", b"old\r\nold"])
+def test_edit_failure_preserves_all_bytes(
+    tmp_path: Path, initial: bytes
+) -> None:
+    target = tmp_path / "src/lib.rs"
+    target.parent.mkdir()
+    target.write_bytes(initial)
+    command = translate_fable_tool_call(
+        fable_tool_call(
+            "Edit",
+            {
+                "file_path": "src/lib.rs",
+                "old_string": "old",
+                "new_string": "new",
+            },
+        ),
+        frozenset(),
+    )
+
+    result = _run_in_testbed(command, tmp_path)
+
+    assert result.returncode != 0
+    assert target.read_bytes() == initial
 
 
 def test_edit_translation_replace_all_is_explicit_and_executable(tmp_path: Path) -> None:

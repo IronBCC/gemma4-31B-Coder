@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import dataclasses
 import json
 import os
 import re
@@ -17,17 +18,20 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import fable5_replay as replay_module  # noqa: E402
 from fable5_import import (  # noqa: E402
     AUDITED_CODE_CATEGORIES,
     DATASET_ID,
     DATASET_REVISION,
     EXPECTED_ROWS,
     EXPECTED_TERMINAL_TRAJECTORIES,
+    MOONSHINER_REVISION,
     BuildConfig,
     ExclusionRecord,
     FableEditOp,
     FableWriteOp,
     ReadOnlyBashOp,
+    ReplayCandidate,
     ReplayEvidence,
     SOURCE_BYTES,
     SOURCE_LFS_SHA256,
@@ -39,6 +43,7 @@ from fable5_import import (  # noqa: E402
     SourceContract,
     VerifierEvidenceOp,
     _load_replay_ledger,
+    _replay_matches,
     build_fable5_pilot,
     canonical_language,
     convert_trajectory,
@@ -186,6 +191,27 @@ def test_seed_contract_uses_only_pinned_git_object_inventory() -> None:
     assert contract.verify_cmd == "python3 test_contract.py"
     assert contract.protected_paths == ("test_contract.py",)
     assert re.fullmatch(r"[0-9a-f]{64}", contract.fixture_sha256)
+    fixture_bytes = b"print('fixture')\n"
+    raw_contract = seed_contract_from_git_objects(
+        "py-contract",
+        task_json,
+        entries,
+        blob_loader=lambda object_id: (
+            fixture_bytes if object_id == "b" * 40 else task_json
+        ),
+        source_tree_sha="c" * 40,
+        task_tree_sha="d" * 40,
+    )
+    digest = hashlib.sha256()
+    encoded_path = b"source.py"
+    digest.update(len(encoded_path).to_bytes(8, "big"))
+    digest.update(encoded_path)
+    digest.update((0o644).to_bytes(4, "big"))
+    digest.update(len(fixture_bytes).to_bytes(8, "big"))
+    digest.update(fixture_bytes)
+    assert raw_contract.fixture_sha256 == digest.hexdigest()
+    assert raw_contract.source_tree_sha == "c" * 40
+    assert raw_contract.task_tree_sha == "d" * 40
     with pytest.raises(ValueError, match="symlink"):
         seed_contract_from_git_objects(
             "py-contract",
@@ -2299,6 +2325,23 @@ def test_replay_gate_requires_exact_noncontrol_hash_bound_evidence(
             resolved=True,
             control=False,
             namespace="candidate",
+            schema_version=2,
+            evidence_sha256="1" * 64,
+            run_contract_sha256="2" * 64,
+            task=candidate.seed.task,
+            language=candidate.language,
+            dataset_revision=DATASET_REVISION,
+            source_commit_sha=candidate.seed.source_commit_sha,
+            source_tree_sha=candidate.seed.source_tree_sha,
+            task_tree_sha=candidate.seed.task_tree_sha,
+            operation_sha256="5" * 64,
+            candidate_tree_sha256="6" * 64,
+            candidate_diff_sha256="7" * 64,
+            verifier_sha256=hashlib.sha256(
+                candidate.seed.verify_cmd.encode()
+            ).hexdigest(),
+            protected_paths=tuple(sorted(candidate.seed.protected_paths)),
+            strict_run_count=2,
         )
 
     result = build_fable5_pilot(
@@ -2428,6 +2471,195 @@ def test_replay_ledger_requires_exact_explicit_schema_and_hashes(
 
     with pytest.raises(ValueError, match="replay ledger"):
         _load_replay_ledger(ledger)
+
+
+def _joined_evidence(
+    *,
+    trajectory_id: str,
+    task: str,
+    language: str,
+    terminal_sha256: str,
+    fixture_sha256: str,
+) -> replay_module.ReplayEvidence:
+    tree = "2" * 64
+    diff = "3" * 64
+    protected = (("tests/test_contract.py", "4" * 64),)
+    run_contract = "5" * 64
+    runs = tuple(
+        replay_module.RunEvidence(
+            schema_version=1,
+            run_id=("a" if index == 0 else "b") * 32,
+            control_identity="candidate",
+            trainable=True,
+            returncode=0,
+            wrapper_returncode=0,
+            duration_seconds=1.0,
+            termination="exited",
+            raw_output_sha256=("6" if index == 0 else "7") * 64,
+            raw_output_bytes=2,
+            output_truncated=False,
+            pre_candidate_tree_sha256=tree,
+            pre_candidate_diff_sha256=diff,
+            post_candidate_tree_sha256="8" * 64,
+            protected_before=protected,
+            protected_after=protected,
+            resolved=True,
+            failure_class=None,
+            cleanup_state="verified_removed",
+            policy_version="fable-docker-v1",
+            image_digest="registry.example/python@sha256:" + "9" * 64,
+            runtime_version="27.5.1",
+            run_contract_sha256=run_contract,
+            resource_peaks=(("memory_bytes", 1), ("pids", 1), ("cpu_usec", 1)),
+        )
+        for index in range(2)
+    )
+    verifier = "python3 test_contract.py"
+    contract_payload = {
+        "schema_version": 2,
+        "dataset_revision": DATASET_REVISION,
+        "source_commit_sha": replay_module.MOONSHINER_REVISION,
+        "source_tree_sha": "a" * 64,
+        "task_tree_sha": "b" * 64,
+        "inventory_sha256": fixture_sha256,
+        "trajectory_id": trajectory_id,
+        "source_terminal_sha256": terminal_sha256,
+        "operation_sha256": "c" * 64,
+        "candidate_tree_sha256": tree,
+        "candidate_diff_sha256": diff,
+        "verifier_sha256": hashlib.sha256(verifier.encode()).hexdigest(),
+        "source_verify_timeout": None,
+        "effective_verify_timeout": 300,
+        "executor_runs": [run_contract, run_contract],
+    }
+    return replay_module.ReplayEvidence(
+        2,
+        trajectory_id,
+        task,
+        language,
+        DATASET_REVISION,
+        replay_module.MOONSHINER_REVISION,
+        "a" * 64,
+        "b" * 64,
+        fixture_sha256,
+        terminal_sha256,
+        "c" * 64,
+        tree,
+        diff,
+        protected,
+        verifier,
+        hashlib.sha256(verifier.encode()).hexdigest(),
+        None,
+        300,
+        "fable-docker-v1",
+        "registry.example/python@sha256:" + "9" * 64,
+        "27.5.1",
+        hashlib.sha256(
+            json.dumps(
+                contract_payload, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest(),
+        runs,
+        True,
+        None,
+        "candidate",
+        True,
+    )
+
+
+def test_importer_joins_only_hash_bound_schema_v2_candidate_evidence(
+    tmp_path: Path,
+) -> None:
+    trajectory_id = "1" * 64
+    terminal = "d" * 64
+    content = "e" * 64
+    fixture = "f" * 64
+    evidence = _joined_evidence(
+        trajectory_id=trajectory_id,
+        task="py-join",
+        language="python",
+        terminal_sha256=terminal,
+        fixture_sha256=fixture,
+    )
+    ledger_path = tmp_path / "replay.jsonl"
+    replay_logs = tmp_path / "custom-replay-logs"
+    with replay_module.ReplayLedger(ledger_path, replay_logs) as ledger:
+        ledger.publish_verified(
+            evidence,
+            source_content_sha256=content,
+            fixture_sha256=fixture,
+            log=b"two strict runs",
+        )
+    loaded = _load_replay_ledger(ledger_path, replay_logs)[trajectory_id]
+    candidate = ReplayCandidate(
+        trajectory_id=trajectory_id,
+        source_terminal_sha256=terminal,
+        content_sha256=content,
+        seed=SeedContract(
+            task="py-join",
+            protected_paths=("tests/test_contract.py",),
+            verify_cmd="python3 test_contract.py",
+            fixture_sha256=fixture,
+            source_tree_sha="a" * 64,
+            task_tree_sha="b" * 64,
+        ),
+        language="python",
+    )
+    assert loaded.evidence_sha256 == hashlib.sha256(
+        replay_module._canonical_json(replay_module.replay_evidence_payload(evidence))
+    ).hexdigest()
+    assert _replay_matches(candidate, loaded)
+
+    assert not _replay_matches(
+        dataclasses.replace(candidate, content_sha256="0" * 64), loaded
+    )
+    assert not _replay_matches(
+        dataclasses.replace(
+            candidate,
+            seed=dataclasses.replace(candidate.seed, source_tree_sha="0" * 40),
+        ),
+        loaded,
+    )
+    assert not _replay_matches(
+        dataclasses.replace(
+            candidate,
+            seed=dataclasses.replace(candidate.seed, protected_paths=("other.py",)),
+        ),
+        loaded,
+    )
+
+
+def test_importer_rejects_legacy_and_control_replay_ledgers(tmp_path: Path) -> None:
+    legacy = tmp_path / "legacy.jsonl"
+    legacy.write_text(
+        json.dumps(
+            {
+                "trajectory_id": "a" * 64,
+                "source_terminal_sha256": "b" * 64,
+                "candidate_content_sha256": "c" * 64,
+                "fixture_sha256": "d" * 64,
+                "resolved": True,
+                "control": False,
+                "namespace": "candidate",
+            }
+        )
+        + "\n"
+    )
+    with pytest.raises(ValueError, match="schema-v2 attempt ledger"):
+        _load_replay_ledger(legacy)
+
+    evidence = _joined_evidence(
+        trajectory_id="1" * 64,
+        task="py-control",
+        language="python",
+        terminal_sha256="2" * 64,
+        fixture_sha256="3" * 64,
+    )
+    payload = replay_module.replay_evidence_payload(evidence)
+    payload["control_identity"] = "reference"
+    payload["trainable"] = False
+    with pytest.raises(ValueError, match="candidate namespace"):
+        replay_module.validate_replay_evidence_payload(payload)
 
 
 def test_replay_gate_rejects_controls_namespace_even_when_resolved(

@@ -90,10 +90,10 @@ def _archive(
             info.mode = 0o755
             archive.addfile(info)
         files = (
-            (f"{prefix}/task.json", task_json or _task_json(), 0o644),
-            (f"{prefix}/reference_fix.patch", patch or _patch(), 0o644),
-            (f"{prefix}/files/src.py", source, source_mode),
-            (f"{prefix}/files/test_src.py", b"assert True\n", 0o644),
+            (f"{prefix}/task.json", task_json or _task_json(), 0o664),
+            (f"{prefix}/reference_fix.patch", patch or _patch(), 0o664),
+            (f"{prefix}/files/src.py", source, source_mode | 0o020),
+            (f"{prefix}/files/test_src.py", b"assert True\n", 0o664),
         )
         for name, data, mode in files:
             info = tarfile.TarInfo(name)
@@ -104,6 +104,8 @@ def _archive(
             info = tarfile.TarInfo(name)
             info.type = kind
             info.linkname = linkname.decode()
+            if kind == tarfile.REGTYPE:
+                info.mode = 0o664
             info.size = len(data) if kind == tarfile.REGTYPE else 0
             archive.addfile(info, io.BytesIO(data) if data else None)
     return buffer.getvalue()
@@ -171,6 +173,8 @@ class FakeGit:
         ):
             return self.tree_entries
         if tail == (
+            "-c",
+            "tar.umask=0002",
             "archive",
             "--format=tar",
             MOONSHINER_REVISION,
@@ -260,7 +264,7 @@ def test_materialize_seed_admits_exact_commit_and_records_object_ids(tmp_path: P
     assert contract.fixture_sha256 == contract.inventory_sha256
     assert (contract.files_root / "src.py").read_bytes() == b"old\n"
     assert any(argv[4] == "cat-file" for argv, _env in fake.calls)
-    assert any(argv[4] == "archive" for argv, _env in fake.calls)
+    assert any("archive" in argv[4:] for argv, _env in fake.calls)
 
 
 def test_git_boundary_disables_replacements_lazy_fetch_and_inherited_config(
@@ -2213,6 +2217,320 @@ def _run_evidence(
         run_contract_sha256=run_contract_sha256,
         resource_peaks=(("memory_bytes", 1024), ("pids", 3), ("cpu_usec", 4000)),
     )
+
+
+def _verified_replay_evidence(
+    trajectory_id: str = "1" * 64,
+    *,
+    task: str = "py-safe",
+    language: str = "python",
+) -> replay.ReplayEvidence:
+    tree = "2" * 64
+    diff = "3" * 64
+    protected = (("test_src.py", "4" * 64),)
+    run_contract = "5" * 64
+    runs = tuple(
+        dataclasses.replace(
+            _run_evidence(
+                identity="candidate",
+                tree=tree,
+                diff=diff,
+                protected=protected,
+                rc=0,
+                output_hash=("6" if index == 0 else "7") * 64,
+                run_contract_sha256=run_contract,
+            ),
+            run_id=("a" if index == 0 else "b") * 32,
+        )
+        for index in range(2)
+    )
+    outer_contract = replay._sha256(
+        replay._canonical_json(
+            {
+                "schema_version": 2,
+                "dataset_revision": DATASET_REVISION,
+                "source_commit_sha": MOONSHINER_REVISION,
+                "source_tree_sha": "8" * 64,
+                "task_tree_sha": "9" * 64,
+                "inventory_sha256": "c" * 64,
+                "trajectory_id": trajectory_id,
+                "source_terminal_sha256": "d" * 64,
+                "operation_sha256": "e" * 64,
+                "candidate_tree_sha256": tree,
+                "candidate_diff_sha256": diff,
+                "verifier_sha256": hashlib.sha256(VERIFY_CMD.encode()).hexdigest(),
+                "source_verify_timeout": None,
+                "effective_verify_timeout": 300,
+                "executor_runs": [run.run_contract_sha256 for run in runs],
+            }
+        )
+    )
+    return replay.ReplayEvidence(
+        schema_version=2,
+        trajectory_id=trajectory_id,
+        task=task,
+        language=language,
+        dataset_revision=DATASET_REVISION,
+        source_commit_sha=MOONSHINER_REVISION,
+        source_tree_sha="8" * 64,
+        task_tree_sha="9" * 64,
+        inventory_sha256="c" * 64,
+        source_terminal_sha256="d" * 64,
+        operation_sha256="e" * 64,
+        candidate_tree_sha256=tree,
+        candidate_diff_sha256=diff,
+        protected_sha256=protected,
+        verifier_text=VERIFY_CMD,
+        verifier_sha256=hashlib.sha256(VERIFY_CMD.encode()).hexdigest(),
+        source_verify_timeout=None,
+        effective_verify_timeout=300,
+        policy_version="fable-docker-v1",
+        image_digest=IMAGE_DIGEST,
+        runtime_version="27.5.1",
+        run_contract_sha256=outer_contract,
+        runs=runs,
+        resolved=True,
+        failure_class=None,
+        control_identity="candidate",
+        trainable=True,
+    )
+
+
+def test_locked_ledger_publishes_0600_log_before_atomic_record(tmp_path: Path) -> None:
+    evidence = _verified_replay_evidence()
+    ledger_path = tmp_path / "replay.jsonl"
+    seen: list[tuple[bool, bool]] = []
+    with replay.ReplayLedger(ledger_path, tmp_path / "logs") as ledger:
+        ledger.publish_verified(
+            evidence,
+            source_content_sha256="f" * 64,
+            fixture_sha256=evidence.inventory_sha256,
+            log=b"strict verifier output\n",
+            after_log_publish=lambda path: seen.append(
+                (path.exists(), ledger_path.exists())
+            ),
+        )
+    assert seen == [(True, False)]
+    assert (
+        stat.S_IMODE(
+            (tmp_path / "logs" / f"{evidence.trajectory_id}.log").stat().st_mode
+        )
+        == 0o600
+    )
+    assert stat.S_IMODE(ledger_path.stat().st_mode) == 0o600
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_ledger_lock_full_validation_resume_and_duplicate_rejection(tmp_path: Path) -> None:
+    evidence = _verified_replay_evidence()
+    path = tmp_path / "replay.jsonl"
+    with replay.ReplayLedger(path, tmp_path / "logs") as first:
+        with pytest.raises(ReplayContractError, match="locked"):
+            with replay.ReplayLedger(path, tmp_path / "logs"):
+                pass
+        first.publish_verified(
+            evidence,
+            source_content_sha256="f" * 64,
+            fixture_sha256=evidence.inventory_sha256,
+            log=b"ok",
+        )
+    with replay.ReplayLedger(path, tmp_path / "logs") as resumed:
+        assert resumed.completed_trajectory_ids == frozenset({evidence.trajectory_id})
+        with pytest.raises(ReplayContractError, match="duplicate trajectory"):
+            resumed.publish_verified(
+                evidence,
+                source_content_sha256="f" * 64,
+                fixture_sha256=evidence.inventory_sha256,
+                log=b"again",
+            )
+    os.chmod(path, 0o644)
+    with pytest.raises(ReplayContractError, match="mode is not 0600"):
+        with replay.ReplayLedger(path, tmp_path / "logs"):
+            pass
+    os.chmod(path, 0o600)
+    payload = json.loads(path.read_text().splitlines()[0])
+    payload["evidence"]["schema_version"] = 1
+    path.write_text(json.dumps(payload) + "\n")
+    with pytest.raises(ReplayContractError, match="schema_version"):
+        with replay.ReplayLedger(path, tmp_path / "logs"):
+            pass
+
+
+def test_ledger_refuses_symlink_lock_and_substituted_log(tmp_path: Path) -> None:
+    path = tmp_path / "replay.jsonl"
+    lock = tmp_path / ".replay.jsonl.lock"
+    outside = tmp_path / "outside"
+    outside.write_text("do not chmod")
+    lock.symlink_to(outside)
+    with pytest.raises(ReplayContractError, match="lock"):
+        with replay.ReplayLedger(path, tmp_path / "logs"):
+            pass
+    lock.unlink()
+
+    evidence = _verified_replay_evidence()
+    with replay.ReplayLedger(path, tmp_path / "logs") as ledger:
+        ledger.publish_verified(
+            evidence,
+            source_content_sha256="f" * 64,
+            fixture_sha256=evidence.inventory_sha256,
+            log=b"ok",
+        )
+    log_path = tmp_path / "logs" / f"{evidence.trajectory_id}.log"
+    log_path.unlink()
+    log_path.symlink_to(outside)
+    with pytest.raises(ReplayContractError, match="log"):
+        with replay.ReplayLedger(path, tmp_path / "logs"):
+            pass
+
+
+def test_ledger_records_rejection_timeout_and_rejects_contract_alias(tmp_path: Path) -> None:
+    path = tmp_path / "replay.jsonl"
+    with replay.ReplayLedger(path, tmp_path / "logs") as ledger:
+        ledger.publish_failure(
+            trajectory_id="1" * 64,
+            status="rejected",
+            failure_class="unsupported_operation",
+            log=b"rejected",
+        )
+        ledger.publish_failure(
+            trajectory_id="2" * 64,
+            status="timeout",
+            failure_class="verifier_timeout",
+            log=b"timed out",
+        )
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [row["status"] for row in rows] == ["rejected", "timeout"]
+    assert all(row["evidence"] is None for row in rows)
+
+    bad = _verified_replay_evidence("3" * 64, task="other")
+    bad = dataclasses.replace(bad, run_contract_sha256="0" * 64)
+    with replay.ReplayLedger(path, tmp_path / "logs") as ledger:
+        with pytest.raises(ReplayContractError, match="run contract"):
+            ledger.publish_verified(
+                bad,
+                source_content_sha256="f" * 64,
+                fixture_sha256=bad.inventory_sha256,
+                log=b"bad",
+            )
+
+
+def test_inventory_arithmetic_and_explicit_smoke_manifest_are_exhaustive() -> None:
+    def candidate(
+        trajectory_id: str, task: str, language: str, **updates: bool
+    ) -> replay.EligibilityCandidate:
+        gates = {
+            "operations_supported": True,
+            "decontaminated": True,
+            "git_seed_valid": True,
+            "reference_patch_valid": True,
+            "language_digest_present": True,
+            "admission_valid": True,
+        }
+        gates.update(updates)
+        return replay.EligibilityCandidate(
+            trajectory_id, task, language, **gates
+        )
+
+    rows = [
+        candidate("1" * 64, "py-a", "python"),
+        candidate("2" * 64, "py-b", "python"),
+        candidate("3" * 64, "rs-a", "rust"),
+        candidate("4" * 64, "rs-b", "rust"),
+        candidate("5" * 64, "cpp-a", "cpp"),
+        candidate(
+            "6" * 64, "drop-op", "python", operations_supported=False
+        ),
+        candidate(
+            "7" * 64, "drop-admit", "rust", admission_valid=False
+        ),
+    ]
+    inventory = replay.build_eligibility_inventory(rows)
+    assert inventory["total"] == 7
+    assert inventory["eligible_ceiling"] == 5
+    assert inventory["total"] == inventory["eligible_ceiling"] + sum(
+        inventory["exclusions"].values()
+    )
+    smoke = replay.build_smoke_manifest(
+        inventory,
+        ["5" * 64, "4" * 64, "2" * 64, "3" * 64, "1" * 64],
+    )
+    assert [row["language"] for row in smoke["trajectories"]] == [
+        "python", "python", "rust", "rust", "cpp"
+    ]
+    with pytest.raises(
+        ReplayContractError, match=r"exactly 2 Python, 2 Rust, and 1 C\+\+"
+    ):
+        replay.build_smoke_manifest(inventory, ["1" * 64] * 5)
+
+
+def test_replay_cli_requires_every_pinned_inventory_input() -> None:
+    with pytest.raises(SystemExit):
+        replay.parse_args([])
+
+
+def test_eligibility_candidate_requires_all_six_explicit_gates() -> None:
+    with pytest.raises(TypeError):
+        replay.EligibilityCandidate("1" * 64, "py", "python")
+
+
+@pytest.mark.parametrize(
+    "digest",
+    [
+        "registry.example/python@sha256:",
+        "registry.example/python@sha256:" + "A" * 64,
+        "registry.example/python@sha256:" + "a" * 63,
+        "registry.example/python@sha256:" + "a" * 64 + "junk",
+        "registry.example/python:latest",
+    ],
+)
+def test_inventory_cli_rejects_nonexact_policy_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, digest: str
+) -> None:
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b"pinned fixture")
+    monkeypatch.setattr(
+        replay,
+        "SOURCE_LFS_SHA256",
+        hashlib.sha256(source.read_bytes()).hexdigest(),
+    )
+    sidecar = tmp_path / "sidecar.jsonl"
+    sidecar.write_text("")
+    seed_repo = tmp_path / "seed"
+    seed_repo.mkdir()
+    policy = tmp_path / "policy.json"
+    policy.write_text(
+        json.dumps({"schema_version": 1, "language_digests": {"python": digest}})
+    )
+    admission = tmp_path / "admission.json"
+    admission.write_text(
+        json.dumps({"schema_version": 1, "admitted_languages": ["python"]})
+    )
+    smoke = tmp_path / "smoke.json"
+    smoke.write_text("[]")
+    with pytest.raises(ReplayContractError, match="exact language digests"):
+        replay.main(
+            [
+                "--source",
+                str(source),
+                "--sidecar",
+                str(sidecar),
+                "--seed-repo",
+                str(seed_repo),
+                "--policy",
+                str(policy),
+                "--admission",
+                str(admission),
+                "--smoke-manifest",
+                str(smoke),
+                "--ledger",
+                str(tmp_path / "replay.jsonl"),
+                "--logs",
+                str(tmp_path / "logs"),
+                "--out",
+                str(tmp_path / "out"),
+                "--inventory-only",
+            ]
+        )
 
 
 class FakeRestrictedExecutor:

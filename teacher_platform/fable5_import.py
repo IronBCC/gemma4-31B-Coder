@@ -1187,6 +1187,9 @@ class SeedContract:
     protected_paths: tuple[str, ...]
     verify_cmd: str
     fixture_sha256: str
+    source_commit_sha: str = MOONSHINER_REVISION
+    source_tree_sha: str = "0" * 40
+    task_tree_sha: str = "0" * 40
 
 
 @dataclass(frozen=True)
@@ -1202,6 +1205,7 @@ class ReplayCandidate:
     source_terminal_sha256: str
     content_sha256: str
     seed: SeedContract
+    language: CanonicalLanguage | None = None
 
 
 @dataclass(frozen=True)
@@ -1213,6 +1217,21 @@ class ReplayEvidence:
     resolved: bool
     control: bool = False
     namespace: str = "candidate"
+    schema_version: int = 0
+    evidence_sha256: str = ""
+    run_contract_sha256: str = ""
+    task: str = ""
+    language: str = ""
+    dataset_revision: str = ""
+    source_commit_sha: str = ""
+    source_tree_sha: str = ""
+    task_tree_sha: str = ""
+    operation_sha256: str = ""
+    candidate_tree_sha256: str = ""
+    candidate_diff_sha256: str = ""
+    verifier_sha256: str = ""
+    protected_paths: tuple[str, ...] = ()
+    strict_run_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -1797,6 +1816,7 @@ def _replay_matches(
 ) -> bool:
     return bool(
         evidence is not None
+        and evidence.schema_version == 2
         and evidence.resolved is True
         and evidence.control is False
         and evidence.namespace == "candidate"
@@ -1805,6 +1825,27 @@ def _replay_matches(
         and evidence.source_terminal_sha256 == candidate.source_terminal_sha256
         and evidence.candidate_content_sha256 == candidate.content_sha256
         and evidence.fixture_sha256 == candidate.seed.fixture_sha256
+        and evidence.task == candidate.seed.task
+        and evidence.language == candidate.language
+        and evidence.dataset_revision == DATASET_REVISION
+        and evidence.source_commit_sha == candidate.seed.source_commit_sha
+        and evidence.source_tree_sha == candidate.seed.source_tree_sha
+        and evidence.task_tree_sha == candidate.seed.task_tree_sha
+        and evidence.protected_paths == tuple(sorted(candidate.seed.protected_paths))
+        and evidence.strict_run_count == 2
+        and all(
+            re.fullmatch(r"[0-9a-f]{64}", value) is not None
+            for value in (
+                evidence.evidence_sha256,
+                evidence.run_contract_sha256,
+                evidence.operation_sha256,
+                evidence.candidate_tree_sha256,
+                evidence.candidate_diff_sha256,
+                evidence.verifier_sha256,
+            )
+        )
+        and evidence.verifier_sha256
+        == _sha256_bytes(candidate.seed.verify_cmd.encode("utf-8"))
     )
 
 
@@ -2394,7 +2435,7 @@ def build_fable5_pilot(
         replay_cursor = database.execute(
             """
             SELECT candidate_key, task, trajectory_id,
-                   source_terminal_sha256, content_sha256,
+                   language, source_terminal_sha256, content_sha256,
                    fixture_sha256, verify_cmd, protected_paths_json
             FROM candidates WHERE status = 'unique_candidate'
             ORDER BY language, task
@@ -2404,6 +2445,7 @@ def build_fable5_pilot(
             candidate_key,
             task,
             trajectory_id,
+            language,
             source_terminal_sha,
             content_sha,
             fixture_sha,
@@ -2427,6 +2469,7 @@ def build_fable5_pilot(
                     verify_cmd=verify_cmd,
                     fixture_sha256=fixture_sha,
                 ),
+                language=language,
             )
             evidence = (
                 config.replay_lookup(replay_candidate)
@@ -2682,6 +2725,11 @@ def seed_contract_from_git_objects(
     task: str,
     task_json_bytes: bytes,
     tree_entries: Iterable[tuple[str, str, str, str]],
+    *,
+    blob_loader: Callable[[str], bytes] | None = None,
+    source_commit_sha: str = MOONSHINER_REVISION,
+    source_tree_sha: str = "0" * 40,
+    task_tree_sha: str = "0" * 40,
 ) -> SeedContract:
     """Build a seed contract from immutable Git-object metadata only."""
 
@@ -2702,8 +2750,10 @@ def seed_contract_from_git_objects(
     for protected_path in test_files:
         _normalize_fable_path(protected_path)
     prefix = f"tasks/seeds/{task}/"
+    entries = sorted(tree_entries, key=lambda item: item[3])
     inventory: list[dict[str, Any]] = []
-    for mode, object_type, object_id, path in sorted(tree_entries, key=lambda item: item[3]):
+    fixture_records: list[tuple[str, int, bytes]] = []
+    for mode, object_type, object_id, path in entries:
         if not path.startswith(prefix):
             raise ValueError(f"task {task} tree entry escapes its seed prefix")
         relative = path.removeprefix(prefix)
@@ -2725,13 +2775,43 @@ def seed_contract_from_git_objects(
                 "git_object": object_id,
             }
         )
+        files_prefix = f"{prefix}files/"
+        if path.startswith(files_prefix) and blob_loader is not None:
+            fixture_records.append(
+                (
+                    path.removeprefix(files_prefix),
+                    # Replay validates Git archive's 0775/0664 representation,
+                    # then materializes and hashes the confined Git mode.
+                    0o755 if mode == "100755" else 0o644,
+                    blob_loader(object_id),
+                )
+            )
     if not inventory or not any(item["path"] == "task.json" for item in inventory):
         raise ValueError(f"task {task} pinned tree has no task.json")
+    if blob_loader is not None:
+        if not fixture_records:
+            raise ValueError(f"task {task} pinned files tree is empty")
+        digest = hashlib.sha256()
+        for path, mode, data in sorted(
+            fixture_records, key=lambda item: item[0].encode("utf-8")
+        ):
+            encoded_path = path.encode("utf-8")
+            digest.update(len(encoded_path).to_bytes(8, "big"))
+            digest.update(encoded_path)
+            digest.update(mode.to_bytes(4, "big"))
+            digest.update(len(data).to_bytes(8, "big"))
+            digest.update(data)
+        fixture_sha256 = digest.hexdigest()
+    else:
+        fixture_sha256 = _sha256_bytes(_canonical_json_bytes(inventory))
     return SeedContract(
         task=task,
         protected_paths=tuple(test_files),
         verify_cmd=verify_cmd,
-        fixture_sha256=_sha256_bytes(_canonical_json_bytes(inventory)),
+        fixture_sha256=fixture_sha256,
+        source_commit_sha=source_commit_sha,
+        source_tree_sha=source_tree_sha,
+        task_tree_sha=task_tree_sha,
     )
 
 
@@ -2740,6 +2820,26 @@ def _load_seed_contract(root: Path, task: str) -> SeedContract:
         raise ValueError("task ID is not a confined seed name")
     prefix = f"tasks/seeds/{task}"
     try:
+        commit_sha = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", f"{MOONSHINER_REVISION}^{{commit}}"],
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout.strip()
+        source_tree_sha = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", f"{MOONSHINER_REVISION}^{{tree}}"],
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout.strip()
+        task_tree_sha = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", f"{MOONSHINER_REVISION}:{prefix}"],
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout.strip()
+        if commit_sha != MOONSHINER_REVISION:
+            raise ValueError("resolved Moonshiner commit does not match the pin")
         task_json_bytes = subprocess.run(
             ["git", "-C", str(root), "show", f"{MOONSHINER_REVISION}:{prefix}/task.json"],
             capture_output=True,
@@ -2763,7 +2863,22 @@ def _load_seed_contract(root: Path, task: str) -> SeedContract:
         except (ValueError, UnicodeDecodeError) as exc:
             raise ValueError(f"task {task} has malformed pinned Git inventory") from exc
         entries.append((mode, object_type, object_id, path))
-    return seed_contract_from_git_objects(task, task_json_bytes, entries)
+    def load_blob(object_id: str) -> bytes:
+        return subprocess.run(
+            ["git", "-C", str(root), "cat-file", "blob", object_id],
+            capture_output=True,
+            check=True,
+        ).stdout
+
+    return seed_contract_from_git_objects(
+        task,
+        task_json_bytes,
+        entries,
+        blob_loader=load_blob,
+        source_commit_sha=commit_sha,
+        source_tree_sha=source_tree_sha,
+        task_tree_sha=task_tree_sha,
+    )
 
 
 def _load_exclusion(path: Path) -> ExclusionRecord:
@@ -2802,66 +2917,58 @@ def _load_exclusion(path: Path) -> ExclusionRecord:
     )
 
 
-def _load_replay_ledger(path: Path) -> dict[str, ReplayEvidence]:
+def _load_replay_ledger(
+    path: Path, log_dir: Path | None = None
+) -> dict[str, ReplayEvidence]:
+    """Load only atomic schema-v2 attempts with exact ReplayEvidence bindings."""
+
+    try:
+        if __package__:
+            from .fable5_replay import ReplayLedger, replay_evidence_payload
+        else:  # pragma: no cover - script-style tests exercise this route.
+            from fable5_replay import ReplayLedger, replay_evidence_payload
+        with ReplayLedger(path, log_dir or path.parent / "logs") as ledger:
+            attempts = ledger.records
+    except Exception as exc:
+        raise ValueError(f"replay ledger is not a valid schema-v2 attempt ledger: {exc}") from exc
     records: dict[str, ReplayEvidence] = {}
-    required_fields = {
-        "trajectory_id",
-        "source_terminal_sha256",
-        "candidate_content_sha256",
-        "fixture_sha256",
-        "resolved",
-        "control",
-        "namespace",
-    }
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            if not line.strip():
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    f"replay ledger line {line_number} is not valid JSON"
-                ) from exc
-            if type(payload) is not dict or set(payload) != required_fields:
-                raise ValueError(
-                    f"replay ledger line {line_number} must have the exact schema"
-                )
-            for field_name in (
-                "trajectory_id",
-                "source_terminal_sha256",
-                "candidate_content_sha256",
-                "fixture_sha256",
-            ):
-                value = payload[field_name]
-                if type(value) is not str or not re.fullmatch(r"[0-9a-f]{64}", value):
-                    raise ValueError(
-                        f"replay ledger line {line_number} has invalid {field_name}"
-                    )
-            if type(payload["resolved"]) is not bool:
-                raise ValueError(
-                    f"replay ledger line {line_number} resolved must be a boolean"
-                )
-            if type(payload["control"]) is not bool:
-                raise ValueError(
-                    f"replay ledger line {line_number} control must be a boolean"
-                )
-            if type(payload["namespace"]) is not str or not payload["namespace"]:
-                raise ValueError(
-                    f"replay ledger line {line_number} namespace must be explicit"
-                )
-            evidence = ReplayEvidence(
-                trajectory_id=payload["trajectory_id"],
-                source_terminal_sha256=payload["source_terminal_sha256"],
-                candidate_content_sha256=payload["candidate_content_sha256"],
-                fixture_sha256=payload["fixture_sha256"],
-                resolved=payload["resolved"],
-                control=payload["control"],
-                namespace=payload["namespace"],
-            )
-            if evidence.trajectory_id in records:
-                raise ValueError(f"duplicate replay trajectory {evidence.trajectory_id}")
-            records[evidence.trajectory_id] = evidence
+    for attempt in attempts:
+        if attempt["status"] != "verified":
+            continue
+        source = attempt["evidence"]
+        evidence_sha = _sha256_bytes(_canonical_json_bytes(source))
+        if evidence_sha != attempt["evidence_sha256"]:
+            raise ValueError("replay ledger evidence hash join mismatch")
+        # ReplayLedger has already validated the exact v2 schema and both runs.
+        if replay_evidence_payload is None:  # pragma: no cover - import assertion.
+            raise AssertionError
+        joined = ReplayEvidence(
+            trajectory_id=source["trajectory_id"],
+            source_terminal_sha256=source["source_terminal_sha256"],
+            candidate_content_sha256=attempt["source_content_sha256"],
+            fixture_sha256=attempt["fixture_sha256"],
+            resolved=True,
+            control=False,
+            namespace="candidate",
+            schema_version=source["schema_version"],
+            evidence_sha256=evidence_sha,
+            run_contract_sha256=source["run_contract_sha256"],
+            task=source["task"],
+            language=source["language"],
+            dataset_revision=source["dataset_revision"],
+            source_commit_sha=source["source_commit_sha"],
+            source_tree_sha=source["source_tree_sha"],
+            task_tree_sha=source["task_tree_sha"],
+            operation_sha256=source["operation_sha256"],
+            candidate_tree_sha256=source["candidate_tree_sha256"],
+            candidate_diff_sha256=source["candidate_diff_sha256"],
+            verifier_sha256=source["verifier_sha256"],
+            protected_paths=tuple(pair[0] for pair in source["protected_sha256"]),
+            strict_run_count=len(source["runs"]),
+        )
+        if joined.trajectory_id in records:
+            raise ValueError(f"duplicate replay trajectory {joined.trajectory_id}")
+        records[joined.trajectory_id] = joined
     return records
 
 
@@ -2903,6 +3010,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--exclusion", type=Path, action="append", default=[])
     parser.add_argument("--moonshiner-root", type=Path)
     parser.add_argument("--replay-ledger", type=Path)
+    parser.add_argument("--replay-logs", type=Path)
     parser.add_argument("--skip-replay", action="store_true")
     parser.add_argument("--metadata-only", action="store_true")
     return parser.parse_args(argv)
@@ -2945,8 +3053,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return len(rendered)
 
         seed_loader = lambda task: _load_seed_contract(args.moonshiner_root, task)
+    if args.replay_ledger and args.replay_logs is None:
+        raise ValueError("--replay-logs is required with --replay-ledger")
     replay_records = (
-        _load_replay_ledger(args.replay_ledger) if args.replay_ledger else {}
+        _load_replay_ledger(args.replay_ledger, args.replay_logs)
+        if args.replay_ledger
+        else {}
     )
     if not args.skip_replay and not args.metadata_only and not replay_records:
         raise ValueError("--replay-ledger is required unless --skip-replay is set")

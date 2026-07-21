@@ -7,7 +7,9 @@ shared typed parser, and reconstructs only declarative Write/Edit mutations.
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
+import fcntl
 import hashlib
 import json
 import math
@@ -23,6 +25,7 @@ import tarfile
 import tempfile
 import time
 import unicodedata
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -31,6 +34,7 @@ from typing import Any, Final, Protocol
 if __package__:  # Support both ``python -m teacher_platform...`` and local tests.
     from .fable5_import import (
         DATASET_REVISION,
+        SOURCE_LFS_SHA256,
         FableEditOp,
         FableWriteOp,
         ReadOnlyBashOp,
@@ -41,6 +45,7 @@ if __package__:  # Support both ``python -m teacher_platform...`` and local test
 else:  # pragma: no cover - the branch is exercised by local tests.
     from fable5_import import (  # type: ignore[no-redef]
         DATASET_REVISION,
+        SOURCE_LFS_SHA256,
         FableEditOp,
         FableWriteOp,
         ReadOnlyBashOp,
@@ -378,6 +383,21 @@ class ControlSetEvidence:
 
 
 @dataclass(frozen=True)
+class EligibilityCandidate:
+    """One explicit structural candidate and its precomputed admission gates."""
+
+    trajectory_id: str
+    task: str
+    language: str
+    operations_supported: bool
+    decontaminated: bool
+    git_seed_valid: bool
+    reference_patch_valid: bool
+    language_digest_present: bool
+    admission_valid: bool
+
+
+@dataclass(frozen=True)
 class _InventoryFile:
     path: str
     mode: int
@@ -423,6 +443,14 @@ def _canonical_json(value: Any) -> bytes:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def trajectory_identity(
@@ -572,9 +600,13 @@ def _validate_archive(
                 raise ReplayContractError("archive contains a file/directory collision")
     if set(records) != set(git_entries):
         raise ReplayContractError("archive file set does not match pinned Git tree")
+    normalized: dict[str, _InventoryFile] = {}
     for path, record in records.items():
         git_mode, git_object_id = git_entries[path]
-        if record.mode != git_mode:
+        # Git's tar archive adds group-write to regular Git modes (0664/0775).
+        # Compare that exact archive representation, then materialize/hash the
+        # confined Git mode (0644/0755) used by the replay workspace.
+        if record.mode != (git_mode | 0o020):
             raise ReplayContractError("archive mode does not match pinned Git tree")
         algorithm = hashlib.sha1 if len(git_object_id) == 40 else hashlib.sha256
         blob_header = b"blob " + str(len(record.data)).encode("ascii") + b"\0"
@@ -582,7 +614,10 @@ def _validate_archive(
             raise ReplayContractError(
                 "archive bytes do not match pinned Git blob object ID"
             )
-    return tuple(records[path] for path in sorted(records, key=lambda p: p.encode()))
+        normalized[path] = _InventoryFile(path, git_mode, record.data)
+    return tuple(
+        normalized[path] for path in sorted(normalized, key=lambda p: p.encode())
+    )
 
 
 def _write_records(destination: Path, records: Sequence[_InventoryFile]) -> None:
@@ -729,6 +764,8 @@ def materialize_seed(
     records = _validate_archive(
         _git_output(
             source,
+            "-c",
+            "tar.umask=0002",
             "archive",
             "--format=tar",
             source.commit,
@@ -3028,27 +3065,757 @@ def run_control_set(
     )
 
 
+_RUN_EVIDENCE_FIELDS: Final = frozenset(
+    field.name for field in dataclasses.fields(RunEvidence)
+)
+_REPLAY_EVIDENCE_FIELDS: Final = frozenset(
+    field.name for field in dataclasses.fields(ReplayEvidence)
+)
+_ATTEMPT_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "trajectory_id",
+        "status",
+        "failure_class",
+        "source_content_sha256",
+        "fixture_sha256",
+        "run_contract_sha256",
+        "evidence_sha256",
+        "evidence",
+        "log",
+    }
+)
+_LOG_FIELDS: Final = frozenset({"path", "sha256", "bytes"})
+
+
+def replay_evidence_payload(evidence: ReplayEvidence) -> dict[str, Any]:
+    """Return the canonical JSON object for one schema-v2 replay result."""
+
+    if type(evidence) is not ReplayEvidence:
+        raise ReplayContractError("replay evidence must use the exact schema-v2 type")
+    payload = dataclasses.asdict(evidence)
+    return json.loads(_canonical_json(payload))
+
+
+def _tuple_pairs(value: object, field_name: str) -> tuple[tuple[str, Any], ...]:
+    if type(value) is not list:
+        raise ReplayContractError(f"{field_name} must be an array")
+    pairs: list[tuple[str, Any]] = []
+    for item in value:
+        if type(item) is not list or len(item) != 2 or type(item[0]) is not str:
+            raise ReplayContractError(f"{field_name} contains an invalid pair")
+        pairs.append((item[0], item[1]))
+    return tuple(pairs)
+
+
+def _run_evidence_from_payload(payload: object) -> RunEvidence:
+    if type(payload) is not dict or set(payload) != _RUN_EVIDENCE_FIELDS:
+        raise ReplayContractError("run evidence must have the exact schema")
+    values = dict(payload)
+    values["protected_before"] = _tuple_pairs(
+        values["protected_before"], "protected_before"
+    )
+    values["protected_after"] = _tuple_pairs(
+        values["protected_after"], "protected_after"
+    )
+    values["resource_peaks"] = _tuple_pairs(
+        values["resource_peaks"], "resource_peaks"
+    )
+    try:
+        return RunEvidence(**values)
+    except TypeError as exc:  # pragma: no cover - exact fields make this defensive.
+        raise ReplayContractError("run evidence cannot be decoded") from exc
+
+
+def _outer_replay_contract(evidence: ReplayEvidence) -> str:
+    return _sha256(
+        _canonical_json(
+            {
+                "schema_version": 2,
+                "dataset_revision": evidence.dataset_revision,
+                "source_commit_sha": evidence.source_commit_sha,
+                "source_tree_sha": evidence.source_tree_sha,
+                "task_tree_sha": evidence.task_tree_sha,
+                "inventory_sha256": evidence.inventory_sha256,
+                "trajectory_id": evidence.trajectory_id,
+                "source_terminal_sha256": evidence.source_terminal_sha256,
+                "operation_sha256": evidence.operation_sha256,
+                "candidate_tree_sha256": evidence.candidate_tree_sha256,
+                "candidate_diff_sha256": evidence.candidate_diff_sha256,
+                "verifier_sha256": evidence.verifier_sha256,
+                "source_verify_timeout": evidence.source_verify_timeout,
+                "effective_verify_timeout": evidence.effective_verify_timeout,
+                "executor_runs": [run.run_contract_sha256 for run in evidence.runs],
+            }
+        )
+    )
+
+
+def _validate_positive_candidate_run(run: RunEvidence, evidence: ReplayEvidence) -> None:
+    valid = (
+        type(run.schema_version) is int
+        and run.schema_version == 1
+        and type(run.run_id) is str
+        and re.fullmatch(r"[0-9a-f]{32}", run.run_id) is not None
+        and run.control_identity == "candidate"
+        and run.trainable is True
+        and type(run.returncode) is int
+        and run.returncode == 0
+        and type(run.wrapper_returncode) is int
+        and run.wrapper_returncode == 0
+        and type(run.duration_seconds) in (int, float)
+        and not isinstance(run.duration_seconds, bool)
+        and math.isfinite(run.duration_seconds)
+        and 0 <= run.duration_seconds <= evidence.effective_verify_timeout
+        and run.termination == "exited"
+        and _is_sha256(run.raw_output_sha256)
+        and type(run.raw_output_bytes) is int
+        and run.raw_output_bytes >= 0
+        and run.output_truncated is False
+        and run.pre_candidate_tree_sha256 == evidence.candidate_tree_sha256
+        and run.pre_candidate_diff_sha256 == evidence.candidate_diff_sha256
+        and _is_sha256(run.post_candidate_tree_sha256)
+        and run.protected_before == evidence.protected_sha256
+        and run.protected_after == evidence.protected_sha256
+        and run.resolved is True
+        and run.failure_class is None
+        and run.cleanup_state == "verified_removed"
+        and run.policy_version == evidence.policy_version
+        and run.image_digest == evidence.image_digest
+        and run.runtime_version == evidence.runtime_version
+        and _is_sha256(run.run_contract_sha256)
+        and _has_positive_resource_peaks(run)
+    )
+    if not valid:
+        raise ReplayContractError("replay evidence does not contain two strict candidate runs")
+
+
+def validate_replay_evidence_payload(payload: object) -> ReplayEvidence:
+    """Decode and fully validate the only evidence namespace importers may trust."""
+
+    if type(payload) is not dict or set(payload) != _REPLAY_EVIDENCE_FIELDS:
+        raise ReplayContractError("ReplayEvidence must have the exact schema")
+    if payload.get("schema_version") != 2:
+        raise ReplayContractError("ReplayEvidence schema_version must be 2")
+    values = dict(payload)
+    values["protected_sha256"] = _tuple_pairs(
+        values["protected_sha256"], "protected_sha256"
+    )
+    raw_runs = values["runs"]
+    if type(raw_runs) is not list or len(raw_runs) != 2:
+        raise ReplayContractError("ReplayEvidence requires exactly two runs")
+    values["runs"] = tuple(_run_evidence_from_payload(run) for run in raw_runs)
+    try:
+        evidence = ReplayEvidence(**values)
+    except TypeError as exc:  # pragma: no cover
+        raise ReplayContractError("ReplayEvidence cannot be decoded") from exc
+    hashes = (
+        evidence.trajectory_id,
+        evidence.inventory_sha256,
+        evidence.source_terminal_sha256,
+        evidence.operation_sha256,
+        evidence.candidate_tree_sha256,
+        evidence.candidate_diff_sha256,
+        evidence.verifier_sha256,
+        evidence.run_contract_sha256,
+    )
+    valid = (
+        all(_is_sha256(value) for value in hashes)
+        and _TASK_RE.fullmatch(evidence.task) is not None
+        and evidence.language in {"python", "rust", "cpp"}
+        and evidence.dataset_revision == DATASET_REVISION
+        and evidence.source_commit_sha == MOONSHINER_REVISION
+        and _OID_RE.fullmatch(evidence.source_tree_sha) is not None
+        and _OID_RE.fullmatch(evidence.task_tree_sha) is not None
+        and type(evidence.verifier_text) is str
+        and _sha256(evidence.verifier_text.encode("utf-8")) == evidence.verifier_sha256
+        and (
+            evidence.source_verify_timeout is None
+            or (
+                type(evidence.source_verify_timeout) is int
+                and 0 < evidence.source_verify_timeout <= MAX_VERIFY_TIMEOUT
+            )
+        )
+        and type(evidence.effective_verify_timeout) is int
+        and 0 < evidence.effective_verify_timeout <= MAX_VERIFY_TIMEOUT
+        and type(evidence.policy_version) is str
+        and bool(evidence.policy_version)
+        and type(evidence.image_digest) is str
+        and "@sha256:" in evidence.image_digest
+        and _is_runtime_version(evidence.runtime_version)
+        and evidence.resolved is True
+        and evidence.failure_class is None
+        and evidence.control_identity == "candidate"
+        and evidence.trainable is True
+        and len({run.run_id for run in evidence.runs}) == 2
+    )
+    if not valid:
+        raise ReplayContractError("ReplayEvidence is not in the exact candidate namespace")
+    protected_paths = tuple(pair[0] for pair in evidence.protected_sha256)
+    if (
+        not protected_paths
+        or protected_paths != tuple(sorted(set(protected_paths)))
+        or any(
+            _relative_path(path, field_name="protected path") != path
+            or type(digest) is not str
+            or not _is_sha256(digest)
+            for path, digest in evidence.protected_sha256
+        )
+    ):
+        raise ReplayContractError("ReplayEvidence protected hashes are invalid")
+    for run in evidence.runs:
+        _validate_positive_candidate_run(run, evidence)
+    if _outer_replay_contract(evidence) != evidence.run_contract_sha256:
+        raise ReplayContractError("ReplayEvidence run contract mismatch")
+    return evidence
+
+
+def _atomic_write_0600(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    temporary = Path(temporary_name)
+    try:
+        if os.fstat(fd).st_dev != path.parent.stat().st_dev:
+            raise ReplayContractError("temporary publication is not on the target filesystem")
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            fd = -1
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temporary.unlink(missing_ok=True)
+
+
+class ReplayLedger:
+    """Exclusive, fully validated, atomically published replay attempt ledger."""
+
+    def __init__(self, path: Path, log_dir: Path) -> None:
+        self.path = Path(path)
+        self.log_dir = Path(log_dir)
+        self._lock_fd: int | None = None
+        self._records: list[dict[str, Any]] = []
+
+    def __enter__(self) -> ReplayLedger:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.parent / f".{self.path.name}.lock"
+        try:
+            self._lock_fd = os.open(
+                lock_path,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                0o600,
+            )
+        except OSError as exc:
+            raise ReplayContractError("replay lock is not a confined regular file") from exc
+        lock_stat = os.fstat(self._lock_fd)
+        if (
+            not stat.S_ISREG(lock_stat.st_mode)
+            or lock_stat.st_nlink != 1
+            or lock_stat.st_dev != self.path.parent.stat().st_dev
+        ):
+            os.close(self._lock_fd)
+            self._lock_fd = None
+            raise ReplayContractError("replay lock is not a same-filesystem single-link file")
+        os.fchmod(self._lock_fd, 0o600)
+        try:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(self._lock_fd)
+            self._lock_fd = None
+            raise ReplayContractError("replay ledger is already locked") from exc
+        try:
+            self._records = self._load_and_validate()
+        except Exception:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if self._lock_fd is not None:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            os.close(self._lock_fd)
+            self._lock_fd = None
+
+    @property
+    def completed_trajectory_ids(self) -> frozenset[str]:
+        return frozenset(record["trajectory_id"] for record in self._records)
+
+    @property
+    def records(self) -> tuple[Mapping[str, Any], ...]:
+        return tuple(self._records)
+
+    def _require_locked(self) -> None:
+        if self._lock_fd is None:
+            raise ReplayContractError("replay ledger is not locked")
+
+    def _validate_attempt(self, payload: object, line_number: int) -> dict[str, Any]:
+        if type(payload) is not dict or set(payload) != _ATTEMPT_FIELDS:
+            raise ReplayContractError(
+                f"replay ledger line {line_number} is not a schema-v2 attempt ledger record"
+            )
+        if payload["schema_version"] != 2:
+            raise ReplayContractError(
+                f"replay ledger line {line_number} schema_version must be 2"
+            )
+        trajectory_id = payload["trajectory_id"]
+        if not _is_sha256(trajectory_id):
+            raise ReplayContractError(f"replay ledger line {line_number} has invalid trajectory")
+        status = payload["status"]
+        if status not in {"verified", "rejected", "timeout"}:
+            raise ReplayContractError(f"replay ledger line {line_number} has invalid status")
+        log = payload["log"]
+        if type(log) is not dict or set(log) != _LOG_FIELDS:
+            raise ReplayContractError(f"replay ledger line {line_number} has invalid log binding")
+        if type(log["path"]) is not str or log["path"] != f"{trajectory_id}.log":
+            raise ReplayContractError(f"replay ledger line {line_number} has invalid log path")
+        if type(log["sha256"]) is not str or not _is_sha256(log["sha256"]):
+            raise ReplayContractError(f"replay ledger line {line_number} has invalid log hash")
+        if type(log["bytes"]) is not int or log["bytes"] < 0:
+            raise ReplayContractError(f"replay ledger line {line_number} has invalid log size")
+        log_path = self.log_dir / log["path"]
+        try:
+            log_lstat = log_path.lstat()
+        except FileNotFoundError as exc:
+            raise ReplayContractError(
+                f"replay ledger line {line_number} log is missing"
+            ) from exc
+        if (
+            not stat.S_ISREG(log_lstat.st_mode)
+            or log_lstat.st_nlink != 1
+            or log_lstat.st_dev != self.log_dir.stat().st_dev
+        ):
+            raise ReplayContractError(f"replay ledger line {line_number} log is missing")
+        if stat.S_IMODE(log_lstat.st_mode) != 0o600:
+            raise ReplayContractError(f"replay ledger line {line_number} log mode is not 0600")
+        log_fd = os.open(log_path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            opened = os.fstat(log_fd)
+            if (opened.st_dev, opened.st_ino) != (log_lstat.st_dev, log_lstat.st_ino):
+                raise ReplayContractError(
+                    f"replay ledger line {line_number} log identity changed"
+                )
+            with os.fdopen(log_fd, "rb", closefd=True) as handle:
+                log_fd = -1
+                log_bytes = handle.read()
+        finally:
+            if log_fd >= 0:
+                os.close(log_fd)
+        if (
+            log["bytes"] != len(log_bytes)
+            or log["sha256"] != _sha256(log_bytes)
+        ):
+            raise ReplayContractError(f"replay ledger line {line_number} log hash mismatch")
+        if status == "verified":
+            evidence = validate_replay_evidence_payload(payload["evidence"])
+            evidence_payload = replay_evidence_payload(evidence)
+            evidence_sha = _sha256(_canonical_json(evidence_payload))
+            if (
+                payload["failure_class"] is not None
+                or payload["source_content_sha256"] is None
+                or not _is_sha256(payload["source_content_sha256"])
+                or payload["fixture_sha256"] != evidence.inventory_sha256
+                or payload["run_contract_sha256"] != evidence.run_contract_sha256
+                or payload["evidence_sha256"] != evidence_sha
+            ):
+                raise ReplayContractError(
+                    f"replay ledger line {line_number} verified binding mismatch"
+                )
+        else:
+            if (
+                type(payload["failure_class"]) is not str
+                or not payload["failure_class"]
+                or any(
+                    payload[field] is not None
+                    for field in (
+                        "source_content_sha256",
+                        "fixture_sha256",
+                        "run_contract_sha256",
+                        "evidence_sha256",
+                        "evidence",
+                    )
+                )
+            ):
+                raise ReplayContractError(
+                    f"replay ledger line {line_number} failure binding mismatch"
+                )
+        return dict(payload)
+
+    def _load_and_validate(self) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        ledger_stat = self.path.lstat()
+        if (
+            not stat.S_ISREG(ledger_stat.st_mode)
+            or ledger_stat.st_nlink != 1
+            or ledger_stat.st_dev != self.path.parent.stat().st_dev
+        ):
+            raise ReplayContractError("replay ledger is not a confined single-link file")
+        if stat.S_IMODE(ledger_stat.st_mode) != 0o600:
+            raise ReplayContractError("replay ledger mode is not 0600")
+        ledger_fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            opened = os.fstat(ledger_fd)
+            if (opened.st_dev, opened.st_ino) != (
+                ledger_stat.st_dev,
+                ledger_stat.st_ino,
+            ):
+                raise ReplayContractError("replay ledger identity changed while opening")
+            with os.fdopen(ledger_fd, "r", encoding="utf-8", closefd=True) as handle:
+                ledger_fd = -1
+                ledger_lines = handle.read().splitlines()
+        finally:
+            if ledger_fd >= 0:
+                os.close(ledger_fd)
+        records: list[dict[str, Any]] = []
+        trajectories: set[str] = set()
+        contracts: set[str] = set()
+        for line_number, line in enumerate(ledger_lines, start=1):
+            if not line:
+                raise ReplayContractError(f"replay ledger line {line_number} is empty")
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ReplayContractError(
+                    f"replay ledger line {line_number} is invalid JSON"
+                ) from exc
+            record = self._validate_attempt(payload, line_number)
+            trajectory = record["trajectory_id"]
+            if trajectory in trajectories:
+                raise ReplayContractError(f"duplicate trajectory {trajectory}")
+            trajectories.add(trajectory)
+            contract = record["run_contract_sha256"]
+            if contract is not None:
+                if contract in contracts:
+                    raise ReplayContractError("duplicate run contract")
+                contracts.add(contract)
+            records.append(record)
+        return records
+
+    def _publish(
+        self,
+        record: dict[str, Any],
+        log: bytes,
+        callback: Callable[[Path], None] | None,
+    ) -> None:
+        self._require_locked()
+        trajectory = record["trajectory_id"]
+        if trajectory in self.completed_trajectory_ids:
+            raise ReplayContractError(f"duplicate trajectory {trajectory}")
+        contract = record["run_contract_sha256"]
+        if contract is not None and any(
+            existing["run_contract_sha256"] == contract for existing in self._records
+        ):
+            raise ReplayContractError("duplicate run contract")
+        log_path = self.log_dir / f"{trajectory}.log"
+        _atomic_write_0600(log_path, log)
+        if callback is not None:
+            callback(log_path)
+        record["log"] = {
+            "path": log_path.name,
+            "sha256": _sha256(log),
+            "bytes": len(log),
+        }
+        validated = self._validate_attempt(record, len(self._records) + 1)
+        output = b"".join(
+            _canonical_json(item) + b"\n" for item in (*self._records, validated)
+        )
+        _atomic_write_0600(self.path, output)
+        self._records.append(validated)
+
+    def publish_verified(
+        self,
+        evidence: ReplayEvidence,
+        *,
+        source_content_sha256: str,
+        fixture_sha256: str,
+        log: bytes,
+        after_log_publish: Callable[[Path], None] | None = None,
+    ) -> None:
+        evidence_payload = replay_evidence_payload(evidence)
+        validated = validate_replay_evidence_payload(evidence_payload)
+        if not _is_sha256(source_content_sha256):
+            raise ReplayContractError("source content hash is invalid")
+        if fixture_sha256 != validated.inventory_sha256:
+            raise ReplayContractError("fixture binding mismatch")
+        self._publish(
+            {
+                "schema_version": 2,
+                "trajectory_id": validated.trajectory_id,
+                "status": "verified",
+                "failure_class": None,
+                "source_content_sha256": source_content_sha256,
+                "fixture_sha256": fixture_sha256,
+                "run_contract_sha256": validated.run_contract_sha256,
+                "evidence_sha256": _sha256(_canonical_json(evidence_payload)),
+                "evidence": evidence_payload,
+                "log": {},
+            },
+            log,
+            after_log_publish,
+        )
+
+    def publish_failure(
+        self,
+        *,
+        trajectory_id: str,
+        status: str,
+        failure_class: str,
+        log: bytes,
+    ) -> None:
+        if status not in {"rejected", "timeout"}:
+            raise ReplayContractError("failure status must be rejected or timeout")
+        if not _is_sha256(trajectory_id):
+            raise ReplayContractError("trajectory ID is invalid")
+        self._publish(
+            {
+                "schema_version": 2,
+                "trajectory_id": trajectory_id,
+                "status": status,
+                "failure_class": failure_class,
+                "source_content_sha256": None,
+                "fixture_sha256": None,
+                "run_contract_sha256": None,
+                "evidence_sha256": None,
+                "evidence": None,
+                "log": {},
+            },
+            log,
+            None,
+        )
+
+
+_ELIGIBILITY_GATES: Final = (
+    ("operations_supported", "unsupported_operations"),
+    ("decontaminated", "contamination"),
+    ("git_seed_valid", "invalid_git_seed"),
+    ("reference_patch_valid", "invalid_reference_patch"),
+    ("language_digest_present", "missing_language_digest"),
+    ("admission_valid", "functional_admission_failed"),
+)
+
+
+def build_eligibility_inventory(
+    rows: Sequence[EligibilityCandidate],
+) -> dict[str, Any]:
+    """Compute a deterministic, exclusive gate partition without discovery."""
+
+    seen: set[str] = set()
+    exclusions = {reason: 0 for _, reason in _ELIGIBILITY_GATES}
+    eligible: list[dict[str, str]] = []
+    gate_pass = {field: 0 for field, _ in _ELIGIBILITY_GATES}
+    for row in rows:
+        if type(row) is not EligibilityCandidate:
+            raise ReplayContractError("eligibility rows must use the exact candidate type")
+        if not _is_sha256(row.trajectory_id) or row.trajectory_id in seen:
+            raise ReplayContractError("eligibility trajectory identity is invalid or duplicate")
+        if not _TASK_RE.fullmatch(row.task) or row.language not in {"python", "rust", "cpp"}:
+            raise ReplayContractError("eligibility task or language is invalid")
+        seen.add(row.trajectory_id)
+        dropped = False
+        for field, reason in _ELIGIBILITY_GATES:
+            value = getattr(row, field)
+            if type(value) is not bool:
+                raise ReplayContractError(f"eligibility gate {field} must be boolean")
+            if not value:
+                exclusions[reason] += 1
+                dropped = True
+                break
+            gate_pass[field] += 1
+        if not dropped:
+            eligible.append(
+                {
+                    "trajectory_id": row.trajectory_id,
+                    "task": row.task,
+                    "language": row.language,
+                }
+            )
+    eligible.sort(key=lambda row: (row["language"], row["task"], row["trajectory_id"]))
+    total = len(rows)
+    if total != len(eligible) + sum(exclusions.values()):
+        raise ReplayContractError("eligibility manifest arithmetic mismatch")
+    return {
+        "schema_version": 1,
+        "gate_order": [field for field, _ in _ELIGIBILITY_GATES],
+        "total": total,
+        "gate_pass": gate_pass,
+        "exclusions": exclusions,
+        "eligible_ceiling": len(eligible),
+        "eligible_by_language": dict(
+            sorted(Counter(row["language"] for row in eligible).items())
+        ),
+        "eligible": eligible,
+    }
+
+
+def build_smoke_manifest(
+    inventory: Mapping[str, Any], trajectory_ids: Sequence[str]
+) -> dict[str, Any]:
+    """Validate an explicit smoke set; never select candidates implicitly."""
+
+    eligible = inventory.get("eligible")
+    if type(eligible) is not list:
+        raise ReplayContractError("eligibility inventory has no explicit candidates")
+    by_id = {
+        row["trajectory_id"]: row
+        for row in eligible
+        if type(row) is dict and type(row.get("trajectory_id")) is str
+    }
+    if len(trajectory_ids) != 5 or len(set(trajectory_ids)) != 5:
+        raise ReplayContractError("smoke requires exactly 2 Python, 2 Rust, and 1 C++")
+    try:
+        selected = [by_id[trajectory_id] for trajectory_id in trajectory_ids]
+    except KeyError as exc:
+        raise ReplayContractError("smoke trajectory is outside the eligible intersection") from exc
+    counts = Counter(row["language"] for row in selected)
+    if counts != Counter({"python": 2, "rust": 2, "cpp": 1}):
+        raise ReplayContractError("smoke requires exactly 2 Python, 2 Rust, and 1 C++")
+    order = {"python": 0, "rust": 1, "cpp": 2}
+    selected = sorted(
+        selected,
+        key=lambda row: (order[row["language"]], row["task"], row["trajectory_id"]),
+    )
+    return {
+        "schema_version": 1,
+        "counts": {"python": 2, "rust": 2, "cpp": 1},
+        "trajectories": selected,
+        "selection_sha256": _sha256(_canonical_json(selected)),
+    }
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--sidecar", type=Path, required=True)
+    parser.add_argument("--seed-repo", type=Path, required=True)
+    parser.add_argument("--policy", type=Path, required=True)
+    parser.add_argument("--admission", type=Path, required=True)
+    parser.add_argument("--smoke-manifest", type=Path, required=True)
+    parser.add_argument("--ledger", type=Path, required=True)
+    parser.add_argument("--logs", type=Path, required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--inventory-only", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Publish only an explicit precomputed inventory in this code-only phase."""
+
+    args = parse_args(argv)
+    if not args.inventory_only:
+        raise ReplayContractError("live replay is disabled; use --inventory-only")
+    for name in ("source", "sidecar", "seed_repo", "policy", "admission", "smoke_manifest"):
+        if not getattr(args, name).exists():
+            raise ReplayContractError(f"explicit --{name.replace('_', '-')} input is missing")
+    if _sha256_path(args.source) != SOURCE_LFS_SHA256:
+        raise ReplayContractError("explicit source artifact does not match the pinned hash")
+    try:
+        policy_payload = json.loads(args.policy.read_text(encoding="utf-8"))
+        admission_payload = json.loads(args.admission.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ReplayContractError("policy/admission input is invalid JSON") from exc
+    if (
+        type(policy_payload) is not dict
+        or set(policy_payload) != {"schema_version", "language_digests"}
+        or policy_payload["schema_version"] != 1
+        or type(policy_payload["language_digests"]) is not dict
+        or any(
+            language not in {"python", "rust", "cpp"}
+            or type(digest) is not str
+            or re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", digest) is None
+            for language, digest in policy_payload["language_digests"].items()
+        )
+    ):
+        raise ReplayContractError("policy input must bind exact language digests")
+    if (
+        type(admission_payload) is not dict
+        or set(admission_payload) != {"schema_version", "admitted_languages"}
+        or admission_payload["schema_version"] != 1
+        or type(admission_payload["admitted_languages"]) is not list
+        or any(
+            language not in {"python", "rust", "cpp"}
+            for language in admission_payload["admitted_languages"]
+        )
+        or len(set(admission_payload["admitted_languages"]))
+        != len(admission_payload["admitted_languages"])
+    ):
+        raise ReplayContractError("admission input must bind exact admitted languages")
+    digests = policy_payload["language_digests"]
+    admitted = frozenset(admission_payload["admitted_languages"])
+    rows: list[EligibilityCandidate] = []
+    eligibility_fields = {field.name for field in dataclasses.fields(EligibilityCandidate)}
+    for line_number, line in enumerate(args.sidecar.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            payload = json.loads(line)
+            if type(payload) is not dict or set(payload) != eligibility_fields:
+                raise ReplayContractError(
+                    f"sidecar line {line_number} is missing an explicit gate"
+                )
+            row = EligibilityCandidate(**payload)
+            rows.append(
+                dataclasses.replace(
+                    row,
+                    language_digest_present=(
+                        row.language_digest_present and row.language in digests
+                    ),
+                    admission_valid=(row.admission_valid and row.language in admitted),
+                )
+            )
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ReplayContractError(f"sidecar line {line_number} is invalid") from exc
+    inventory = build_eligibility_inventory(rows)
+    smoke_payload = json.loads(args.smoke_manifest.read_text(encoding="utf-8"))
+    if type(smoke_payload) is not list or any(type(value) is not str for value in smoke_payload):
+        raise ReplayContractError("smoke manifest input must be an explicit trajectory ID list")
+    smoke = build_smoke_manifest(inventory, smoke_payload)
+    args.out.mkdir(parents=True, exist_ok=True)
+    _atomic_write_0600(args.out / "eligibility.json", _canonical_json(inventory) + b"\n")
+    _atomic_write_0600(args.out / "smoke.json", _canonical_json(smoke) + b"\n")
+    return 0
+
+
 __all__ = [
     "AdmissionEvidence",
     "CandidateState",
     "ControlSetEvidence",
     "DockerExecutor",
     "DockerPolicy",
+    "EligibilityCandidate",
     "GitSeedSource",
     "MOONSHINER_REVISION",
     "MutationPlan",
     "ReferencePatchContract",
     "ReplayContractError",
     "ReplayEvidence",
+    "ReplayLedger",
     "RestrictedExecutor",
     "RunEvidence",
     "SeedContract",
     "canonical_mutation_plan",
+    "build_eligibility_inventory",
+    "build_smoke_manifest",
     "functional_admission_probe",
     "materialize_seed",
     "preflight_reference_patch",
     "reconstruct_candidate",
     "run_control_set",
+    "replay_evidence_payload",
     "trajectory_identity",
     "verify_candidate",
+    "validate_replay_evidence_payload",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

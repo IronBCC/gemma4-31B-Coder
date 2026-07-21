@@ -73,9 +73,10 @@ this change.
   trajectories, validates structure, normalizes supported tool calls, applies
   behavior and decontamination gates, token-filters, and writes the SFT JSONL
   plus manifest.
-- `teacher_platform/fable5_replay.py` joins a selected task to the pinned
-  Moonshiner seed, replays it in a disposable restricted workspace, protects
-  test files, and records baseline/final verification evidence.
+- `teacher_platform/fable5_replay.py` joins a selected trajectory identity to a
+  seed materialized from the pinned Moonshiner Git object, reconstructs it in a
+  disposable restricted workspace, protects test files, and records versioned
+  baseline/reference/candidate verification evidence.
 - `teacher_platform/tests/test_fable5_import.py` tests cumulative-row collapse,
   conversion, pairing, behavior gates, deduplication, and manifest arithmetic.
 - `teacher_platform/tests/test_fable5_replay.py` tests seed identity,
@@ -109,7 +110,15 @@ One streaming pass retains a row only when all conditions hold:
 9. Exact task/prompt/content hashes and fuzzy prompt matching prove no overlap
    with hard30, SWE-Lite 0:30, the frozen 239 Multi-SWE-Rust IDs, or the C++
    evaluation pool. Ambiguous matches fail closed.
-10. Content-hash deduplication retains one deterministic representative.
+10. Content-hash deduplication retains one deterministic representative per
+    task after all Boolean gates, ordered by the exact ascending tuple
+    `(first_edit_index, max_read_streak, normalized_command_count,
+    rendered_token_count, canonical_terminal_sha256)`. A missing first edit is
+    already a behavior rejection, not a sortable value. The primary identity is
+    nevertheless
+    `trajectory_id = sha256(dataset_revision || NUL || task || NUL ||
+    canonical_terminal_json)`, never bare task ID; this prevents replay/resume
+    collisions and keeps the one-row-per-task policy explicit.
 
 The row-level validation split is retained only as an audit count. It is never
 written into training output.
@@ -123,7 +132,15 @@ path scanning.
 
 Supported calls map as follows:
 
-- `Bash(command)` -> native `bash` with the command unchanged.
+- `Bash(command)` -> one of two shared typed classes. `ReadOnlyBashOp` uses a
+  strict static allowlist with no scripts, substitutions, redirections,
+  mutation-capable flags, external absolute paths, or unknown syntax.
+  `VerifierEvidenceOp` must equal the pinned seed `verify_cmd` byte-for-byte as
+  a UTF-8 string; no trimming, line-ending, quoting, or whitespace normalization
+  is permitted. It is retained as trusted build/test evidence
+  but never used to construct candidate state. Every other Bash form rejects as
+  `ambiguous_bash_mutation`. Generated-state effects from verifier evidence are
+  not described as read-only and do not enter reconstruction.
 - `Read(file_path, offset, limit)` -> a shell-quoted `sed -n`/`cat` command.
 - `Write(file_path, content)` -> a deterministic Python `Path.write_text`
   heredoc whose payload is base64 encoded.
@@ -135,8 +152,11 @@ Supported calls map as follows:
   option has an exact supported mapping; otherwise reject the trajectory.
 
 Paths must be relative, NUL-free, and remain inside the task workspace. Absolute
-paths, `..`, shell newlines in path fields, symlinks escaping the workspace, and
-test/protected-file writes fail closed.
+paths, `..`, shell newlines in path fields, every seed symlink or special file,
+symlinks escaping the workspace, internal aliases to protected files, and
+test/protected-file writes fail closed. Import and replay share one immutable
+typed operation parser; the Gemma command and reconstructed candidate must be
+derived from the same canonical operation sequence.
 
 Fable can issue parallel calls in one assistant message, while mini-SWE expects
 one Bash call per turn. Conversion emits one assistant/tool-result pair per
@@ -177,43 +197,70 @@ declarative source mutations and independently verified from the pinned
 `tasks/seeds/<task>` fixture. A trajectory whose final state depends on an
 arbitrary Bash mutation is not reconstructable and is rejected.
 
-1. Copy the seed `files/` tree into a fresh disposable workspace.
-2. Record hashes for `test_files` and every fixture file before replay.
-3. Run the seed's exact `verify_cmd` with `verify_timeout`; require the baseline
-   to fail when the task contract declares a failing baseline.
-4. Reconstruct the candidate only from exact `Write`, `Edit`, or equivalent
-   declarative patch operations. Do not execute transcript Bash, tests, package
-   managers, scripts, interpreters, or command substitutions to build the
-   candidate. Any unproven Bash source mutation rejects the task.
-5. Apply the reconstructed candidate in an isolated, network-disabled,
-   resource-bounded environment. Never execute a Fable command on the host.
-6. Require all declared protected/test files to remain byte-identical.
-7. Run the exact verification command twice in fresh candidate states and
-   require identical successful return codes and output hashes.
-8. Capture a binary source diff; require it to be nonempty and free of rejected
-   paths.
-9. Record task/revision/fixture/command/diff hashes, return codes, durations,
-   bounded log paths, and cleanup status.
+1. Materialize `tasks/seeds/<task>` from the exact pinned Git object, not a
+   mutable checkout. Record its tree/object IDs and canonical inventory hash.
+2. Reject symlinks, hardlink anomalies, devices, FIFOs, sockets, submodules,
+   non-regular protected files, and escaping paths. Record hashes and modes for
+   `test_files` and every fixture file before replay.
+3. Run the seed's exact `verify_cmd`. A missing source `verify_timeout` uses the
+   versioned policy default of 300 seconds; explicit values must be positive
+   non-Boolean integers at most 1800 seconds. Record source and effective
+   values. The untouched seed baseline must fail for this coding-task lane.
+4. Reconstruct the candidate only from exact typed `Write` and `Edit` operations
+   emitted by the shared importer parser. Do not execute transcript Bash,
+   scripts, interpreters, package managers, or command substitutions to build
+   candidate state. Any unproven source mutation rejects the task.
+5. Apply the reconstructed candidate in an admitted, network-disabled,
+   secret-isolated, resource-bounded environment. Never expose host `/`, home,
+   credentials, Docker socket, or production files; never execute a Fable
+   command on the host.
+6. Require all declared protected/test files to remain byte-identical in every
+   control and verification run.
+7. Materialize two fresh candidate states independently from the pinned Git
+   object and canonical operation plan. Require both exact verifier runs to
+   return zero. Record each bounded raw output hash independently; raw hashes
+   need not equal because build paths, durations, and test order can differ.
+8. Capture a canonical binary source diff/tree hash before each verifier; require
+   the two pre-verification candidate hashes to match, be nonempty, and exclude
+   rejected paths.
+9. Preflight `reference_fix.patch` with a confined parser plus
+   `git apply --check`; invalid/missing patches are excluded and counted before
+   smoke selection. Reject absolute/parent paths, symlink/submodule/binary/
+   rename/copy/mode-only changes, and protected-file changes.
+10. Record a versioned `run_contract_sha256` over dataset/Git revisions,
+    trajectory and canonical-operation hashes, fixture tree, verifier command,
+    effective timeout, executor/image policy, and resource bounds. Evidence also
+    records per-run return/duration/termination/output/state hashes, cleanup,
+    and resource peaks.
 
-The first runtime gate is five tasks: two Python, two Rust, and one C++ when a
-clean C++ candidate exists. Each task runs three controls: the reconstructed
-Fable candidate must pass, the pinned `reference_fix.patch` must pass as a
-separate harness-positive control, and a deliberately corrupted candidate must
-fail. Control artifacts are tagged and cannot enter training output.
+The first runtime gate is a manifest-pinned set of five trajectories selected
+only after structural conversion: two Python, two Rust, and one C++ from the
+intersection of reconstructable candidates, valid seeds, valid reference
+patches, cached toolchains, and admitted sandbox policy. Each task runs the
+untouched seed as the required tainted negative control, the pinned reference
+patch as the tainted positive control, and the reconstructed Fable candidate.
+An additional deterministic corrupt candidate is optional diagnostic evidence,
+not an admission requirement. Only the candidate can enter training output.
 
-Linux `bwrap` with a read-only host root, isolated PID namespace, temporary home
-and `/tmp`, clear environment, disabled network, and only the fixture workspace
-writable is preferred. No image pull is automatic. If Docker is required, the
-gate uses only an already-cached immutable digest and inherits the 40-GiB
-free-space floor, non-root execution, CPU/memory/PID limits, exact-CID cleanup,
-no host mounts or Docker socket, no broad prune, and no production-port changes.
-A missing safe environment stops with an inventory report.
+Executor admission is functional, not `command -v`: it must run the complete
+isolation/resource/cleanup policy plus the required language executable. The
+current host's `bwrap --unshare-all` shape is not admitted, so the runtime path
+is Docker only unless a new full probe proves otherwise. Docker uses exact
+already-cached immutable digests per language, copies seed inputs rather than
+host-mounting them, and inherits the 40-GiB free-space floor, `--network none`,
+read-only root, a capability-free trusted root PID-1 wrapper solely for setup,
+hashing, and result publication, a distinct non-root verifier UID/GID, tmpfs
+scratch, CPU/memory/PID/file-size/wall
+limits, exact-CID plus descendant cleanup, no Docker socket, no broad prune, and
+no production-port changes. A missing digest/toolchain or failed admission
+stops with an inventory report; no image pull is automatic.
 
 ## Outputs and manifest
 
 The pilot output is `data/fable5_agentic_pilot_v1/`:
 
-- `train.jsonl`: Gemma-native SFT rows, one full trajectory per task;
+- `train.jsonl`: Gemma-native SFT rows, one full trajectory per task, keyed by
+  `trajectory_id` and carrying `source_instance_id=<task>`;
 - `manifest.json`: pinned revisions and hashes, row arithmetic, per-language and
   per-category counts, all drop reasons, tool-conversion counts, token and
   first-edit histograms, dedup hashes, decontamination hashes, replay evidence
@@ -226,7 +273,7 @@ The pilot output is `data/fable5_agentic_pilot_v1/`:
   protected test content.
 
 Every source label is
-`teacher:fable5:aef8506515979988aa5c1a423f5b0fb3cee60382:<task>`.
+`teacher:fable5:aef8506515979988aa5c1a423f5b0fb3cee60382:<trajectory_id>`.
 
 Arithmetic must prove:
 
@@ -244,14 +291,16 @@ behavior_drop + replay_drop + token_drop + output`.
 4. The five-task independent replay smoke passes five of five; any verifier or
    cleanup failure stops the lane.
 5. The complete CPU build advances to training consideration only if it yields
-   at least 300 independently verified Python/Rust/C++ trajectories, at least
-   70% edit by command ten, median first edit at most eight, and zero format
-   failures.
+   at least 150 independently verified unique-task trajectories, including at
+   least 100 Python, 30 Rust, and 12 C++, at least 70% edit by command ten,
+   median first edit at most eight, and zero format failures. These floors sit
+   below the audited pinned valid-seed/reference ceiling (277 total) but remain
+   blocking; the manifest reports the exact eligible ceiling before replay.
 
-If fewer than 300 survive, report the honest per-language yield and bank the
-converter. Do not relax tool, verification, contamination, or behavior rules to
-hit the target. A future mixture may begin at 5-10% Fable rows; no mixture or
-training launch is authorized by this design.
+If any overall or language floor is missed, report the honest per-language
+yield and bank the converter. Do not relax tool, verification, contamination,
+or behavior rules to hit the target. A future mixture may begin at 5-10% Fable
+rows; no mixture or training launch is authorized by this design.
 
 ## Non-goals
 

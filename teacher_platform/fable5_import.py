@@ -2,10 +2,32 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import shlex
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import PurePosixPath
 from typing import Any, Final, Iterable, Literal
+
+try:
+    # Script-style imports put this directory first on sys.path.
+    from teacher_platform import (  # type: ignore[attr-defined]
+        UnsupportedTrajectoryTool,
+        _normalize_trajectory_bash_command,
+        _quoted_python_editor,
+        _reject_trajectory_relative_escape,
+        _trajectory_shell_tokens,
+    )
+except ImportError:
+    # Module-style imports resolve ``teacher_platform`` as a namespace package.
+    from teacher_platform.teacher_platform import (
+        UnsupportedTrajectoryTool,
+        _normalize_trajectory_bash_command,
+        _quoted_python_editor,
+        _reject_trajectory_relative_escape,
+        _trajectory_shell_tokens,
+    )
 
 
 DATASET_ID: Final = "greghavens/fable-5-coding-and-debugging-traces"
@@ -16,6 +38,11 @@ SOURCE_LFS_SHA256: Final = (
 SOURCE_BYTES: Final = 730_331_947
 EXPECTED_ROWS: Final = 12_408
 EXPECTED_TERMINAL_TRAJECTORIES: Final = 2_377
+MINI_SWE_SYSTEM: Final = (
+    "You are a practical software engineer using a shell to fix one repository "
+    "bug. Prefer a small correct source edit over extended inspection. Before each "
+    "command write 1-3 terse sentences of reasoning, then emit one bash tool call."
+)
 
 CanonicalLanguage = Literal["python", "rust", "cpp"]
 
@@ -336,3 +363,367 @@ def select_terminal_row(row: dict[str, Any]) -> SelectedTrajectory:
         messages=validated_messages,
         tools_json=tools_json,
     )
+
+
+def _fable_arguments(tool_call: object) -> tuple[str, dict[str, Any]]:
+    if type(tool_call) is not dict or tool_call.get("type") != "function":
+        raise UnsupportedTrajectoryTool("malformed Fable tool call")
+    function = tool_call.get("function")
+    if type(function) is not dict or type(function.get("name")) is not str:
+        raise UnsupportedTrajectoryTool("malformed Fable tool function")
+    name = function["name"]
+    raw_arguments = function.get("arguments")
+    if type(raw_arguments) is str:
+        try:
+            raw_arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError as exc:
+            raise UnsupportedTrajectoryTool(
+                "Fable tool arguments contain malformed JSON"
+            ) from exc
+    if type(raw_arguments) is not dict:
+        raise UnsupportedTrajectoryTool("Fable tool arguments must be an object")
+    if any(type(key) is not str for key in raw_arguments):
+        raise UnsupportedTrajectoryTool("Fable tool argument keys must be strings")
+    return name, raw_arguments
+
+
+def _require_keys(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    required: frozenset[str],
+    optional: frozenset[str] = frozenset(),
+) -> None:
+    missing = sorted(required - arguments.keys())
+    if missing:
+        raise UnsupportedTrajectoryTool(
+            f"{name} missing required arguments: {', '.join(missing)}"
+        )
+    unknown = sorted(arguments.keys() - required - optional)
+    if unknown:
+        raise UnsupportedTrajectoryTool(
+            f"unsupported {name} arguments: {', '.join(unknown)}"
+        )
+
+
+def _required_string(
+    arguments: dict[str, Any], key: str, *, nonempty: bool = False
+) -> str:
+    value = arguments.get(key)
+    if type(value) is not str or (nonempty and not value.strip()):
+        qualifier = " nonempty" if nonempty else ""
+        raise UnsupportedTrajectoryTool(f"{key} must be a{qualifier} string")
+    return value
+
+
+def _normalize_fable_path(value: object) -> str:
+    if type(value) is not str or not value:
+        raise UnsupportedTrajectoryTool("file path must be a nonempty string")
+    if "\x00" in value:
+        raise UnsupportedTrajectoryTool("file path contains NUL")
+    if "\n" in value or "\r" in value:
+        raise UnsupportedTrajectoryTool("file path contains a newline")
+
+    absolute_testbed = value == "/testbed" or value.startswith("/testbed/")
+    if value.startswith("/") and not absolute_testbed:
+        raise UnsupportedTrajectoryTool("file path is an unsupported absolute path")
+    relative = value.removeprefix("/testbed/") if absolute_testbed else value
+    if value == "/testbed":
+        relative = "."
+    raw_parts = relative.split("/")
+    if any(part == "" for part in raw_parts):
+        raise UnsupportedTrajectoryTool("file path contains an empty path component")
+    if any(part == ".." for part in raw_parts):
+        raise UnsupportedTrajectoryTool("file path contains parent traversal")
+    if any(part == "." for part in raw_parts) and relative != ".":
+        raise UnsupportedTrajectoryTool("file path contains an ambiguous component")
+    normalized = PurePosixPath(relative)
+    return "/testbed" if normalized == PurePosixPath(".") else f"/testbed/{normalized}"
+
+
+def _normalize_protected_paths(protected_paths: frozenset[str]) -> frozenset[str]:
+    return frozenset(_normalize_fable_path(path) for path in protected_paths)
+
+
+def _reject_protected(path: str, protected_paths: frozenset[str]) -> None:
+    if path in _normalize_protected_paths(protected_paths):
+        raise UnsupportedTrajectoryTool(f"write targets protected path {path}")
+
+
+def _safe_mutation_prelude(path: str) -> list[str]:
+    return [
+        "from pathlib import Path",
+        "root = Path('/testbed').resolve()",
+        f"path = Path({json.dumps(path)})",
+        "parent = path.parent.resolve()",
+        "candidate = path.resolve() if path.exists() else parent / path.name",
+        "if candidate != root and root not in candidate.parents:",
+        "    raise SystemExit('mutation path escapes /testbed through a symlink')",
+    ]
+
+
+def _bounded_positive_int(value: object, name: str, *, maximum: int) -> int:
+    if type(value) is not int or value <= 0 or value > maximum:
+        raise UnsupportedTrajectoryTool(
+            f"{name} must be a positive integer no greater than {maximum}"
+        )
+    return value
+
+
+def _safe_search_string(value: object, name: str) -> str:
+    if type(value) is not str or not value:
+        raise UnsupportedTrajectoryTool(f"{name} must be a nonempty string")
+    if "\x00" in value or "\n" in value or "\r" in value:
+        raise UnsupportedTrajectoryTool(f"{name} contains an unsafe control character")
+    return value
+
+
+def translate_fable_tool_call(
+    tool_call: object, protected_paths: frozenset[str]
+) -> str:
+    """Translate one exact Fable tool call into one fail-closed bash command."""
+
+    name, arguments = _fable_arguments(tool_call)
+
+    if name == "Bash":
+        _require_keys(
+            name,
+            arguments,
+            required=frozenset({"command"}),
+            optional=frozenset({"description", "timeout"}),
+        )
+        command = _required_string(arguments, "command", nonempty=True)
+        if "description" in arguments and type(arguments["description"]) is not str:
+            raise UnsupportedTrajectoryTool("description must be a string")
+        if "timeout" in arguments:
+            _bounded_positive_int(arguments["timeout"], "timeout", maximum=86_400_000)
+        command = _normalize_trajectory_bash_command(command, None).strip()
+        _reject_trajectory_relative_escape(command)
+        if "&" in _trajectory_shell_tokens(command):
+            raise UnsupportedTrajectoryTool("Bash background execution is unsupported")
+        return command
+
+    if name == "Read":
+        _require_keys(
+            name,
+            arguments,
+            required=frozenset({"file_path"}),
+            optional=frozenset({"offset", "limit"}),
+        )
+        path = _normalize_fable_path(arguments["file_path"])
+        offset = arguments.get("offset", 1)
+        limit = arguments.get("limit", 2_000)
+        offset = _bounded_positive_int(offset, "offset", maximum=10_000_000)
+        limit = _bounded_positive_int(limit, "limit", maximum=2_000)
+        end = offset + limit - 1
+        quoted_path = shlex.quote(path)
+        return (
+            f"if [ ! -f {quoted_path} ]; then "
+            "echo 'read target is not a regular file' >&2; exit 1; "
+            f"else sed -n {shlex.quote(f'{offset},{end}p')} {quoted_path}; fi"
+        )
+
+    if name == "Write":
+        _require_keys(
+            name,
+            arguments,
+            required=frozenset({"file_path", "content"}),
+        )
+        path = _normalize_fable_path(arguments["file_path"])
+        _reject_protected(path, protected_paths)
+        content = _required_string(arguments, "content")
+        payload = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        return _quoted_python_editor(
+            _safe_mutation_prelude(path)
+            + [
+                "import base64",
+                f"content = base64.b64decode({payload!r}).decode('utf-8')",
+                "path.write_text(content, encoding='utf-8')",
+            ]
+        )
+
+    if name == "Edit":
+        _require_keys(
+            name,
+            arguments,
+            required=frozenset({"file_path", "old_string", "new_string"}),
+            optional=frozenset({"replace_all"}),
+        )
+        path = _normalize_fable_path(arguments["file_path"])
+        _reject_protected(path, protected_paths)
+        old_string = _required_string(arguments, "old_string", nonempty=True)
+        new_string = _required_string(arguments, "new_string")
+        replace_all = arguments.get("replace_all", False)
+        if type(replace_all) is not bool:
+            raise UnsupportedTrajectoryTool("replace_all must be a boolean")
+        old_payload = base64.b64encode(old_string.encode("utf-8")).decode("ascii")
+        new_payload = base64.b64encode(new_string.encode("utf-8")).decode("ascii")
+        lines = _safe_mutation_prelude(path) + [
+            "import base64",
+            f"old_string = base64.b64decode({old_payload!r}).decode('utf-8')",
+            f"new_string = base64.b64decode({new_payload!r}).decode('utf-8')",
+            "text = path.read_text(encoding='utf-8')",
+            "matches = text.count(old_string)",
+        ]
+        if replace_all:
+            lines.extend(
+                [
+                    "if matches == 0:",
+                    "    raise SystemExit('expected at least one old_string match, found 0')",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "if matches != 1:",
+                    "    raise SystemExit(f'expected exactly one old_string match, found {matches}')",
+                ]
+            )
+        lines.append("path.write_text(text.replace(old_string, new_string), encoding='utf-8')")
+        return _quoted_python_editor(lines)
+
+    if name == "Glob":
+        _require_keys(
+            name,
+            arguments,
+            required=frozenset({"pattern"}),
+            optional=frozenset({"path"}),
+        )
+        pattern = _safe_search_string(arguments["pattern"], "pattern")
+        path = _normalize_fable_path(arguments.get("path", "."))
+        return (
+            f"rg --files --glob {shlex.quote(pattern)} -- {shlex.quote(path)} "
+            "| head -n 200"
+        )
+
+    if name == "Grep":
+        _require_keys(
+            name,
+            arguments,
+            required=frozenset({"pattern"}),
+            optional=frozenset(
+                {"path", "glob", "output_mode", "head_limit", "-i", "-n"}
+            ),
+        )
+        pattern = _safe_search_string(arguments["pattern"], "pattern")
+        path = _normalize_fable_path(arguments.get("path", "."))
+        if arguments.get("output_mode", "content") != "content":
+            raise UnsupportedTrajectoryTool("unsupported Grep output_mode")
+        limit = _bounded_positive_int(
+            arguments.get("head_limit", 200), "head_limit", maximum=2_000
+        )
+        flags = ["-n"]
+        for flag in ("-i", "-n"):
+            if flag in arguments and type(arguments[flag]) is not bool:
+                raise UnsupportedTrajectoryTool(f"Grep {flag} must be a boolean")
+        if arguments.get("-n") is False:
+            raise UnsupportedTrajectoryTool("Grep -n cannot be disabled")
+        if arguments.get("-i"):
+            flags.append("-i")
+        if "glob" in arguments:
+            glob = _safe_search_string(arguments["glob"], "glob")
+            flags.extend(["--glob", shlex.quote(glob)])
+        return (
+            f"rg {' '.join(flags)} -- {shlex.quote(pattern)} {shlex.quote(path)} "
+            f"| head -n {limit}"
+        )
+
+    raise UnsupportedTrajectoryTool(f"unsupported Fable tool: {name}")
+
+
+def _native_message(
+    role: str,
+    content: str,
+    *,
+    tool_calls: list[dict[str, Any]] | None = None,
+    loss: bool | None = None,
+) -> dict[str, Any]:
+    message: dict[str, Any] = {
+        "role": role,
+        "content": content,
+        "tool_calls": tool_calls or [],
+    }
+    if loss is not None:
+        message["loss"] = loss
+    return message
+
+
+def convert_trajectory(
+    selected: SelectedTrajectory, protected_paths: frozenset[str]
+) -> dict[str, Any]:
+    """Convert one validated terminal Fable trajectory to native mini-SWE SFT."""
+
+    messages = validate_source_messages(selected.messages)
+    problem_turns = [
+        message
+        for message in messages
+        if message["role"] == "user"
+        and not message["content"].lstrip().startswith("OBSERVATION:")
+    ]
+    if len(problem_turns) != 1:
+        raise UnsupportedTrajectoryTool(
+            "trajectory must contain exactly one non-observation user problem turn"
+        )
+    problem_text = problem_turns[0]["content"]
+    results_by_id = {
+        message["tool_call_id"]: message["content"]
+        for message in messages
+        if message["role"] == "tool"
+    }
+
+    converted = [
+        _native_message("system", MINI_SWE_SYSTEM),
+        _native_message(
+            "user", f"<pr_description>\n{problem_text}\n</pr_description>"
+        ),
+    ]
+    next_call_id = 0
+    for message in messages:
+        if message["role"] != "assistant":
+            continue
+        calls = _assistant_calls(message, message_index=-1)
+        if not calls:
+            converted.append(
+                _native_message("assistant", message["content"], loss=True)
+            )
+            continue
+        for call_offset, source_call in enumerate(calls):
+            source_call_id = source_call["id"]
+            command = translate_fable_tool_call(source_call, protected_paths)
+            call_id = f"fable-tool-{next_call_id}"
+            next_call_id += 1
+            native_call = {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": json.dumps(
+                        {"command": command}, ensure_ascii=False, separators=(",", ":")
+                    ),
+                },
+            }
+            converted.append(
+                _native_message(
+                    "assistant",
+                    message["content"] if call_offset == 0 else "",
+                    tool_calls=[native_call],
+                    loss=True,
+                )
+            )
+            converted.append(
+                _native_message(
+                    "user", f"OBSERVATION:\n{results_by_id[source_call_id]}"
+                )
+            )
+
+    if converted[-1]["role"] != "assistant":
+        raise UnsupportedTrajectoryTool(
+            "converted trajectory must end on the real terminal assistant"
+        )
+    return {
+        "instance_id": selected.task,
+        "source_instance_id": selected.task,
+        "repo": f"moonshiner/{selected.task}",
+        "source": f"teacher:fable5:{DATASET_REVISION}:{selected.task}",
+        "messages": converted,
+    }

@@ -16,14 +16,20 @@ from fable5_import import (  # noqa: E402
     DATASET_REVISION,
     EXPECTED_ROWS,
     EXPECTED_TERMINAL_TRAJECTORIES,
+    FableEditOp,
+    FableWriteOp,
+    ReadOnlyBashOp,
     SOURCE_BYTES,
     SOURCE_LFS_SHA256,
     DropReason,
     RowRejected,
     SelectedTrajectory,
     SourceContract,
+    VerifierEvidenceOp,
     canonical_language,
     convert_trajectory,
+    lower_fable_operation,
+    parse_fable_tool_call,
     select_terminal_row,
     translate_fable_tool_call,
     validate_source_messages,
@@ -378,8 +384,120 @@ def test_bash_translation_accepts_native_and_json_arguments() -> None:
     )
     encoded = fable_tool_call("Bash", json.dumps({"command": "cargo test"}))
 
-    assert translate_fable_tool_call(native, frozenset()) == "cargo test"
-    assert translate_fable_tool_call(encoded, frozenset()) == "cargo test"
+    trusted = frozenset({"cargo test"})
+    assert translate_fable_tool_call(
+        native, frozenset(), trusted_verifier_commands=trusted
+    ) == "cargo test"
+    assert translate_fable_tool_call(
+        encoded, frozenset(), trusted_verifier_commands=trusted
+    ) == "cargo test"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cargo test --offline",
+        "python -m pytest -q tests/test_contract.py",
+        "cmake --build build && ctest --test-dir build --output-on-failure",
+    ],
+)
+def test_exact_injected_verifier_is_typed_evidence(command: str) -> None:
+    operation = parse_fable_tool_call(
+        fable_tool_call("Bash", {"command": command}),
+        frozenset(),
+        trusted_verifier_commands=frozenset({command}),
+    )
+
+    assert operation == VerifierEvidenceOp(command=command)
+    assert lower_fable_operation(operation) == command
+
+
+def test_read_only_bash_is_typed_separately_from_verifier_evidence() -> None:
+    operation = parse_fable_tool_call(
+        fable_tool_call("Bash", {"command": "git diff -- src/lib.rs"}),
+        frozenset(),
+    )
+
+    assert operation == ReadOnlyBashOp(command="git diff -- src/lib.rs")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cargo test --offline",
+        "pytest -q tests/test_contract.py",
+        "cmake --build build",
+        "ninja -C build test",
+        "make clean",
+        "./verify.sh",
+    ],
+)
+def test_untrusted_verifier_or_script_is_ambiguous_bash_mutation(command: str) -> None:
+    with pytest.raises(ValueError, match="ambiguous_bash_mutation"):
+        parse_fable_tool_call(
+            fable_tool_call("Bash", {"command": command}), frozenset()
+        )
+
+
+def test_parse_fable_tool_call_returns_immutable_canonical_operation() -> None:
+    call = fable_tool_call(
+        "Write",
+        json.dumps({"file_path": "/testbed/src/lib.rs", "content": "payload"}),
+    )
+
+    operation = parse_fable_tool_call(
+        call, frozenset({"tests/test_contract.py"})
+    )
+
+    assert operation == FableWriteOp(
+        path="/testbed/src/lib.rs",
+        content="payload",
+        protected_paths=("/testbed/tests/test_contract.py",),
+    )
+    with pytest.raises(FrozenInstanceError):
+        operation.path = "/testbed/other"  # type: ignore[misc]
+    assert lower_fable_operation(operation) == translate_fable_tool_call(
+        call, frozenset({"tests/test_contract.py"})
+    )
+
+
+def test_parse_edit_object_is_replay_ready_without_reparsing() -> None:
+    operation = parse_fable_tool_call(
+        fable_tool_call(
+            "Edit",
+            {
+                "file_path": "src/lib.rs",
+                "old_string": "before",
+                "new_string": "after",
+                "replace_all": True,
+            },
+        ),
+        frozenset(),
+    )
+
+    assert operation == FableEditOp(
+        path="/testbed/src/lib.rs",
+        old_string="before",
+        new_string="after",
+        replace_all=True,
+        protected_paths=(),
+    )
+
+
+def test_bash_timeout_matches_pinned_schema_boundary() -> None:
+    assert translate_fable_tool_call(
+        fable_tool_call("Bash", {"command": "cargo test", "timeout": 600_000}),
+        frozenset(),
+        trusted_verifier_commands=frozenset({"cargo test"}),
+    ) == "cargo test"
+    with pytest.raises(ValueError, match="no greater than 600000"):
+        translate_fable_tool_call(
+            fable_tool_call(
+                "Bash", {"command": "cargo test", "timeout": 600_001}
+            ),
+            frozenset(),
+            trusted_verifier_commands=frozenset({"cargo test"}),
+        )
 
 
 @pytest.mark.parametrize(
@@ -399,6 +517,81 @@ def test_bash_translation_rejects_unsafe_or_semantic_options(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         translate_fable_tool_call(fable_tool_call("Bash", arguments), frozenset())
+
+
+@pytest.mark.parametrize(
+    ("command", "message"),
+    [
+        ("cat /etc/passwd", "outside /testbed"),
+        ("printf x > /tmp/fable-escape", "redirection"),
+        ("printf x > tests/test_contract.py", "redirection"),
+        ("sed -i s/a/b/ src/lib.rs", "mutating command"),
+        ("sed --in-place=.bak s/a/b/ src/lib.rs", "mutating command"),
+        ("perl -pi -e s/a/b/ src/lib.rs", "mutating command"),
+        ("tee src/lib.rs", "mutating command"),
+        ("rm src/lib.rs", "mutating command"),
+        ("mv src/a src/b", "mutating command"),
+        ("cp src/a src/b", "mutating command"),
+        ("install src/a src/b", "mutating command"),
+        ("touch src/new.rs", "mutating command"),
+        ("patch -p1 < fix.patch", "redirection"),
+        ("git apply fix.patch", "mutating git command"),
+        ("git restore src/lib.rs", "mutating git command"),
+        ("git checkout -- src/lib.rs", "mutating git command"),
+        ("git reset --hard", "mutating git command"),
+        ("git clean -fd", "mutating git command"),
+        ("python -c 'open(\"src/a\", \"w\").write(\"x\")'", "interpreter dynamic execution"),
+        ("python3 <<'PY'\nprint('x')\nPY", "redirection"),
+        ("python3 <<<'print(1)'", "redirection"),
+        ("cat \"$TARGET\"", "dynamic shell construction"),
+        ("cat $(pwd)/src/lib.rs", "dynamic shell construction"),
+        ("cat `pwd`/src/lib.rs", "dynamic shell construction"),
+        ("cat src/lib.rs\nrm src/lib.rs", "multiline shell construction"),
+        ("bash -c 'cat src/lib.rs'", "unsupported Bash executable"),
+        ("cargo install crate-name", "ambiguous_bash_mutation"),
+        ("cargo fmt", "ambiguous_bash_mutation"),
+        ("ruff check --fix src", "ambiguous_bash_mutation"),
+        ("ruff format src", "ambiguous_bash_mutation"),
+        ("cmake -P mutate.cmake", "ambiguous_bash_mutation"),
+        ("sed -n 'w tests/test_contract.py' src/lib.rs", "ambiguous_bash_mutation"),
+        ("rg --pre 'rm src/lib.rs' parser src", "ambiguous_bash_mutation"),
+        ("sort -o src/lib.rs input.txt", "ambiguous_bash_mutation"),
+        ("uniq input.txt src/lib.rs", "ambiguous_bash_mutation"),
+        ("diff --output=src/lib.rs a b", "ambiguous_bash_mutation"),
+        ("printf -v TARGET value", "ambiguous_bash_mutation"),
+        ("git diff --ext-diff", "ambiguous_bash_mutation"),
+        ("git grep -O rm parser", "ambiguous_bash_mutation"),
+        ("tree -o src/lib.rs", "ambiguous_bash_mutation"),
+    ],
+)
+def test_bash_translation_fails_closed_for_mutation_and_ambiguous_construction(
+    command: str, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        translate_fable_tool_call(
+            fable_tool_call("Bash", {"command": command}),
+            frozenset({"tests/test_contract.py"}),
+        )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pwd",
+        "ls -la src",
+        "rg -n parser src | head -n 20",
+        "sed -n '1,20p' src/lib.rs",
+        "git status --short",
+        "git diff -- src/lib.rs",
+    ],
+)
+def test_bash_translation_preserves_narrow_read_only_policy(command: str) -> None:
+    assert (
+        translate_fable_tool_call(
+            fable_tool_call("Bash", {"command": command}), frozenset()
+        )
+        == command
+    )
 
 
 @pytest.mark.parametrize(
@@ -446,6 +639,22 @@ def test_read_translation_is_bounded_and_requires_regular_file(tmp_path: Path) -
     assert directory_result.returncode != 0
 
 
+def test_read_translation_rejects_outside_symlink_at_runtime(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-read-outside"
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_text("outside secret", encoding="utf-8")
+    (tmp_path / "escape.txt").symlink_to(secret)
+    command = translate_fable_tool_call(
+        fable_tool_call("Read", {"file_path": "escape.txt"}), frozenset()
+    )
+
+    result = _run_in_testbed(command, tmp_path)
+
+    assert result.returncode != 0
+    assert "outside secret" not in result.stdout
+
+
 def test_write_translation_uses_literal_payload_and_blocks_symlink_escape(
     tmp_path: Path,
 ) -> None:
@@ -484,6 +693,63 @@ def test_write_translation_rejects_protected_path() -> None:
         )
 
 
+@pytest.mark.parametrize("tool_name", ["Write", "Edit"])
+def test_mutation_translation_rejects_in_workspace_alias_to_protected_file(
+    tmp_path: Path, tool_name: str
+) -> None:
+    protected = tmp_path / "tests/test_contract.py"
+    protected.parent.mkdir()
+    protected.write_text("SAFE", encoding="utf-8")
+    (tmp_path / "alias.py").symlink_to(protected)
+    arguments: dict[str, object]
+    if tool_name == "Write":
+        arguments = {"file_path": "alias.py", "content": "PWN"}
+    else:
+        arguments = {
+            "file_path": "alias.py",
+            "old_string": "SAFE",
+            "new_string": "PWN",
+        }
+    command = translate_fable_tool_call(
+        fable_tool_call(tool_name, arguments),
+        frozenset({"tests/test_contract.py"}),
+    )
+
+    result = _run_in_testbed(command, tmp_path)
+
+    assert result.returncode != 0
+    assert protected.read_text(encoding="utf-8") == "SAFE"
+
+
+@pytest.mark.parametrize("tool_name", ["Write", "Edit"])
+def test_mutation_translation_rejects_hardlink_identity_of_protected_file(
+    tmp_path: Path, tool_name: str
+) -> None:
+    protected = tmp_path / "tests/test_contract.py"
+    protected.parent.mkdir()
+    protected.write_text("SAFE", encoding="utf-8")
+    alias = tmp_path / "alias.py"
+    alias.hardlink_to(protected)
+    arguments: dict[str, object]
+    if tool_name == "Write":
+        arguments = {"file_path": "alias.py", "content": "PWN"}
+    else:
+        arguments = {
+            "file_path": "alias.py",
+            "old_string": "SAFE",
+            "new_string": "PWN",
+        }
+    command = translate_fable_tool_call(
+        fable_tool_call(tool_name, arguments),
+        frozenset({"tests/test_contract.py"}),
+    )
+
+    result = _run_in_testbed(command, tmp_path)
+
+    assert result.returncode != 0
+    assert protected.read_text(encoding="utf-8") == "SAFE"
+
+
 def test_edit_translation_requires_exact_one_match_without_mutation(
     tmp_path: Path,
 ) -> None:
@@ -506,6 +772,53 @@ def test_edit_translation_requires_exact_one_match_without_mutation(
 
     assert result.returncode != 0
     assert target.read_text(encoding="utf-8") == "old old"
+
+
+@pytest.mark.parametrize("initial", ["zero matches", "old old"])
+def test_edit_translation_exact_one_rejects_zero_and_multiple_without_mutation(
+    tmp_path: Path, initial: str
+) -> None:
+    target = tmp_path / "src/lib.rs"
+    target.parent.mkdir()
+    target.write_text(initial, encoding="utf-8")
+    command = translate_fable_tool_call(
+        fable_tool_call(
+            "Edit",
+            {
+                "file_path": "src/lib.rs",
+                "old_string": "old",
+                "new_string": "new",
+            },
+        ),
+        frozenset(),
+    )
+
+    result = _run_in_testbed(command, tmp_path)
+
+    assert result.returncode != 0
+    assert target.read_text(encoding="utf-8") == initial
+
+
+def test_edit_translation_exact_one_mutates_one_match(tmp_path: Path) -> None:
+    target = tmp_path / "src/lib.rs"
+    target.parent.mkdir()
+    target.write_text("before old after", encoding="utf-8")
+    command = translate_fable_tool_call(
+        fable_tool_call(
+            "Edit",
+            {
+                "file_path": "src/lib.rs",
+                "old_string": "old",
+                "new_string": "new",
+            },
+        ),
+        frozenset(),
+    )
+
+    result = _run_in_testbed(command, tmp_path)
+
+    assert result.returncode == 0
+    assert target.read_text(encoding="utf-8") == "before new after"
 
 
 def test_edit_translation_replace_all_is_explicit_and_executable(tmp_path: Path) -> None:
@@ -561,6 +874,29 @@ def test_glob_and_grep_translation_are_bounded_and_shell_quoted(tmp_path: Path) 
     assert grep_result.returncode == 0
     assert "needle" in grep_result.stdout
     assert "head -n 5" in grep_command
+
+
+@pytest.mark.parametrize("tool_name", ["Glob", "Grep"])
+def test_search_translation_rejects_outside_directory_symlink_at_runtime(
+    tmp_path: Path, tool_name: str
+) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-{tool_name.lower()}-outside"
+    outside.mkdir()
+    (outside / "secret.py").write_text("needle\n", encoding="utf-8")
+    (tmp_path / "escape").symlink_to(outside, target_is_directory=True)
+    if tool_name == "Glob":
+        arguments = {"pattern": "*.py", "path": "escape"}
+    else:
+        arguments = {"pattern": "needle", "path": "escape"}
+    command = translate_fable_tool_call(
+        fable_tool_call(tool_name, arguments), frozenset()
+    )
+
+    result = _run_in_testbed(command, tmp_path)
+
+    assert result.returncode != 0
+    assert "secret.py" not in result.stdout
+    assert "needle" not in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -627,7 +963,11 @@ def test_conversion_serializes_parallel_calls_and_pairs_results_by_id() -> None:
         tools_json="[]",
     )
 
-    row = convert_trajectory(selected, frozenset())
+    row = convert_trajectory(
+        selected,
+        frozenset(),
+        trusted_verifier_commands=frozenset({"pytest -q"}),
+    )
 
     assert row["instance_id"] == "py-parser-fix"
     assert row["source_instance_id"] == "py-parser-fix"

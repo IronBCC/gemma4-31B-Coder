@@ -522,6 +522,73 @@ def test_steps_from_trajectory_accepts_matching_tool_call_id():
     assert tp.steps_from_trajectory(msgs)[0]["observation"] == "/testbed"
 
 
+def test_cmd_merge_writes_resolved_and_rejected_banks(tmp_path):
+    from types import SimpleNamespace
+
+    first = tmp_path / "batch_a"
+    second = tmp_path / "batch_b"
+    first.mkdir()
+    second.mkdir()
+    (first / "results.jsonl").write_text("\n".join([
+        json.dumps({"instance_id": "resolved", "n_assistant_events": 4,
+                    "patch_len": 10, "resolved": True}),
+        json.dumps({"instance_id": "rejected", "n_assistant_events": 4,
+                    "patch_len": 10, "resolved": False}),
+    ]) + "\n")
+    for instance_id in ("resolved", "rejected"):
+        (first / f"{instance_id}.stream.jsonl").write_text("stream\n")
+        (first / f"{instance_id}.patch").write_text("patch\n")
+    # The later batch wins for repeated instance IDs, as in retry collection.
+    (second / "results.jsonl").write_text(json.dumps({
+        "instance_id": "rejected", "n_assistant_events": 5,
+        "patch_len": 11, "resolved": False,
+    }) + "\n")
+    (second / "rejected.stream.jsonl").write_text("latest stream\n")
+    (second / "rejected.patch").write_text("latest patch\n")
+
+    out = tmp_path / "merged"
+    assert tp.cmd_merge(SimpleNamespace(glob=str(tmp_path / "batch_*"), out_dir=str(out))) == 0
+
+    assert {row["instance_id"] for row in tp._read_jsonl(out / "resolved.jsonl")} == {"resolved"}
+    assert {row["instance_id"] for row in tp._read_jsonl(out / "rejected.jsonl")} == {"rejected"}
+    assert (out / "resolved.stream.jsonl").read_text() == "stream\n"
+    assert (out / "rejected" / "rejected.stream.jsonl").read_text() == "latest stream\n"
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["rejected"] == 1
+    assert manifest["rejected_streams_copied"] == 2
+
+
+def test_collect_loop_stops_pass_and_backs_off_on_openrouter_429(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    tasks = tmp_path / "tasks.jsonl"
+    tasks.write_text("\n".join(json.dumps({"instance_id": instance_id}) for instance_id in ("a", "b")) + "\n")
+    calls = []
+    sleeps = []
+    probes = iter((True, True, False))
+
+    def rate_limited(row, *_args):
+        calls.append(row["instance_id"])
+        return {"instance_id": row["instance_id"], "resolved": False,
+                "error": "openrouter: Error code: 429 - rate limited upstream"}
+
+    monkeypatch.setattr(tp, "collect_one_openrouter", rate_limited)
+    monkeypatch.setattr(tp, "_probe_quota", lambda *_args: next(probes))
+    monkeypatch.setattr(tp, "_docker_free_gib", lambda: 1000)
+    monkeypatch.setattr(tp.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(tp.time, "sleep", sleeps.append)
+    args = SimpleNamespace(
+        tasks=str(tasks), out_dir=str(tmp_path / "run"), backend="openrouter",
+        model="poolside/laguna-s-2.1", max_turns=1, loop=True,
+        max_consecutive_credit_hits=3, max_walls=2, wall_sleep=99,
+        rate_limit_sleep=7, floor_gib=40, exclude_runs=[],
+    )
+
+    assert tp.cmd_collect(args) == 0
+    assert calls == ["a", "a"]
+    assert sleeps == [7, 7]
+
+
 def test_cross_run_exclusion(tmp_path):
     import json
     (tmp_path / "runA").mkdir()

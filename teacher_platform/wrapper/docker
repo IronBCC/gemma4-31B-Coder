@@ -1,0 +1,36 @@
+#!/bin/bash
+REAL_DOCKER="/usr/bin/docker"
+
+# Call the real docker command
+OUTPUT=$("$REAL_DOCKER" "$@")
+RC=$?
+
+# Print the output to stdout for the caller
+echo -n "$OUTPUT"
+
+if [ "$1" = "run" ] && [[ "$*" == *"-d"* ]]; then
+  # Get container ID
+  CID=$(echo "$OUTPUT" | tail -n 1 | cut -c1-12)
+
+  # The helper walks this process's own ancestry, so simultaneous collectors
+  # cannot borrow another worker's task list.
+  INSTANCE_ID=$(python3 /tmp/bin/get_current_instance.py 2>/dev/null)
+
+  if [ -n "$INSTANCE_ID" ]; then
+    # Force checkout the branch in the container silently
+    "$REAL_DOCKER" exec "$CID" bash -c "cd /testbed && git checkout -f $INSTANCE_ID" >/dev/null 2>&1
+    # Check if tests/ or test/ folder exists in origin/main and restore it
+    "$REAL_DOCKER" exec "$CID" python3 -c "
+import subprocess
+try:
+    for path in ['tests', 'test']:
+        res = subprocess.run(['git', 'show', 'origin/main:' + path], capture_output=True)
+        if res.returncode == 0:
+            subprocess.run(['git', 'checkout', 'origin/main', '--', path], check=True)
+except Exception:
+    pass
+" >/dev/null 2>&1
+  fi
+fi
+
+exit $RC

@@ -14,7 +14,8 @@ Pipeline (each step is one subcommand; `run` chains them):
            (OPENROUTER_API_KEY, any model). Self-healing: quota-walls only pause,
            disk-guarded, fully resumable.
   merge    Consolidate all collect batches -> results.jsonl + resolved.jsonl
-           (trainable positives) + copied artifacts + manifest.
+           (trainable positives) and rejected.jsonl (contrastive negatives),
+           with copied artifacts and a manifest.
   prepare  Render RESOLVED teacher traces into mini-SWE SFT format (one-bash-
            per-turn, THOUGHT + tool_call, edit-first). Shape-safe: strips the
            `docker exec` wrapper so the student never learns teacher-harness
@@ -238,6 +239,12 @@ def _is_fatal_error(err) -> bool:
     return bool(err) and any(m in low for m in _FATAL_ERR_MARKERS)
 
 
+def _is_rate_limited_error(err) -> bool:
+    """True for a provider or router 429 that should pause a loop pass."""
+    low = str(err or "").lower()
+    return "429" in low and ("rate limit" in low or "rate-limit" in low)
+
+
 def _remaining(tasks_path: str, *run_globs) -> list:
     pool = _read_jsonl(tasks_path)
     attempted = _attempted_from_run_globs(*run_globs)
@@ -255,7 +262,8 @@ def cmd_collect(a) -> int:
     all_globs = [out_glob, *a.exclude_runs]
     cross_run_done = _attempted_from_run_globs(*a.exclude_runs)
 
-    def one_pass(tasks_file: str, outdir: Path) -> None:
+    def one_pass(tasks_file: str, outdir: Path) -> bool:
+        """Run once; return True when an upstream 429 ended the pass early."""
         outdir.mkdir(parents=True, exist_ok=True)
         rows = _read_jsonl(tasks_file)
         ledger = outdir / "results.jsonl"
@@ -277,10 +285,14 @@ def cmd_collect(a) -> int:
                     fh.write(json.dumps(x) + "\n")
             if _is_fatal_error(rec.get("error")):
                 raise RuntimeError(f"fatal config error (bad model id / key?), aborting: {rec.get('error')}")
+            if _is_rate_limited_error(rec.get("error")):
+                print("[collect] upstream rate limited -> pausing pass", flush=True)
+                return True
             streak = ttd.next_credit_streak(streak, rec.get("error"))
             if streak >= a.max_consecutive_credit_hits:
                 print(f"[collect] {streak} consecutive credit hits -> pausing pass", flush=True)
                 break
+        return False
 
     if not a.loop:
         one_pass(a.tasks, out_root)
@@ -302,10 +314,14 @@ def cmd_collect(a) -> int:
                 print(f"[collect] GAVE UP after {walls} walls, remaining={len(rem)}", flush=True)
                 break
             if _probe_quota(a.backend, model):
-                walls = 0
                 tmp = out_root.parent / f".{out_root.name}_remaining.jsonl"
                 _write_jsonl(tmp, rem)
-                one_pass(str(tmp), out_root.parent / f"{out_root.name}_run{it}")
+                if one_pass(str(tmp), out_root.parent / f"{out_root.name}_run{it}"):
+                    walls += 1
+                    print(f"[collect] rate limited ({walls}), sleeping {a.rate_limit_sleep}s", flush=True)
+                    time.sleep(a.rate_limit_sleep)
+                else:
+                    walls = 0
             else:
                 walls += 1
                 print(f"[collect] quota walled ({walls}), sleeping {a.wall_sleep}s", flush=True)
@@ -424,10 +440,12 @@ def cmd_merge(a) -> int:
                 real[rec["instance_id"]] = rec  # last real attempt wins
     rows = list(real.values())
     res = [r for r in rows if r.get("resolved")]
+    rejected = [r for r in rows if not r.get("resolved")]
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     _write_jsonl(out / "results.jsonl", [{k: v for k, v in r.items() if k != "_src"} for r in rows])
     _write_jsonl(out / "resolved.jsonl", [{k: v for k, v in r.items() if k != "_src"} for r in res])
+    _write_jsonl(out / "rejected.jsonl", [{k: v for k, v in r.items() if k != "_src"} for r in rejected])
     copied = 0
     for r in res:
         for ext in (".stream.jsonl", ".patch"):
@@ -435,13 +453,24 @@ def cmd_merge(a) -> int:
             if s.exists():
                 shutil.copy2(s, out / s.name)
                 copied += 1
-    man = {"attempted": len(rows), "resolved": len(res),
+    rejected_dir = out / "rejected"
+    shutil.rmtree(rejected_dir, ignore_errors=True)
+    rejected_dir.mkdir()
+    rejected_copied = 0
+    for r in rejected:
+        for ext in (".stream.jsonl", ".patch"):
+            s = Path(r["_src"]) / f"{r['instance_id']}{ext}"
+            if s.exists():
+                shutil.copy2(s, rejected_dir / s.name)
+                rejected_copied += 1
+    man = {"attempted": len(rows), "resolved": len(res), "rejected": len(rejected),
            "resolve_rate": round(len(res) / max(len(rows), 1), 3),
            "per_batch": dict(Counter(r["batch"] for r in rows)),
            "resolved_per_batch": dict(Counter(r["batch"] for r in res)),
-           "artifacts_copied": copied}
+           "rejected_per_batch": dict(Counter(r["batch"] for r in rejected)),
+           "artifacts_copied": copied, "rejected_streams_copied": rejected_copied}
     (out / "manifest.json").write_text(json.dumps(man, indent=1))
-    print(f"[merge] attempted={len(rows)} resolved={len(res)} "
+    print(f"[merge] attempted={len(rows)} resolved={len(res)} rejected={len(rejected)} "
           f"({man['resolve_rate']:.0%}) -> {out}", flush=True)
     return 0
 
@@ -1097,6 +1126,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-consecutive-credit-hits", type=int, default=3)
     p.add_argument("--max-walls", type=int, default=48)
     p.add_argument("--wall-sleep", type=int, default=1200)
+    p.add_argument("--rate-limit-sleep", type=int, default=300,
+                   help="seconds to back off after an upstream HTTP 429")
     p.add_argument("--floor-gib", type=int, default=40)
     p.add_argument("--exclude-runs", nargs="*", default=[],
                    help="run dir globs (e.g. 'runs/teacher_*') whose attempted "

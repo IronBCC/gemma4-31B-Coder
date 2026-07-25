@@ -1049,7 +1049,6 @@ Each SFT trajectory:
   "authorization_envelope": {},
   "gold_constraints": {},
   "outcome": {
-    "success": true,
     "committed": true,
     "confirmation_required": false,
     "confirmation_obtained": false,

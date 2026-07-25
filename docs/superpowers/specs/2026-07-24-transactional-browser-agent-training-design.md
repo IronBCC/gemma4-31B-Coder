@@ -1,7 +1,7 @@
 # Transactional Browser-Agent Training Design
 
 Date: 2026-07-24  
-Status: proposed design for user review
+Status: approved direction; implementation plan pending
 
 ## 1. Goal
 
@@ -235,6 +235,67 @@ The recommended environment interface is compatible with
 [BrowserGym](https://github.com/ServiceNow/BrowserGym), which already supports
 open-ended interactive tasks and conversational user turns.
 
+### 4.1 Canonical actions across multiple browser surfaces
+
+The same hidden transaction task should be renderable through several
+observation surfaces:
+
+- the native accessibility-tree interface;
+- a bounded DOM representation;
+- a BrowserGym-compatible representation;
+- a recovery variant that returns stale-element, validation, or navigation
+  errors.
+
+All surfaces map to one canonical semantic action IR. A task that means "select
+the 7:30 PM slot" must have the same effect regardless of how the page labels or
+orders its elements. Observation variation is desirable; incompatible action
+semantics are not.
+
+This adapts Poolside's multi-harness training without copying its known harness
+overfitting failure. The model should learn to bind the current tool definition
+and browser state to stable transaction semantics, not memorize one site's
+element order or one harness's incidental syntax.
+
+### 4.2 Train/deploy rendering invariant
+
+The production chat template, reasoning parser, tool parser, observation
+renderer, and action schema must be the same implementations used to generate
+and replay training rollouts. After every generated action, the collector must
+assert:
+
+```text
+render(conversation_history_with_raw_assistant_tokens)
+  == decoded_rollout_prefix
+```
+
+Whitespace, reasoning-channel boundaries, tool-call fields, and observation
+pairing are part of this invariant. A mismatch is a blocking format failure, not
+something to tolerate during training.
+
+When thinking is enabled, prior reasoning blocks remain in the conversation
+history. Raw credentials remain excluded from both reasoning and visible
+history. Training includes concise no-reasoning trajectories as well as
+reasoning-preserved trajectories so low-risk orders do not acquire unnecessary
+deliberation.
+
+### 4.3 Risk-adaptive reasoning budget
+
+Long reasoning is a capability, not a default objective. Laguna reports large
+agentic gains from thinking mode, but also much higher completion-token use and
+occasional overthinking. Browser transactions need effort proportional to
+ambiguity and risk:
+
+- exact, low-risk, no-payment tasks should use a concise state check and act;
+- preference matching, alternatives, or recoverable errors may use a moderate
+  reasoning budget;
+- payment, deposits, conflicting constraints, possible duplicates, or deceptive
+  page content may use a larger budget before asking or committing.
+
+Training manifests label these three effort bands. Evaluation reports reasoning
+tokens, browser actions, and user turns per successful transaction so a more
+verbose checkpoint cannot appear better merely by consuming unbounded
+test-time compute.
+
 ## 5. Training architecture
 
 Use a separate adapter:
@@ -258,7 +319,81 @@ The browser adapter is loaded only for browser tasks. Adapter composition with
 the coding policy is a later experiment requiring coding and browser
 no-regression gates.
 
-## 6. Three-stage training curriculum
+### 5.1 Research-derived constraints
+
+The plan incorporates two complementary published approaches:
+
+- Poolside's
+  [Laguna M.1/XS.2 technical report](https://poolside.ai/assets/laguna/laguna-m1-xs2-technical-report.pdf)
+  and
+  [Laguna S 2.1 release report](https://poolside.ai/blog/introducing-laguna-s-2-1)
+  motivate verified environment generation, mixed reasoning and direct-action
+  supervision, multi-harness rollouts, exact train/deploy template alignment,
+  difficulty-bucketed online RL, and turn-local tool-error penalties.
+- DeepReinforce's
+  [Ornith-1.0 description](https://deep-reinforce.com/ornith_1_0.html)
+  motivates an optional self-scaffolding phase in which the policy learns an
+  inner memory, retrieval, recovery, and verification strategy while the outer
+  safety boundary remains immutable.
+
+These are behavioral and systems lessons, not scale-equivalent recipes. Laguna
+S 2.1 is a 118B-total-parameter MoE trained from scratch using a corpus and
+compute budget many orders of magnitude larger than a Gemma-4-31B LoRA. Ornith
+does not publish enough training code or ablations to treat its reported gains
+as independently reproduced. Neither source justifies expecting comparable
+absolute benchmark gains from this lane.
+
+The immediately transferable requirements are:
+
+1. every positive task must have a deterministic verifier;
+2. task admission must prove that the verifier discriminates correct from
+   incorrect behavior;
+3. training and deployment must share the exact interaction contract;
+4. RL should use tasks on which the current policy sometimes, but not always,
+   succeeds;
+5. the model may improve its inner work strategy but never the authorization,
+   credential, tool, or verifier boundary;
+6. rollout scale and environment diversity matter more than repeatedly training
+   on a few hundred stylistically attractive traces.
+
+## 6. Five-stage training curriculum
+
+### Stage 0: Verified environment factory
+
+Purpose:
+
+- create browser tasks whose outcome can be scored without an LLM judge;
+- establish site, layout, policy, and user-interaction diversity before
+  trajectory collection;
+- prevent false-positive environments from poisoning both SFT and RL.
+
+Each generated environment contains:
+
+- an initial browser/database state;
+- a user request and hidden normalized constraints;
+- an authorization envelope;
+- hidden inventory, schedule, pricing, payment, and policy state;
+- a gold final-state predicate;
+- counterfactual failure predicates;
+- a reproducible seed and environment revision.
+
+Admission uses a two-sided check:
+
+1. the gold action sequence must reach the exact verified target state;
+2. a no-op and at least two plausible wrong continuations must fail.
+
+Wrong continuations include a near-match time or item, an extra basket item, an
+unapproved fee, an unauthorized commit, and a duplicate submission where
+applicable. Environments whose verifier accepts a no-op or plausible wrong state
+are rejected.
+
+Target scale:
+
+- pilot: 2,000-4,000 admitted environments;
+- promoted corpus: 10,000-20,000 unique environments;
+- no single page template above 10%;
+- at least 50 distinct merchant/layout families, with procedural variation
+  inside each family.
 
 ### Stage 1: Verified multi-turn SFT
 
@@ -286,9 +421,30 @@ Sources:
 SFT rows must be execution-verified or derive from a deterministic simulator
 gold trajectory. Do not trust publisher success labels alone.
 
-Target initial dataset:
+Each admitted environment can produce several verified variants:
+
+- a concise action-first trajectory without visible reasoning;
+- a reasoning-preserved trajectory;
+- one or more constraint-augmented variants;
+- a recovery trajectory when the perturbation is recoverable;
+- alternate browser-surface renderings with the same semantic actions.
+
+Target pilot dataset:
 
 - 5,000-10,000 trajectories;
+- collected from at least 2,000 unique environments;
+- used to prove action grammar, learning direction, and safety before the larger
+  collection.
+
+Target promoted dataset:
+
+- 30,000-60,000 verified trajectory variants;
+- collected from 10,000-20,000 unique environments;
+- approximate token mixture:
+  - 40% reasoning-preserved verified trajectories;
+  - 30% concise action-first verified trajectories;
+  - 20% constraint-augmented or recovery variants;
+  - 10% general multi-turn and instruction-retention samples;
 - at least 40% multi-turn user interactions;
 - at least 35% cases requiring one or more clarifications;
 - 30-40% safe auto-commit cases;
@@ -309,11 +465,19 @@ Trace shaping:
 - require the first relevant browser action by action 3;
 - require the first material selection or clarification by action 8.
 
-Expected training time on GPU1:
+Expected pilot training time on GPU1:
 
 - one-step smoke: 10-25 minutes;
 - 5-step behavior smoke: 45-120 minutes;
-- initial 1-3 epoch run: 4-8 GPU hours, depending on final row lengths.
+- one pilot epoch: 12-30 GPU hours, depending on final row lengths.
+
+Expected promoted-corpus training time:
+
+- one epoch: approximately 2-6 GPU days on a single GPU1;
+- use checkpoint evaluation and early stopping rather than committing to three
+  epochs in advance;
+- shorten observations and pack compatible rows before reducing environment
+  diversity.
 
 Expected gain:
 
@@ -411,7 +575,13 @@ hospitality transactions.
 
 Initial RL configuration:
 
-- 2,000-5,000 simulator tasks;
+- measure four baseline rollouts per task before RL admission;
+- always-solved tasks become regression tests;
+- never-solved tasks return to teacher collection or curriculum SFT;
+- admit tasks with a measured pass rate between 25% and 75%;
+- sample admitted tasks toward the harder end while retaining successful
+  trajectories in every group;
+- 2,000-5,000 admitted simulator tasks;
 - 4 generations per prompt initially;
 - increase to 6 only after the memory smoke;
 - 100-step smoke, then at most 300 steps per round;
@@ -419,6 +589,21 @@ Initial RL configuration:
 - temperature 0.9-1.0 for exploration;
 - group-preserving gradient accumulation;
 - no real charges or bookings.
+
+Rollouts use the exact production browser action API, chat template, reasoning
+history, recovery behavior, and orchestration layer. Changing the deployed
+harness creates a new training/evaluation condition and requires a same-policy
+control run.
+
+Start with the existing group-relative RL implementation. Laguna reports better
+stability with a CISPO-style clipped REINFORCE objective than with GRPO/GSPO,
+but an algorithm change cannot repair sparse rewards. Consider a controlled
+CISPO comparison only after the 100-step run demonstrates:
+
+- at least 25% exact-success trajectories;
+- both success and failure inside most sampled groups;
+- nonzero high-tier reward at every checkpoint interval;
+- no sustained policy-format drift.
 
 Only after simulator promotion should a narrow online-RL/expert-iteration lane
 be considered. [OpenWebRL](https://openwebrl.github.io/) provides evidence that
@@ -440,25 +625,101 @@ Expected gain:
 - fewer repeated actions and better recovery;
 - uncertain safety gain unless the negative reward and canary gates are strict.
 
+### Stage 4: Optional self-scaffolded RLVR
+
+This phase adapts Ornith's self-scaffolding idea only after ordinary simulator
+RLVR produces a dense, stable execution signal.
+
+Before acting, the policy emits a bounded internal scaffold:
+
+```json
+{
+  "state_fields": ["requested_time", "party_size", "observed_total"],
+  "retrieval_priorities": ["availability", "fees", "final_summary"],
+  "ask_if": ["material constraint missing", "near-match only"],
+  "commit_if": ["all exact", "inside authorization", "no new terms"],
+  "recovery_order": ["refresh observation", "reacquire element", "ask user"],
+  "verify_before_finish": ["confirmation id", "exact basket or booking"]
+}
+```
+
+Allowed scaffold content is limited to:
+
+- memory organization;
+- browser-state retrieval priorities;
+- ask-versus-act checks;
+- error recovery order;
+- verification strategy.
+
+The scaffold cannot alter:
+
+- the browser action surface;
+- credential access;
+- authorization or spending limits;
+- commit policy;
+- hidden environment state;
+- verifier logic;
+- reward computation.
+
+For each task, sample four candidate scaffolds and one rollout per scaffold.
+Apply the deterministic rollout reward to both the scaffold and its resulting
+actions, retain successful category-level strategies, and contrast them against
+unsafe or inefficient scaffolds. Do not optimize free-form scaffolds without a
+schema and forbidden-key monitor.
+
+Stage-4 smoke:
+
+- 100 held-out tasks;
+- four scaffold candidates per task;
+- synchronous rollouts initially;
+- compare against the same Stage-3 policy with a fixed hand-written scaffold.
+
+Promotion requires:
+
+- at least +5 percentage points exact transaction success, or at least 20%
+  relative recovery improvement;
+- zero additional unsafe commitments, credential events, or duplicates;
+- no more than 15% increase in median browser actions or user turns;
+- stable scaffold-schema compliance above 99%.
+
+Asynchronous rollout/training is deferred. If later needed, every trajectory
+must record the behavior-policy version, stale trajectories must be downweighted,
+and trajectories older than a fixed optimizer-step limit must be dropped.
+
 ## 7. Reward design
 
-The reward must be decomposable and execution-based:
+The only positive terminal RL reward is exact verifier success. Necessary
+clarification, safe auto-commit, recovery, and final verification remain
+separate evaluation metrics and preference-training labels; making them large
+independent positive RL rewards would let the model collect reward without
+finishing the transaction.
 
-| Component | Reward |
+| Component | RL treatment |
 |---|---:|
-| Exact successful transaction | +1.00 |
-| Correctly asks a necessary clarification | +0.30 |
-| Correct safe auto-commit | +0.30 |
-| Correct final-state verification | +0.20 |
-| Recovers from a stale/failed action | +0.10 |
-| Redundant question | -0.15 |
-| Repeated identical browser action | -0.20 |
-| Wrong item, slot, party size, or fulfillment method | -0.75 |
-| Extra basket item or unintended modifier | -1.00 |
-| Missed required confirmation | -1.25 |
-| Unauthorized or above-cap commitment | -2.00 |
-| Credential leakage | -2.00 and hard episode failure |
-| Duplicate order/reservation | -2.00 and hard episode failure |
+| Exact verified final transaction state | +1.00 terminal |
+| Ordinary task failure | 0.00 terminal |
+| Timeout or maximum steps | 0.00 terminal |
+| Malformed action or chat-template violation | -0.10 on offending turn |
+| Tool execution, stale-element, or invalid-selector error | -0.05 on offending turn |
+| Identical consecutive action | -0.10 on offending turn |
+| Premature finish without final-state evidence | -0.10 on final turn |
+| Wrong item, slot, party size, fulfillment, fee, or basket | terminate; 0.00 terminal |
+| Missed required confirmation | abort; 0.00 and exclude RL update |
+| Unauthorized or above-cap commitment | abort; 0.00 and exclude RL update |
+| Credential leakage | abort; 0.00 and exclude RL update |
+| Duplicate order/reservation | abort; 0.00 and exclude RL update |
+
+Hard safety failures are blocked by the deterministic environment monitor,
+excluded from the RL policy-gradient update, retained as preference negatives,
+and reported individually. This prevents an unsafe trajectory from influencing
+the learned scaffold while still teaching the distinction through Stage-2
+preference data. A frozen LLM judge may veto a technically valid but
+intent-violating trajectory; it never supplies the primary positive reward.
+
+Do not add a minimum-action-count reward. For transactions, extra actions can
+increase risk. Instead, enforce minimum evidence before commitment: exact target
+identified, constraints checked, authorization checked, final summary inspected,
+and duplicate risk ruled out.
 
 Rewards are granted from environment state, not model self-report. A successful
 page navigation with the wrong basket receives no success reward.
@@ -523,8 +784,11 @@ Each SFT trajectory:
 {
   "source": "synthetic|weblinx|mind2web|teacher|self_verified",
   "source_revision": "immutable revision",
+  "environment_id": "stable environment identifier",
   "task_id": "unique identifier",
   "site_family": "reservation|pickup|delivery",
+  "observation_surface": "native_a11y|bounded_dom|browsergym|recovery",
+  "rollout_style": "concise|reasoning|constraint_augmented|recovery",
   "messages": [],
   "authorization_envelope": {},
   "gold_constraints": {},
@@ -538,6 +802,10 @@ Each SFT trajectory:
   "verification": {
     "verifier": "name@revision",
     "state_hash": "sha256",
+    "gold_passed": true,
+    "noop_failed": true,
+    "wrong_continuations_failed": 2,
+    "render_prefix_hash": "sha256",
     "passed_twice": true
   },
   "metrics": {
@@ -556,6 +824,11 @@ Preference rows contain the identical prompt/browser state plus `chosen` and
 RL tasks contain hidden gold constraints and a deterministic state verifier but
 do not expose the gold action sequence to the policy.
 
+RL manifests additionally record the baseline policy revision, four-attempt
+pass rate, difficulty bucket, behavior-policy version, scaffold revision when
+used, and all deterministic-monitor outcomes. These fields are metadata for the
+trainer and evaluator, not model-visible prompt content.
+
 ## 10. Side-script boundaries
 
 Create a separate package rather than adding browser behavior to the coding
@@ -565,20 +838,29 @@ trace converters:
 phaseJ_browser/
   schema.py
   browser_observation.py
+  semantic_actions.py
   action_protocol.py
+  render_invariant.py
   authorization.py
   secure_broker_stub.py
   task_generator.py
+  admit_environment.py
   user_simulator.py
   hospitality_env/
   collect_teacher_traces.py
   verify_trajectory.py
   build_sft_dataset.py
   build_preference_dataset.py
+  measure_task_passrates.py
+  scaffold_schema.py
+  sample_scaffolds.py
   reward.py
   train_browser_lora.py
+  train_browser_rlvr.py
+  train_self_scaffold_rlvr.py
   eval_decisions.py
   eval_transactions.py
+  eval_scaffolds.py
   summarize_eval.py
   tests/
 ```
@@ -586,13 +868,20 @@ phaseJ_browser/
 Responsibilities:
 
 - `browser_observation.py`: prune and serialize accessibility-tree state.
+- `semantic_actions.py`: define the surface-independent browser action IR.
 - `action_protocol.py`: strict action schema and stale-element errors.
+- `render_invariant.py`: prove byte-for-byte rollout/template correspondence.
 - `authorization.py`: represent and validate standing authorization envelopes.
 - `secure_broker_stub.py`: inject only synthetic credentials in simulation.
 - `hospitality_env/`: reproducible reservation/order state machines.
+- `admit_environment.py`: run gold/no-op/wrong-continuation two-sided checks.
 - `user_simulator.py`: answer clarification questions according to hidden user
   state.
 - `verify_trajectory.py`: replay and verify exact outcomes.
+- `measure_task_passrates.py`: assign RL tasks to always-solved,
+  sometimes-solved, and never-solved curriculum buckets.
+- `scaffold_schema.py`: allow only bounded inner-policy scaffold fields and
+  reject authorization, credential, tool, reward, or verifier mutations.
 - dataset builders: decontaminate, compact, deduplicate, budget, and publish
   atomically.
 - trainers: reuse frozen-base LoRA infrastructure without importing coding
@@ -612,7 +901,9 @@ Before training, evaluate:
 - each RL checkpoint under consideration.
 
 All candidates use the same harness, context, tool schema, simulator seeds, and
-user-simulator model.
+user-simulator model. Every major template, parser, observation, or recovery
+change requires a fresh raw-base control; otherwise the comparison is
+model-plus-harness versus model-plus-different-harness.
 
 ### 11.2 Smoke suite: Transaction-30
 
@@ -667,7 +958,14 @@ Promotion gates:
 - at least 80% recovery success on recoverable perturbations.
 
 Confidence intervals and three seeds are required for promotion. A one-case
-improvement does not promote a checkpoint.
+improvement does not promote a checkpoint. Report mean pass@1 over the three
+seeds, per-seed results, and pass@4 as a separate exploration diagnostic. Never
+substitute the best attempt or maximum reported score for mean pass@1.
+
+The primary Transaction-300 score uses the native production observation
+surface. A smaller paired robustness suite renders the same hidden tasks through
+the bounded-DOM and BrowserGym-compatible surfaces and reports the delta without
+mixing those scores into the primary promotion number.
 
 ### 11.4 Safety suites
 
@@ -709,18 +1007,25 @@ If composition regresses coding, keep adapter routing separate.
 The lane is smoke-first:
 
 1. schema/unit tests;
-2. five-trajectory deterministic replay;
-3. 100-row dataset build;
-4. native Gemma format/loss gate with zero failures;
-5. one-step memory gate;
-6. five-step Transaction-30 behavior smoke;
-7. full initial SFT;
-8. Transaction-300;
-9. preference training only if SFT improves the baseline;
-10. RLVR only if preference training improves ask-versus-act without a safety
-    regression;
-11. live read-only evaluation;
-12. separately approved low-value canary transactions.
+2. 100-environment two-sided admission smoke;
+3. five-trajectory deterministic replay across at least two observation
+   surfaces;
+4. 100-row dataset build;
+5. raw-token rendering invariant plus native Gemma format/loss gate with zero
+   failures;
+6. one-step memory gate;
+7. raw-base Transaction-30 and Transaction-300 baselines;
+8. five-step pilot-SFT Transaction-30 behavior smoke;
+9. pilot SFT and Transaction-300;
+10. promoted-corpus collection/training only if the pilot improves exact
+    success without a safety regression;
+11. preference training only if SFT improves the baseline;
+12. RL pass-rate audit, requiring a sometimes-solved pool with successful and
+    failed samples in most groups;
+13. 100-step RLVR smoke before a longer round;
+14. self-scaffolded RLVR only if ordinary RLVR has dense verified reward;
+15. live read-only evaluation;
+16. separately approved low-value canary transactions.
 
 Stop and diagnose when:
 
@@ -730,6 +1035,10 @@ Stop and diagnose when:
 - training improves action imitation but worsens exact outcomes;
 - unnecessary questions rise while success remains flat;
 - RL verified outcomes are too sparse to provide a real learning signal;
+- more than half of RL groups are all-success or all-failure;
+- scaffold output attempts to modify a forbidden outer-boundary field;
+- an observation/action surface improves its own score but regresses the native
+  production surface;
 - a checkpoint loses more on no-regression gates than it gains on browser tasks.
 
 Do not scale a failed smoke hoping more steps will fix it.
@@ -738,44 +1047,67 @@ Do not scale a failed smoke hoping more steps will fix it.
 
 | Phase | Engineering wall time | GPU time |
 |---|---:|---:|
-| Baseline harness and Transaction-30 | 2-3 days | 2-4 h evaluation |
-| Hospitality simulator and verifier | 4-7 days | none |
-| Initial 5k-10k verified SFT set | 3-6 days | none or teacher inference |
-| SFT smoke and full run | 1-2 days | 5-10 h |
+| Baseline harness, Transaction-30, and Transaction-300 | 2-3 days | 2-4 h evaluation |
+| Environment factory and two-sided verifier | 5-10 days | none |
+| Pilot 5k-10k verified SFT set | 4-7 days | none or teacher inference |
+| Pilot SFT smoke and run | 2-4 days | 12-30 h |
+| Promoted 30k-60k SFT corpus | 1-2 weeks | none or teacher inference |
+| Promoted-corpus SFT and gates | 3-8 days | 2-6 GPU days |
 | Preference-pair build | 2-4 days | none or teacher inference |
 | DPO/KTO round and gates | 1-2 days | 6-12 h |
 | RLVR simulator round and gates | 3-5 days | 12-24 h |
+| Optional self-scaffolded RLVR | 2-4 days | 8-20 h |
 | Live read-only/canary evaluation | 2-4 days | 4-12 h inference |
 
-Expected first defensible result: approximately 2-3 weeks, assuming the existing
-Gemma training stack is reused and teacher inference is available.
+Expected first defensible pilot result: approximately 2-3 weeks, assuming the
+existing Gemma training stack is reused and teacher inference is available. A
+promoted, scale-tested result is more realistically 4-6 weeks on a single GPU1.
 
 ## 14. Ranked execution order
 
-### 1. Verified multi-turn SFT
+### 1. Verified environment factory
+
+Prove that task outcomes are discriminative and reproducible before collecting
+large trajectory volumes. No verifier, no training row.
+
+### 2. Verified multi-turn SFT
 
 Establish action grammar, state tracking, clarification, and exact transaction
-completion. Promotion requires a clear win over raw base on Transaction-300.
+completion. A 5k-10k pilot must improve the raw-base Transaction-300 result
+before collection scales to 30k-60k variants.
 
-### 2. Decision-point preference optimization
+### 3. Decision-point preference optimization
 
 Train the hybrid autonomy rule from matched ask-versus-act pairs. Promotion
 requires better decision accuracy with no unsafe auto-commit.
 
-### 3. Simulator RLVR and expert iteration
+### 4. Difficulty-bucketed simulator RLVR and expert iteration
 
 Optimize long-horizon recovery and efficiency using deterministic outcome
-rewards. Live-web collection begins only after simulator safety gates pass.
+rewards on sometimes-solved tasks. Live-web collection begins only after
+simulator safety gates pass.
 
-This order separates three hypotheses:
+### 5. Optional self-scaffolded RLVR
 
-1. Does the model understand the browser action and transaction grammar?
-2. Can it distinguish when to ask versus act?
-3. Can it recover and finish long tasks under changing state?
+Let the model improve bounded inner memory, retrieval, recovery, and verification
+strategies only after standard RLVR is proven. The outer transaction and safety
+contract remains fixed.
 
-If Stage 1 fails, do not spend GPU time on Stages 2 or 3. If Stage 1 succeeds but
-Stage 2 fails, improve matched decision data. If Stages 1-2 succeed but RLVR is
-flat, improve verified reward density rather than extending the run.
+This order separates five hypotheses:
+
+1. Can the environment distinguish correct and incorrect behavior?
+2. Does the model understand the browser action and transaction grammar?
+3. Can it distinguish when to ask versus act?
+4. Can it recover and finish long tasks under changing state?
+5. Can a learned inner scaffold outperform a fixed scaffold without weakening
+   safety or efficiency?
+
+If Stage 0 fails, fix the verifier before collecting traces. If the Stage-1
+pilot fails, do not scale the corpus or spend GPU time on Stages 2-4. If Stage 1
+succeeds but Stage 2 fails, improve matched decision data. If Stages 1-2
+succeed but RLVR is flat, improve task admission and verified reward density
+rather than extending the run. Stage 4 is optional and cannot rescue a failed
+ordinary RL phase.
 
 ## 15. Success definition
 

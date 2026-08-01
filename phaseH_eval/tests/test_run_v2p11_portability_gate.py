@@ -37,6 +37,10 @@ def test_portability_launcher_uses_stock_controller_free_harness() -> None:
     assert "DockerSelfRetryEnv" not in script
     assert "pkill" not in script
     assert "pgrep" not in script
+    assert 'nvidia-smi -i "$GPU_INDEX" --query-gpu=uuid' in script
+    assert 'nvidia-smi -i "$GPU_INDEX" --query-compute-apps=pid' in script
+    assert "--query-gpu=index,uuid" not in script
+    assert "--query-compute-apps=gpu_uuid,pid" not in script
 
 
 def test_portability_launcher_preserves_raw_tool_call_evidence() -> None:

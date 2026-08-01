@@ -214,16 +214,12 @@ if [[ "$MODE" == "empty_retry" ]]; then
   [[ ! -e "$PREDICTIONS" ]] ||
     halt "refusing to overwrite predictions: $PREDICTIONS"
 fi
-gpu_uuid="$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader |
-  awk -F, -v gpu_index="$GPU_INDEX" \
-    '$1 + 0 == gpu_index {
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
-      print $2
-    }')"
+gpu_uuid="$(nvidia-smi -i "$GPU_INDEX" --query-gpu=uuid \
+  --format=csv,noheader | awk '{$1=$1; print}')"
 [[ -n "$gpu_uuid" ]] || halt "GPU_INDEX does not resolve to a GPU: $GPU_INDEX"
-gpu_pids="$(nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader |
-  awk -F, -v uuid="$gpu_uuid" '
-    {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1); if ($1 == uuid) print $2}')"
+gpu_pids="$(nvidia-smi -i "$GPU_INDEX" --query-compute-apps=pid \
+  --format=csv,noheader,nounits |
+  awk '{$1=$1; if ($1 ~ /^[0-9]+$/) print $1}')"
 ensure_eval_manifest
 
 if [[ "$REUSE_SERVE" == "0" ]]; then

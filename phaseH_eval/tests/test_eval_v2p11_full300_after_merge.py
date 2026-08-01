@@ -61,6 +61,10 @@ def test_v2p11_full300_driver_preserves_machine_safety() -> None:
     assert 'GPU_INDEX is fixed to GPU1; GPU0 is unavailable' in script
     assert "REQUIRE_PRODUCTION_HEALTH" not in script
     assert "wait_for_gpu1_idle" in script
+    assert 'nvidia-smi -i "$GPU_INDEX" --query-gpu=uuid' in script
+    assert 'nvidia-smi -i "$GPU_INDEX" --query-compute-apps=pid' in script
+    assert "--query-gpu=index,uuid" not in script
+    assert "--query-compute-apps=gpu_uuid,pid" not in script
     assert "pkill" not in script
     assert "pgrep" not in script
 

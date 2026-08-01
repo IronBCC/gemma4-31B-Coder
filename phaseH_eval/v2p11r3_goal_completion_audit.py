@@ -42,6 +42,37 @@ def _validate_reasoned_lineage(provenance: Mapping[str, Any]) -> None:
         raise ValueError("r3 Fable reasoning-contract evidence is incomplete")
 
 
+def _validate_behavior_poststage(provenance: Mapping[str, Any]) -> None:
+    poststage = provenance.get("behavior_poststage")
+    if not isinstance(poststage, Mapping) or {
+        "recovery_rows": poststage.get("recovery_rows"),
+        "recovery_optimizer_steps": poststage.get(
+            "recovery_optimizer_steps"
+        ),
+        "behavior_rows": poststage.get("behavior_rows"),
+        "kto_optimizer_steps": poststage.get("kto_optimizer_steps"),
+        "coverage_counts": poststage.get("coverage_counts"),
+        "negative_counts": poststage.get("negative_counts"),
+    } != {
+        "recovery_rows": 138,
+        "recovery_optimizer_steps": 105,
+        "behavior_rows": 606,
+        "kto_optimizer_steps": 25,
+        "coverage_counts": {
+            "desirable_correct_patch": 25,
+            "empty_terminal": 8,
+            "repeated_read_loop": 8,
+            "wrong_nonempty_replay": 9,
+        },
+        "negative_counts": {
+            "empty_terminal": 33,
+            "repeated_read_loop": 55,
+            "wrong_nonempty_replay": 228,
+        },
+    }:
+        raise ValueError("r3 behavior poststage evidence is incomplete")
+
+
 def publish_goal_audit(
     *, verdict_path: Path, full_ids_path: Path,
     v2p10_composite_path: Path, v2p10_predictions_path: Path,
@@ -85,6 +116,7 @@ def publish_goal_audit(
         candidate_model_contract=model_contract, candidate_name=candidate_name,
     )
     _validate_reasoned_lineage(provenance)
+    _validate_behavior_poststage(provenance)
     control = verdict["v2p10"]
     candidate = verdict["v2p11"]
     assert isinstance(control, Mapping) and isinstance(candidate, Mapping)
@@ -101,6 +133,16 @@ def publish_goal_audit(
             "stage_a_strict_fable_rows": 36,
             "recent_strict_fable_rows": 15,
             "reasoned_fable_tool_turns": 468,
+            "portable_recovery_rows": 138,
+            "recovery_optimizer_steps": 105,
+            "behavior_kto_rows": 606,
+            "behavior_kto_optimizer_steps": 25,
+            "behavior_kto_coverage": {
+                "desirable_correct_patch": 25,
+                "empty_terminal": 8,
+                "repeated_read_loop": 8,
+                "wrong_nonempty_replay": 9,
+            },
             "full_context_window": 32768,
             "official_scores_bound": True,
             "failure_analysis_bound": True,
@@ -118,7 +160,14 @@ def publish_goal_audit(
             "provenance": _binding(provenance_path),
         },
     }
-    _publish_json_noreplace(Path(output_path).resolve(), report)
+    output_path = Path(output_path).resolve()
+    if output_path.exists():
+        if _read_object(output_path) != report:
+            raise ValueError(
+                "existing goal audit differs from current inputs"
+            )
+    else:
+        _publish_json_noreplace(output_path, report)
     return report
 
 

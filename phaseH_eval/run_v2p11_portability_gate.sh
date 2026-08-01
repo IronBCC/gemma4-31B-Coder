@@ -49,23 +49,14 @@ halt() {
 }
 
 gpu1_uuid() {
-  nvidia-smi --query-gpu=index,uuid --format=csv,noheader |
-    awk -F, -v gpu_index="$GPU_INDEX" '$1 + 0 == gpu_index {
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
-      print $2
-    }'
+  nvidia-smi -i "$GPU_INDEX" --query-gpu=uuid --format=csv,noheader |
+    awk '{$1=$1; print}'
 }
 
 gpu1_compute_pids() {
-  local uuid="$1"
-  nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader |
-    awk -F, -v target="$uuid" '
-      {
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
-        if ($1 == target) print $2
-      }
-    '
+  nvidia-smi -i "$GPU_INDEX" --query-compute-apps=pid \
+    --format=csv,noheader,nounits |
+    awk '{$1=$1; if ($1 ~ /^[0-9]+$/) print $1}'
 }
 
 wait_for_gpu1_idle() {

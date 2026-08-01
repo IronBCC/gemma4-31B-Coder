@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "phaseH_eval" / "run_v2p11_portability_gate.sh"
@@ -190,6 +192,99 @@ main
     assert result.stdout.splitlines()[:2] == ["validate", "prepull"]
 
 
+def test_full_mode_validates_interpolation_before_any_image_pull(
+    tmp_path: Path,
+) -> None:
+    control_model = tmp_path / "control-model"
+    candidate_model = tmp_path / "candidate-model"
+    anchor_model = tmp_path / "anchor-model"
+    source_model = tmp_path / "source-model"
+    for model in (control_model, candidate_model, anchor_model, source_model):
+        model.mkdir()
+    manifest = candidate_model / "interpolation_manifest.json"
+    manifest.write_text("{}\n")
+    ids = tmp_path / "ids.json"
+    ids.write_text(json.dumps([f"case-{index}" for index in range(10)]))
+    stock_config = tmp_path / "swebench.yaml"
+    stock_config.write_text("environment:\n  environment_class: docker\n")
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            """
+source "$SCRIPT_UNDER_TEST"
+validate_interpolation_candidate() { echo validate; }
+prepull_holdout_images() { echo prepull; }
+run_or_reuse_stock_harness() { echo "run:$1"; }
+check_production() { :; }
+wait_for_gpu1_idle() { :; }
+main
+""",
+        ],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "SCRIPT_UNDER_TEST": str(SCRIPT),
+            "LINEAGE_MODE": "interpolation",
+            "CONTROL_MODEL": str(control_model),
+            "CANDIDATE_MODEL": str(candidate_model),
+            "INTERPOLATION_ANCHOR_MODEL": str(anchor_model),
+            "INTERPOLATION_SOURCE_MODEL": str(source_model),
+            "INTERPOLATION_MANIFEST": str(manifest),
+            "FINAL_AUDIT": str(tmp_path / "missing-final-audit.json"),
+            "CONTROL_ROOT": str(tmp_path / "control-run"),
+            "CANDIDATE_ROOT": str(tmp_path / "candidate-run"),
+            "GATE": str(tmp_path / "gate.json"),
+            "IDS": str(ids),
+            "STOCK_CONFIG": str(stock_config),
+            "EVAL_PY": os.environ.get("PYTHON", "/usr/bin/python3"),
+            "VLLM": "/usr/bin/true",
+        },
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode != 0
+    assert result.stdout.splitlines()[:2] == ["validate", "prepull"]
+
+
+@pytest.mark.parametrize(
+    ("gpu_index", "lineage_mode"),
+    [("0", "interpolation"), ("1", "invalid")],
+)
+def test_invalid_gpu_or_lineage_mode_fails_before_serving(
+    tmp_path: Path,
+    gpu_index: str,
+    lineage_mode: str,
+) -> None:
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            """
+source "$SCRIPT_UNDER_TEST"
+prepull_holdout_images() { echo PREPULL; }
+start_owned_serve() { echo SERVE; }
+main
+""",
+        ],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "SCRIPT_UNDER_TEST": str(SCRIPT),
+            "GPU_INDEX": gpu_index,
+            "LINEAGE_MODE": lineage_mode,
+            "LOG": str(tmp_path / "launcher.log"),
+        },
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode != 0
+    assert "PREPULL" not in result.stdout
+    assert "SERVE" not in result.stdout
+
+
 def test_portability_launcher_exposes_vllm_build_tools_on_path() -> None:
     result = subprocess.run(
         [
@@ -221,7 +316,13 @@ def test_portability_launcher_supports_direct_lora_candidate() -> None:
 
     assert 'LINEAGE_MODE="${LINEAGE_MODE:-posttrain}"' in script
     assert "validate_direct_lora_candidate" in script
-    assert "LINEAGE_MODE must be posttrain or direct_lora" in script
+    assert "validate_interpolation_candidate" in script
+    assert "phaseH_eval/v2p11_interpolation_lineage.py" in script
+    assert "posttrain|direct_lora|interpolation" in script
+    assert (
+        "LINEAGE_MODE must be posttrain, direct_lora, or interpolation"
+        in script
+    )
     assert "--candidate-name" in script
     assert '"$CANDIDATE_NAME"' in script
     assert 'CUDA_VISIBLE_DEVICES="$GPU_INDEX"' in script

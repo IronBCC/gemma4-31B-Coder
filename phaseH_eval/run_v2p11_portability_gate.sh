@@ -16,6 +16,9 @@ RECOVERY_MARKER="${RECOVERY_MARKER:-runs/v2p11_recovery_sft_complete.json}"
 KTO_MARKER="${KTO_MARKER:-runs/v2p11_kto_complete.json}"
 FINAL_MERGE_MARKER="${FINAL_MERGE_MARKER:-runs/v2p11_final_merge_complete.json}"
 FINAL_AUDIT="${FINAL_AUDIT:-/media/ironbcc/CrucialX10/models/merged/teacher_sft_v2p11_full/v2p11_final_merge_audit.json}"
+INTERPOLATION_MANIFEST="${INTERPOLATION_MANIFEST:-/media/ironbcc/CrucialX10/models/merged/teacher_sft_v2p11r4_blend25/interpolation_manifest.json}"
+INTERPOLATION_ANCHOR_MODEL="${INTERPOLATION_ANCHOR_MODEL:-/media/ironbcc/CrucialX10/models/merged/teacher_sft_v2p10_full}"
+INTERPOLATION_SOURCE_MODEL="${INTERPOLATION_SOURCE_MODEL:-/media/ironbcc/CrucialX10/models/merged/teacher_sft_v2p11r3_behavior_full}"
 CONTROL_NAME="${CONTROL_NAME:-teacher_sft_v2p10}"
 CONTROL_MODEL="${CONTROL_MODEL:-/media/ironbcc/CrucialX10/models/merged/teacher_sft_v2p10_full}"
 CANDIDATE_NAME="${CANDIDATE_NAME:-teacher_sft_v2p11}"
@@ -205,6 +208,15 @@ assert json.loads(audit_path.read_text()) == {
     "misplaced_tensors": [],
     "nonfinite_tensors": [],
     "complete": True,
+}
+
+validate_interpolation_candidate() {
+  "$EVAL_PY" phaseH_eval/v2p11_interpolation_lineage.py \
+    --manifest "$INTERPOLATION_MANIFEST" \
+    --anchor-model "$INTERPOLATION_ANCHOR_MODEL" \
+    --source-model "$INTERPOLATION_SOURCE_MODEL" \
+    --output-model "$CANDIDATE_MODEL" \
+    --candidate-name "$CANDIDATE_NAME"
 }
 PY
 }
@@ -626,8 +638,8 @@ main() {
     *) halt "PORTABILITY_MODE must be control-only or full" ;;
   esac
   case "$LINEAGE_MODE" in
-    posttrain|direct_lora) ;;
-    *) halt "LINEAGE_MODE must be posttrain or direct_lora" ;;
+    posttrain|direct_lora|interpolation) ;;
+    *) halt "LINEAGE_MODE must be posttrain, direct_lora, or interpolation" ;;
   esac
   [[ "$WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]] ||
     halt "WAIT_SECONDS must be a positive integer"
@@ -649,17 +661,31 @@ main() {
     halt "portability ID artifact must contain 10 rows"
 
   if [[ "$PORTABILITY_MODE" == "full" ]]; then
-    [[ -f "$FINAL_AUDIT" ]] ||
-      halt "v2.11 final merge audit is missing"
     [[ -d "$CANDIDATE_MODEL" ]] ||
       halt "v2.11 portability candidate model directory is missing"
-    if [[ "$LINEAGE_MODE" == "posttrain" ]]; then
-      [[ -f "$POSTTRAIN_MARKER" ]] ||
-        halt "v2.11 posttrain marker is missing"
-      validate_posttrain_candidate
-    else
-      validate_direct_lora_candidate
-    fi
+    case "$LINEAGE_MODE" in
+      posttrain)
+        [[ -f "$FINAL_AUDIT" ]] ||
+          halt "v2.11 final merge audit is missing"
+        [[ -f "$POSTTRAIN_MARKER" ]] ||
+          halt "v2.11 posttrain marker is missing"
+        validate_posttrain_candidate
+        ;;
+      direct_lora)
+        [[ -f "$FINAL_AUDIT" ]] ||
+          halt "v2.11 final merge audit is missing"
+        validate_direct_lora_candidate
+        ;;
+      interpolation)
+        [[ -f "$INTERPOLATION_MANIFEST" ]] ||
+          halt "v2.11 interpolation manifest is missing"
+        [[ -d "$INTERPOLATION_ANCHOR_MODEL" ]] ||
+          halt "v2.11 interpolation anchor model is missing"
+        [[ -d "$INTERPOLATION_SOURCE_MODEL" ]] ||
+          halt "v2.11 interpolation source model is missing"
+        validate_interpolation_candidate
+        ;;
+    esac
   fi
 
   trap cleanup EXIT

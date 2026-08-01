@@ -3095,3 +3095,28 @@ Full analysis + run-by-run history: `phaseD_sft/V6_49K_RETROSPECTIVE.md`. Compre
   `Restart=on-failure`, `RestartSec=60`, `StartLimitBurst=3`, and a 30-minute start-limit interval.
   It performs no GPU query or work while waiting. The training and final-verdict ETA boundaries
   remain approximately 22:48 PDT on 2026-07-31 and 16:00-20:00 PDT on 2026-08-01, respectively.
+
+### v2.11r3 promotion proof gates (2026-07-31 20:16 PDT)
+
+- Commit `042feca` binds the r3 init adapter to the rebuilt canonical v2.10 training-lineage
+  contract, including exact adapter weights, `adapter_config.json`, and resolved adapter directory.
+  Fresh publication, provenance reuse, evaluator preflight/comparison, and the final goal audit all
+  receive the canonical trust root externally; a provenance report cannot nominate its own lineage.
+- Commit `d14d763` publishes every unresolved non-empty full300 ID (including classified model
+  failures), its paired introduced/eliminated sets and delta, and requires a non-positive delta for
+  promotion. The final audit reconstructs `wrong = full - resolved - empty`, checks the failure
+  classification split, and requires verdict resolved/empty IDs and counts to match both validated
+  official score bindings. The omitted-ID and contradictory-score attacks now fail closed.
+- Independent review returned zero findings after both adversarial fixes. The complete tracked
+  v2.11 contract suite passed `129/129` locally and `129/129` remotely; Python compilation and both
+  r3 shell syntax checks passed. Checksum-only rsync verification is blank for all 15 committed
+  proof-gate paths.
+- CPU-only remote revalidation published/reused
+  `runs/v2p11_v2p10_training_lineage.json` with SHA-256
+  `4f7affc19fc56f370987a728c01d21c36290ffdebb9e87e4d8304210f32ade12`. It binds canonical v2.10
+  adapter weights SHA-256 `b91b41a5b0b9b82395d5b1aecca3b24536c110663f276d0caaec9e0e6a3bcb45`
+  and config SHA-256 `896cd7dc25f89a534058a0c2943884bc92d2fc45068469ebbd39cca361cce4b0`.
+- The waiter remains at its last verified identity above; it was not polled during this offline
+  proof work. Do not query or touch GPU0. The next live evidence boundary remains 22:48 PDT, when
+  the named training unit, exact trainer evidence, waiter/poststage unit, and resulting immutable
+  artifacts should be checked once.

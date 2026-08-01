@@ -3258,3 +3258,34 @@ Full analysis + run-by-run history: `phaseD_sft/V6_49K_RETROSPECTIVE.md`. Compre
   mismatch before comparing resolution, wrong-nonempty, empty, or repeat-loop metrics. No live
   portability status was polled for this offline preflight; the next live check remains its
   completion/error boundary.
+
+### v2.11r4 full300 and source-provenance preflight (2026-08-01 12:43 PDT)
+
+- The correct joined-panel and official-score validators freshly replayed the canonical v2.10
+  full300 evidence. `data/swebench_lite_test_ids.json` remains 300 unique IDs with SHA-256
+  `b98fc2b1054dc8fdfcb94f083f43454fd568961a0b3dbf8c388c210b7b868e14`.
+  `runs/v2p10_full300_composite.json` remains a complete
+  `disjoint_panel_full300_composite`, SHA-256
+  `c26838c892684c963202d0ce88c936c4fec522134c1eb145f31c85eb3d9f516e`, with 157 resolved
+  and two model-empty outcomes (`pylint-dev__pylint-7080`, `sphinx-doc__sphinx-8801`). Its 29 empty
+  retries produced 26 nonempty patches and nine additional resolutions, leaving two empty.
+- The canonical v2.10 predictions SHA-256 is
+  `d742ad5d25751ea5af6522be3dd361c404ce7791879679f1c0d156226616acca`; training-lineage
+  SHA-256 is `4f7affc19fc56f370987a728c01d21c36290ffdebb9e87e4d8304210f32ade12`; and official-score
+  binding SHA-256 is `c0717bd8c7fb2b8894267345963f08412ee4c15e11a6c904c76b41e592562a76`.
+  All three revalidated against current panels, reports, model identity, and the 1,211-row v2.10
+  training contract. No recent-v2.11 Fable row is attributed to v2.10.
+- A full rebuild of `runs/v2p11r3_behavior_completion_provenance.json`, SHA-256
+  `727d6ed77657d92739c32824ca646bdf0b1dc7949bbbbdf107814c166cc0be8b`, also passed. It
+  revalidated the 1,262-row, 32,768-token, 79-step LoRA run with 820 changed tensors; 92 Fable rows;
+  36 new strict Stage-A rows plus 15 recent strict exact-patch rows; max rendered length 26,594;
+  707 excluded IDs across 12 repositories; and zero overlap with the 300 evaluation IDs. The
+  behavior poststage remains bound to 138 recovery rows/105 steps, 606 behavior rows/25 KTO steps,
+  and the exact recovery, behavior, exclusion, adapter, journal, watchdog, merge, and model hashes.
+- One exploratory command initially applied `_validate_composite_source`, which is intentionally a
+  single-panel validator, to the joined full300 composite and therefore returned `source composite
+  is incomplete`. Root-cause inspection showed the joined artifact correctly uses type
+  `disjoint_panel_full300_composite` and nested fixed/complement `selected_attempts`; the production
+  chain does not make that incompatible call. Re-running through `validate_official_score_binding`
+  and `validate_v2p10_training_lineage_contract` passed without edits. No canonical artifact was
+  changed. The next live check remains the portability completion/error boundary.

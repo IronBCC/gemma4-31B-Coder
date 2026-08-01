@@ -3039,3 +3039,39 @@ Full analysis + run-by-run history: `phaseD_sft/V6_49K_RETROSPECTIVE.md`. Compre
   evidence, 468 reasoned Fable tool turns, and per-instance failure analysis. It publishes only a
   trustworthy win; a losing full300 verdict remains preserved evidence but cannot be misreported as
   goal completion. Focused local and remote validation passed 23 tests.
+
+### v2.11r3 behavior-poststage handoff (2026-07-31 18:55 PDT)
+
+- The final candidate is now `teacher_sft_v2p11r3_behavior`, not the direct reasoned r3 adapter.
+  After the 79-step reasoning SFT, the guarded chain runs a 138-row/105-step recovery SFT, a
+  one-step KTO canary, a 25-step coverage-selected KTO pass, the final multimodal merge, the
+  controller-free portability gate, and exactly one matched Lite300 evaluation. The final audit
+  still requires a complete v2.11 win over the bound v2.10 result of 157/300 with no empty-patch
+  regression.
+- Model-level empty/loop mitigation is bound into the poststage data: 606 behavior rows include
+  33 empty-terminal, 55 repeated-read-loop, and 228 wrong-nonempty negatives. The deterministic
+  50-row KTO coverage pass requires 25 desirable patches plus 8 empty, 8 loop, and 9 wrong-edit
+  negatives. Recovery SFT uses 32,768 context, rank/alpha 32/32, and 105 optimizer steps.
+- Remote production admission revalidated at 18:54 PDT: recovery `138` rows/`105` optimizer steps,
+  behavior `606` rows, `707` excluded IDs, `12` excluded repositories, `300` full-evaluation IDs,
+  and zero overlap. Sealed SHA-256 values are recovery train
+  `eda502d05f736426728651953e76330d24addd39471e82bf5fe423c896ba4b66`, recovery manifest
+  `c996953fb810f3e4642bd458dde7226e245bcb99ac02fec249e38a6d9d21fc2a`, behavior data
+  `525526bffe58a64a3e42b0d733d87b60dd62e3d2dbaa8362de7b74b00a6699e9`, behavior manifest
+  `2b77db5de27de7f3880ac711fd0721efb8c00ffe82ce8ca6f219225c5fb43122`, and exclusions
+  `00171a1e7796fac2103317bcf4f05af42e46ff92db0041fd4a26ccbaaa7e4bd8`.
+- The integration commits are `b251340`, `f0f3bbb`, `0adcd9f`, and `73f708a`. Local and remote
+  focused verification both pass `93/93`; all five shell launchers and all five embedded Python
+  heredocs compile. The chain is restartable at immutable training evidence, recovery/KTO phases,
+  portability, provenance, full300, and goal-audit boundaries. Existing artifacts are reused only
+  after current-input revalidation; partial final-file writes use atomic no-replace publication.
+- Live artifact line at 18:51 PDT: training unit `v2p11r3-reasoned-train-gpu1.service` has wrapper
+  MainPID `2526707`; exact GPU1 trainer PID `2526889` is at optimizer step `32/79`, microstep
+  `525/1264`, GPU1 utilization `98%`, and trainer ETA `14,168` seconds. The evidence-based r3
+  training boundary is about 22:48 PDT. No process or query targets GPU0.
+- CPU-only waiter `v2p11r3-posttrain-waiter.service` is active as PID `2577442`, invocation
+  `b735b35d76754947bb62cebee84ce49f`. It checks only the named training unit every 60 seconds and
+  then executes `phaseH_eval/run_v2p11r3_posttrain_chain.sh`; it performs no GPU work while r3 owns
+  GPU1. Allow roughly 4-7 hours after r3 for recovery/KTO/merges/portability and roughly 12-14 hours
+  for the matched full300 including bounded empty correction. The current final-verdict window is
+  approximately 16:00-20:00 PDT on 2026-08-01, subject to actual recovery/KTO throughput.

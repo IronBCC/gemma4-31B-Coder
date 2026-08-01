@@ -3213,3 +3213,27 @@ Full analysis + run-by-run history: `phaseD_sft/V6_49K_RETROSPECTIVE.md`. Compre
 - Next evidence boundary: materialization completion/error, initially expected around 12:10-12:20 PDT.
   If it succeeds, portability is approximately 1-2 hours and fixed150 approximately 6-10 hours; a
   passing full300 then requires another approximately 8-14 hours.
+
+### v2.11r4 portability10 live boundary (2026-08-01 12:25 PDT)
+
+- The interpolated checkpoint is atomically published and lineage-verified at
+  `/media/ironbcc/CrucialX10/models/merged/teacher_sft_v2p11r4_blend25`. Its complete manifest has
+  SHA-256 `3026c4cd158fc66460f01d10b1bc2288c806de2ca93e125aba0844df54656c66`, 1,188
+  tensors, 20 shards, and 62,546,177,752 tensor bytes. The bounded materializer peaked at
+  10,018,902,016 bytes RSS. Only the admitted tokenizer padding fields differ between parents; the
+  published output copies the canonical v2.10 tokenizer.
+- The resumed automatic chain is active as `v2p11r4-blend25-chain-gpu1.service`, exact chain PID
+  `3803607`, with portability wrapper PID `3804523`. At `12:25:25 PDT`, exact vLLM PID `3806254`
+  became ready on `:8013`; `/v1/models` returns only `teacher_sft_v2p11r4_blend25` rooted at the
+  exact published path. Engine PID `3806533` owns GPU1 and the 12-GiB host-memory watchdog is PID
+  `3806255`. Do not query or touch GPU0.
+- The controller-free stock-harness portability driver is exact PID `3807933` over the immutable
+  verified 10-task set. It began at `12:25:29 PDT`; candidate artifacts were still 0 predictions,
+  0 trajectories, and 0 batch-prediction files at launch. The already-verified matched v2.10
+  control remains 10 predictions, 10 trajectories, and one batch-prediction file. No portability
+  gate artifact or fixed150 artifact exists yet.
+- Next evidence boundary is portability completion/error, projected around `13:25-14:25 PDT` from
+  the prior measured lane. On pass, the same chain starts matched fixed150 automatically; its
+  provisional completion bracket is `19:25 PDT` through `00:25 PDT` on 2026-08-02, to be replaced
+  by a measured ETA after the first completed fixed150 batch. Full300 remains conditional on that
+  gate and would add approximately 8-14 hours.

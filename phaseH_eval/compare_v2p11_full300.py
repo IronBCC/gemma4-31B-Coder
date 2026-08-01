@@ -276,6 +276,21 @@ def validate_completion_provenance(
         )
     if (
         report.get("artifact_type")
+        == "v2p11r3_behavior_completion_provenance"
+    ):
+        from phaseH_eval.v2p11r3_behavior_completion_provenance import (
+            validate_completion_provenance as validate_behavior_poststage,
+        )
+
+        return validate_behavior_poststage(
+            provenance_path,
+            full_ids_path=full_ids_path,
+            v2p10_composite_path=v2p10_composite_path,
+            candidate_model_contract=candidate_model_contract,
+            candidate_name=candidate_name,
+        )
+    if (
+        report.get("artifact_type")
         == "v2p11r3_completion_provenance"
     ):
         from phaseH_eval.v2p11r3_completion_provenance import (

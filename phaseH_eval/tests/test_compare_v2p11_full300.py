@@ -686,6 +686,46 @@ def test_completion_provenance_dispatches_reasoned_direct_lora_contract(
     assert captured["candidate_model_contract"] == model_contract
 
 
+def test_completion_provenance_dispatches_r3_behavior_poststage_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import phaseH_eval.v2p11r3_behavior_completion_provenance as behavior_module
+
+    provenance = tmp_path / "provenance.json"
+    provenance.write_text(json.dumps({
+        "artifact_type": "v2p11r3_behavior_completion_provenance",
+    }) + "\n")
+    captured: dict[str, object] = {}
+
+    def fake_validate(path: Path, **kwargs: object) -> dict[str, object]:
+        captured["path"] = path
+        captured.update(kwargs)
+        return {"status": "complete", "behavior_poststage": {"kto_optimizer_steps": 25}}
+
+    monkeypatch.setattr(
+        behavior_module,
+        "validate_completion_provenance",
+        fake_validate,
+    )
+    full_ids = tmp_path / "ids.json"
+    v2p10 = tmp_path / "v2p10.json"
+    model_contract = {"served_name": "teacher_sft_v2p11r3_behavior"}
+
+    validated = compare_module.validate_completion_provenance(
+        provenance,
+        full_ids_path=full_ids,
+        v2p10_composite_path=v2p10,
+        candidate_model_contract=model_contract,
+        candidate_name="teacher_sft_v2p11r3_behavior",
+    )
+
+    assert validated["behavior_poststage"]["kto_optimizer_steps"] == 25
+    assert captured["path"] == provenance.resolve()
+    assert captured["candidate_name"] == "teacher_sft_v2p11r3_behavior"
+    assert captured["candidate_model_contract"] == model_contract
+
+
 def test_verdict_publication_rolls_back_json_when_markdown_exists(
     tmp_path: Path,
 ) -> None:

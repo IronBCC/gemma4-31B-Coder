@@ -111,6 +111,12 @@ def create_complete_phase_lineage(
     *,
     final_model: Path,
     stage_marker: Path,
+    r3_stage: bool = False,
+    marker_prefix: str = "v2p11",
+    coverage_override: dict[str, int] | None = None,
+    selected_uids_override: list[str] | None = None,
+    recovery_manifest_override: dict[str, object] | None = None,
+    omit_recovery_audit_from_marker: bool = False,
 ) -> dict[str, Path]:
     root.mkdir(parents=True, exist_ok=True)
     stage_adapter = root / "stage_adapter"
@@ -157,17 +163,29 @@ def create_complete_phase_lineage(
         },
     )
     stage_value = json.loads(stage_marker.read_text())
-    stage_value["adapter_sha256"] = binding(stage_weights)["sha256"]
-    stage_value["run_manifest_sha256"] = binding(
-        stage_adapter / "run_manifest.json"
-    )["sha256"]
+    if r3_stage:
+        stage_value.update(
+            {
+                "schema_version": 1,
+                "artifact_type": "v2p11r3_training_completion",
+                "status": "complete",
+                "optimizer_steps": 79,
+                "max_steps": 79,
+                "adapter": binding(stage_weights),
+            }
+        )
+    else:
+        stage_value["adapter_sha256"] = binding(stage_weights)["sha256"]
+        stage_value["run_manifest_sha256"] = binding(
+            stage_adapter / "run_manifest.json"
+        )["sha256"]
     write_json(stage_marker, stage_value)
     recovery_data = root / "recovery_data"
     recovery_data.mkdir()
     (recovery_data / "train.jsonl").write_text("{}\n")
     write_json(recovery_data / "manifest.json", {"rows": 138})
     recovery_input = write_phase_marker(
-        root / "v2p11_recovery_sft_inputs.json",
+        root / f"{marker_prefix}_recovery_sft_inputs.json",
         "recovery_sft_inputs",
         [
             stage_marker,
@@ -187,21 +205,44 @@ def create_complete_phase_lineage(
         recovery_adapter / "adapter_config.json",
         {"r": 32, "lora_alpha": 32},
     )
-    write_json(
-        recovery_adapter / "run_manifest.json",
-        {
-            "data": "data/v2p11_portable_recovery138_targeted",
-            "init_adapter": "adapters/teacher_sft_v2p11_bf16",
+    recovery_run_manifest = {
+            "data": (
+                str(recovery_data.resolve())
+                if r3_stage
+                else "data/v2p11_portable_recovery138_targeted"
+            ),
+            "init_adapter": (
+                str(stage_adapter.resolve())
+                if r3_stage
+                else "adapters/teacher_sft_v2p11_bf16"
+            ),
             "max_seq": 32768,
             "load_4bit": False,
-        },
-    )
+        }
+    if r3_stage:
+        recovery_run_manifest.update(
+            {
+                "data_len": 138,
+                "rank": 32,
+                "alpha": 32,
+                "lr": 5e-6,
+                "epochs": 3.0,
+                "bsz": 1,
+                "grad_accum": 4,
+                "warmup_steps": 4,
+                "gradient_checkpointing": "bounded_unsloth",
+                "selective_assistant_loss": True,
+            }
+        )
+    if recovery_manifest_override:
+        recovery_run_manifest.update(recovery_manifest_override)
+    write_json(recovery_adapter / "run_manifest.json", recovery_run_manifest)
     write_json(
         recovery_adapter / "trainer_state.json",
         {"global_step": 105, "max_steps": 105},
     )
     recovery_marker = write_phase_marker(
-        root / "v2p11_recovery_sft_complete.json",
+        root / f"{marker_prefix}_recovery_sft_complete.json",
         "recovery_sft",
         [
             recovery_input,
@@ -217,8 +258,14 @@ def create_complete_phase_lineage(
         recovery_model,
         "v2p11_recovery_merge_audit.json",
     )
+    if omit_recovery_audit_from_marker:
+        recovery_model_artifacts = [
+            path
+            for path in recovery_model_artifacts
+            if path.name != "v2p11_recovery_merge_audit.json"
+        ]
     recovery_merge_marker = write_phase_marker(
-        root / "v2p11_recovery_merge_complete.json",
+        root / f"{marker_prefix}_recovery_merge_complete.json",
         "recovery_merge",
         [*recovery_model_artifacts, recovery_marker],
     )
@@ -245,7 +292,7 @@ def create_complete_phase_lineage(
     behavior_manifest = root / "v2p11_behavior_kto_v2_manifest.json"
     write_json(behavior_manifest, {"rows": 606})
     kto_input = write_phase_marker(
-        root / "v2p11_kto_inputs.json",
+        root / f"{marker_prefix}_kto_inputs.json",
         "kto_full_inputs",
         [recovery_merge_marker, behavior_data, behavior_manifest],
     )
@@ -274,10 +321,12 @@ def create_complete_phase_lineage(
             "source_rows": 606,
             "training_rows": 50,
             "coverage_required": True,
-            "coverage_counts": coverage,
-            "selected_sample_uids": [
-                str(row["sample_uid"]) for row in selected
-            ],
+            "coverage_counts": coverage_override or coverage,
+            "selected_sample_uids": (
+                selected_uids_override
+                if selected_uids_override is not None
+                else [str(row["sample_uid"]) for row in selected]
+            ),
             "per_device_train_batch_size": 2,
             "gradient_accumulation_steps": 1,
             "optimizer_steps": 25,
@@ -287,7 +336,7 @@ def create_complete_phase_lineage(
     kto_state = kto_adapter / "trainer_state.json"
     write_json(kto_state, {"global_step": 25, "max_steps": 25})
     kto_marker = write_phase_marker(
-        root / "v2p11_kto_complete.json",
+        root / f"{marker_prefix}_kto_complete.json",
         "kto_full",
         [
             kto_input,
@@ -303,7 +352,7 @@ def create_complete_phase_lineage(
         "v2p11_final_merge_audit.json",
     )
     final_merge_marker = write_phase_marker(
-        root / "v2p11_final_merge_complete.json",
+        root / f"{marker_prefix}_final_merge_complete.json",
         "final_merge",
         [*final_artifacts, recovery_merge_marker, kto_marker],
     )
@@ -313,8 +362,11 @@ def create_complete_phase_lineage(
         "recovery_manifest": recovery_data / "manifest.json",
         "recovery_merge": recovery_merge_marker,
         "behavior_manifest": behavior_manifest,
+        "behavior_data": behavior_data,
         "kto_input": kto_input,
         "kto": kto_marker,
         "final_merge": final_merge_marker,
         "kto_evidence": evidence,
+        "stage_weights": stage_weights,
+        "stage_marker": stage_marker,
     }

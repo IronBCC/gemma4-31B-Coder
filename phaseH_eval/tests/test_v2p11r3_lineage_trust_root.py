@@ -80,15 +80,41 @@ def test_goal_audit_dispatches_external_lineage_to_r3(
     for path in (v2p10_score, v2p11_score, provenance, lineage):
         _write_json(path, {})
     captured: dict[str, object] = {}
+    outcomes = {
+        "v2p10": {
+            "resolved": {"control-resolved"},
+            "empty": {"control-empty"},
+            "wrong_nonempty": {"control-wrong-a", "control-wrong-b"},
+        },
+        "v2p11": {
+            "resolved": {"candidate-resolved"},
+            "empty": {"candidate-empty"},
+            "wrong_nonempty": {"candidate-wrong"},
+        },
+    }
     monkeypatch.setattr(
         audit_module,
         "_validate_trustworthy_verdict",
-        lambda *_args, **_kwargs: None,
+        lambda *_args, **_kwargs: outcomes,
     )
+
+    def validate_score(path: Path, **_kwargs: object) -> dict[str, object]:
+        label = "v2p10" if Path(path) == v2p10_score else "v2p11"
+        outcome = outcomes[label]
+        summary = {"v2p10": (157, 2), "v2p11": (158, 1)}[label]
+        return {
+            "final": {
+                "resolved_ids": sorted(outcome["resolved"]),
+                "empty_ids": sorted(outcome["empty"]),
+                "resolved": summary[0],
+                "empty": summary[1],
+            }
+        }
+
     monkeypatch.setattr(
         audit_module,
         "validate_official_score_binding",
-        lambda *_args, **_kwargs: {},
+        validate_score,
     )
     monkeypatch.setattr(audit_module, "_model_contract", lambda _path: {})
 

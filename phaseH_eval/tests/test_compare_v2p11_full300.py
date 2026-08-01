@@ -460,11 +460,27 @@ def test_compare_full300_requires_same_panel_and_reports_paired_delta(
     assert report["empty_patch"]["v2p11"] == ["case-150"]
     assert report["empty_patch"]["eliminated"] == ["case-001"]
     assert report["empty_patch"]["introduced"] == ["case-150"]
+    assert report["wrong_nonempty"] == {
+        "v2p10": sorted(
+            set(f"case-{index:03d}" for index in range(300))
+            - {"case-000", "case-001", "case-150"}
+        ),
+        "v2p11": sorted(
+            set(f"case-{index:03d}" for index in range(300))
+            - {"case-000", "case-001", "case-150", "case-299"}
+        ),
+        "introduced": [],
+        "eliminated": ["case-299"],
+        "delta": -1,
+        "no_regression": True,
+    }
     assert report["verdict"] == {
         "beats_v2p10": True,
         "resolved_delta": 1,
         "paired_win_delta": 1,
         "behavior_healthy": True,
+        "wrong_nonempty_delta": -1,
+        "wrong_nonempty_no_regression": True,
     }
     assert report["harness_contract"] == HARNESS_CONTRACT
 
@@ -841,6 +857,13 @@ def test_cli_forwards_explicit_candidate_identity(
         (set(), set(), set(), {"case-299"}, False),
         (set(), set(), {"case-298"}, {"case-299"}, False),
         ({"case-148"}, {"case-149"}, set(), set(), False),
+        (
+            {"case-298", "case-299"},
+            set(),
+            {"case-298", "case-299"},
+            set(),
+            False,
+        ),
     ],
 )
 def test_matched_comparison_reports_first_pass_and_retry_policy(

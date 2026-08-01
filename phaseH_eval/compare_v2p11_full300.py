@@ -1211,6 +1211,11 @@ def compare_full300(
     v2p11_resolved = set(candidate["resolved_ids"])
     v2p10_empty = _empty_ids(control)
     v2p11_empty = _empty_ids(candidate)
+    v2p10_wrong_nonempty = full_set - v2p10_resolved - v2p10_empty
+    v2p11_wrong_nonempty = full_set - v2p11_resolved - v2p11_empty
+    wrong_nonempty_delta = (
+        len(v2p11_wrong_nonempty) - len(v2p10_wrong_nonempty)
+    )
     v2p11_only = v2p11_resolved - v2p10_resolved
     v2p10_only = v2p10_resolved - v2p11_resolved
     paired_win_delta = len(v2p11_only) - len(v2p10_only)
@@ -1324,6 +1329,18 @@ def compare_full300(
             "eliminated": sorted(v2p10_empty - v2p11_empty),
             "introduced": sorted(v2p11_empty - v2p10_empty),
         },
+        "wrong_nonempty": {
+            "v2p10": sorted(v2p10_wrong_nonempty),
+            "v2p11": sorted(v2p11_wrong_nonempty),
+            "introduced": sorted(
+                v2p11_wrong_nonempty - v2p10_wrong_nonempty
+            ),
+            "eliminated": sorted(
+                v2p10_wrong_nonempty - v2p11_wrong_nonempty
+            ),
+            "delta": wrong_nonempty_delta,
+            "no_regression": wrong_nonempty_delta <= 0,
+        },
         "failure_analysis": failure_analysis,
         "behavior_regression": behavior_regression,
         "verdict": {
@@ -1331,6 +1348,8 @@ def compare_full300(
             "resolved_delta": len(v2p11_resolved) - len(v2p10_resolved),
             "paired_win_delta": paired_win_delta,
             "behavior_healthy": behavior_regression["healthy"],
+            "wrong_nonempty_delta": wrong_nonempty_delta,
+            "wrong_nonempty_no_regression": wrong_nonempty_delta <= 0,
         },
     }
     if provenance is not None:
@@ -1366,6 +1385,7 @@ def compare_full300(
             and report["verdict"]["first_pass_no_new_empty_ids"]
             and report["verdict"]["corrected_no_new_empty_ids"]
             and report["verdict"]["behavior_healthy"]
+            and report["verdict"]["wrong_nonempty_no_regression"]
             and provenance is not None
             and official_scores is not None
         )
@@ -1376,6 +1396,7 @@ def _markdown(report: Mapping[str, Any]) -> str:
     verdict = report["verdict"]
     paired = report["paired"]
     empty = report["empty_patch"]
+    wrong_nonempty = report["wrong_nonempty"]
     behavior = report["behavior_regression"]
     lines = [
         "# v2.11 vs v2.10 — SWE-bench Lite 300",
@@ -1442,6 +1463,13 @@ def _markdown(report: Mapping[str, Any]) -> str:
         (
             f"Empty patches eliminated: {len(empty['eliminated'])}; "
             f"introduced: {len(empty['introduced'])}."
+        ),
+        (
+            "Wrong non-empty outcomes: v2.10 "
+            f"{len(wrong_nonempty['v2p10'])}; v2.11 "
+            f"{len(wrong_nonempty['v2p11'])}; delta "
+            f"{wrong_nonempty['delta']:+d}; no regression: "
+            f"{str(wrong_nonempty['no_regression']).lower()}."
         ),
         (
             "Repeated-failure loop delta: "

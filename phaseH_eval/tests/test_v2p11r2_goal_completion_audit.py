@@ -82,6 +82,14 @@ def test_rejects_verdict_without_a_first_pass_win() -> None:
         "v2p11": {"name": "teacher_sft_v2p11r2", "resolved": 160, "empty": 1},
         "empty_patch": {"introduced": []},
         "first_pass": {"empty_patch": {"introduced": []}},
+        "wrong_nonempty": {
+            "v2p10": ["case-b", "case-c"],
+            "v2p11": ["case-c"],
+            "introduced": [],
+            "eliminated": ["case-b"],
+            "delta": -1,
+            "no_regression": True,
+        },
         "failure_analysis": {"by_instance": {}},
         "verdict": {
             "beats_v2p10": True,
@@ -91,6 +99,8 @@ def test_rejects_verdict_without_a_first_pass_win() -> None:
             "first_pass_no_new_empty_ids": True,
             "corrected_no_new_empty_ids": True,
             "behavior_healthy": True,
+            "wrong_nonempty_delta": -1,
+            "wrong_nonempty_no_regression": True,
             "trustworthy_beats_v2p10": True,
             "resolved_delta": 3,
         },
@@ -117,6 +127,144 @@ def test_rejects_verdict_without_a_first_pass_win() -> None:
         raise AssertionError("a missing first-pass win was accepted")
 
 
+def test_rejects_wrong_nonempty_regression_despite_a_score_win() -> None:
+    verdict = {
+        "schema_version": 1,
+        "artifact_type": "v2p11_v2p10_full300_verdict",
+        "status": "complete",
+        "population": 300,
+        "v2p10": {
+            "name": "teacher_sft_v2p10",
+            "resolved": 157,
+            "empty": 2,
+        },
+        "v2p11": {
+            "name": "teacher_sft_v2p11r3_behavior",
+            "resolved": 158,
+            "empty": 0,
+        },
+        "empty_patch": {"introduced": []},
+        "first_pass": {"empty_patch": {"introduced": []}},
+        "wrong_nonempty": {
+            "v2p10": ["case-a"],
+            "v2p11": ["case-a", "case-b"],
+            "introduced": ["case-b"],
+            "eliminated": [],
+            "delta": 1,
+            "no_regression": False,
+        },
+        "failure_analysis": {"by_instance": {}},
+        "verdict": {
+            "beats_v2p10": True,
+            "first_pass_beats_v2p10": True,
+            "first_pass_empty_delta": -2,
+            "corrected_empty_delta": -2,
+            "first_pass_no_new_empty_ids": True,
+            "corrected_no_new_empty_ids": True,
+            "behavior_healthy": True,
+            "wrong_nonempty_delta": 1,
+            "wrong_nonempty_no_regression": False,
+            "trustworthy_beats_v2p10": True,
+            "resolved_delta": 1,
+        },
+    }
+
+    with pytest.raises(ValueError, match="trustworthy win"):
+        _validate_trustworthy_verdict(
+            verdict,
+            candidate_name="teacher_sft_v2p11r3_behavior",
+        )
+
+
+def test_rejects_consistently_omitted_wrong_nonempty_id() -> None:
+    full_ids = [f"case-{index:03d}" for index in range(300)]
+    control_resolved = set(full_ids[:157])
+    candidate_resolved = set(full_ids[:158])
+    control_empty = {full_ids[157], full_ids[158]}
+    candidate_empty: set[str] = set()
+    claimed_control_wrong = set(full_ids[159:])
+    claimed_candidate_wrong = set(full_ids[159:])
+    by_instance = {
+        full_ids[157]: {"v2p10": ["empty_patch"]},
+        full_ids[158]: {"v2p10": ["empty_patch"]},
+        **{
+            instance_id: {
+                "v2p10": ["nonempty_unresolved"],
+                "v2p11": ["nonempty_unresolved"],
+            }
+            for instance_id in full_ids[159:]
+        },
+    }
+    verdict = {
+        "schema_version": 1,
+        "artifact_type": "v2p11_v2p10_full300_verdict",
+        "status": "complete",
+        "population": 300,
+        "v2p10": {
+            "name": "teacher_sft_v2p10",
+            "resolved": len(control_resolved),
+            "empty": len(control_empty),
+        },
+        "v2p11": {
+            "name": "teacher_sft_v2p11r3_behavior",
+            "resolved": len(candidate_resolved),
+            "empty": len(candidate_empty),
+        },
+        "paired": {
+            "v2p11_only": [full_ids[157]],
+            "v2p10_only": [],
+            "both_resolved": sorted(control_resolved),
+            "neither_resolved": full_ids[158:],
+        },
+        "empty_patch": {
+            "v2p10": sorted(control_empty),
+            "v2p11": [],
+            "introduced": [],
+            "eliminated": sorted(control_empty),
+        },
+        "first_pass": {"empty_patch": {"introduced": []}},
+        "wrong_nonempty": {
+            "v2p10": sorted(claimed_control_wrong),
+            "v2p11": sorted(claimed_candidate_wrong),
+            "introduced": [],
+            "eliminated": [],
+            "delta": 0,
+            "no_regression": True,
+        },
+        "failure_analysis": {
+            "v2p10_nonempty_unresolved": sorted(claimed_control_wrong),
+            "v2p11_nonempty_unresolved": sorted(claimed_candidate_wrong),
+            "v2p10_model_failure_ids": [],
+            "v2p11_model_failure_ids": [],
+            "v2p10_repeat_loop_ids": [],
+            "v2p11_repeat_loop_ids": [],
+            "v2p10_tool_format_error_ids": [],
+            "v2p11_tool_format_error_ids": [],
+            "by_instance": by_instance,
+        },
+        "verdict": {
+            "beats_v2p10": True,
+            "first_pass_beats_v2p10": True,
+            "first_pass_empty_delta": -2,
+            "corrected_empty_delta": -2,
+            "first_pass_no_new_empty_ids": True,
+            "corrected_no_new_empty_ids": True,
+            "behavior_healthy": True,
+            "wrong_nonempty_delta": 0,
+            "wrong_nonempty_no_regression": True,
+            "trustworthy_beats_v2p10": True,
+            "resolved_delta": 1,
+        },
+    }
+
+    with pytest.raises(ValueError, match="wrong non-empty"):
+        _validate_trustworthy_verdict(
+            verdict,
+            candidate_name="teacher_sft_v2p11r3_behavior",
+            full_ids=full_ids,
+        )
+
+
 def test_rejects_failure_analysis_missing_unresolved_instances() -> None:
     verdict = {
         "schema_version": 1,
@@ -133,6 +281,14 @@ def test_rejects_failure_analysis_missing_unresolved_instances() -> None:
         },
         "empty_patch": {"introduced": []},
         "first_pass": {"empty_patch": {"introduced": []}},
+        "wrong_nonempty": {
+            "v2p10": ["case-b", "case-c"],
+            "v2p11": ["case-c"],
+            "introduced": [],
+            "eliminated": ["case-b"],
+            "delta": -1,
+            "no_regression": True,
+        },
         "failure_analysis": {
             "v2p10_nonempty_unresolved": [],
             "v2p11_nonempty_unresolved": [],
@@ -152,6 +308,8 @@ def test_rejects_failure_analysis_missing_unresolved_instances() -> None:
             "first_pass_no_new_empty_ids": True,
             "corrected_no_new_empty_ids": True,
             "behavior_healthy": True,
+            "wrong_nonempty_delta": -1,
+            "wrong_nonempty_no_regression": True,
             "trustworthy_beats_v2p10": True,
             "resolved_delta": 1,
         },
@@ -197,6 +355,14 @@ def test_publishes_only_the_revalidated_trustworthy_verdict(
         "v2p11": {"name": "teacher_sft_v2p11r2", "resolved": 160, "empty": 1},
         "empty_patch": {"introduced": []},
         "first_pass": {"empty_patch": {"introduced": []}},
+        "wrong_nonempty": {
+            "v2p10": ["case-a", "case-b"],
+            "v2p11": ["case-a"],
+            "introduced": [],
+            "eliminated": ["case-b"],
+            "delta": -1,
+            "no_regression": True,
+        },
         "failure_analysis": {"by_instance": {}},
         "verdict": {
             "beats_v2p10": True,
@@ -206,6 +372,8 @@ def test_publishes_only_the_revalidated_trustworthy_verdict(
             "first_pass_no_new_empty_ids": True,
             "corrected_no_new_empty_ids": True,
             "behavior_healthy": True,
+            "wrong_nonempty_delta": -1,
+            "wrong_nonempty_no_regression": True,
             "trustworthy_beats_v2p10": True,
             "resolved_delta": 3,
         },

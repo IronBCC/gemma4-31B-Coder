@@ -50,7 +50,7 @@ Run: `PYTHONPATH=$PWD .venv/bin/python -m pytest -q phaseH_eval/tests/test_v2p11
 
 Expected: FAIL because `_validate_v2p10_init_lineage` is absent.
 
-- [ ] **Step 3: Implement canonical lineage validation**
+- [x] **Step 3: Implement canonical lineage validation**
 
 Import the canonical validator, rebuild the lineage against `runs/v2p10_full300_composite.json`, and require exact binding equality:
 
@@ -65,11 +65,11 @@ if lineage["artifacts"]["adapter"] != training["init_adapter"]:
 
 Store `_binding(lineage_path)` and the validated v2.10 training summary in the r3 report. Thread `v2p10_lineage_path` through publish, rebuild validation, the behavior wrapper, and both CLIs.
 
-- [ ] **Step 4: Make the posttrain chain create or revalidate the lineage before poststage**
+- [x] **Step 4: Make the posttrain chain create or revalidate the lineage before poststage**
 
 Use the existing v2.10 marker, run manifest, dataset manifest/train JSONL, adapter, merge audit/model, full300 composite, and Stage-A manifest arguments already used by `run_v2p11_completion_chain.sh`. Pass `--v2p10-lineage "$V2P10_LINEAGE"` to behavior provenance publication.
 
-- [ ] **Step 5: Verify GREEN and commit**
+- [x] **Step 5: Verify GREEN and commit**
 
 Run the three focused provenance/chain test files, `bash -n phaseH_eval/run_v2p11r3_posttrain_chain.sh`, Python compilation, and `git diff --check`.
 
@@ -95,7 +95,7 @@ The tests require a candidate that resolves one additional task but turns two co
 
 Expected RED: the report lacks `wrong_nonempty`, the trustworthy validator accepts the regression, and the goal audit omits the requirement.
 
-- [ ] **Step 2: Derive immutable paired wrong non-empty evidence**
+- [x] **Step 2: Derive immutable paired wrong non-empty evidence**
 
 ```python
 control_wrong = full_set - v2p10_resolved - v2p10_empty
@@ -105,11 +105,11 @@ delta = len(candidate_wrong) - len(control_wrong)
 
 Publish the two sets plus introduced/eliminated IDs, `delta`, and `no_regression = delta <= 0`. Because model failures are unresolved and non-empty, they remain inside these sets while retaining their separate failure-analysis classification.
 
-- [ ] **Step 3: Enforce the gate at both promotion layers**
+- [x] **Step 3: Enforce the gate at both promotion layers**
 
 Require current, internally consistent wrong-nonempty sets and `wrong_nonempty_no_regression is True` in `_validate_trustworthy_verdict`. Include the same condition in `trustworthy_beats_v2p10`; surface it in Markdown and the r3 goal-audit requirements/score summary.
 
-- [ ] **Step 4: Verify GREEN and commit**
+- [x] **Step 4: Verify GREEN and commit**
 
 Run the three focused comparison/audit test files, then the complete v2.11 contract suite, Python compilation, `bash -n` for the r3 chain/evaluator, and `git diff --check`.
 

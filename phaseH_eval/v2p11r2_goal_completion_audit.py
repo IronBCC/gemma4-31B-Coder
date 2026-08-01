@@ -41,11 +41,12 @@ def _validate_trustworthy_verdict(
     *,
     candidate_name: str,
     full_ids: Sequence[str] | None = None,
-) -> None:
+) -> dict[str, dict[str, set[str]]] | None:
     control = verdict.get("v2p10")
     candidate = verdict.get("v2p11")
     decision = verdict.get("verdict")
     corrected_empty = verdict.get("empty_patch")
+    wrong_nonempty = verdict.get("wrong_nonempty")
     first_pass = verdict.get("first_pass")
     first_pass_empty = (
         first_pass.get("empty_patch")
@@ -65,6 +66,7 @@ def _validate_trustworthy_verdict(
         or candidate.get("name") != candidate_name
         or not isinstance(decision, Mapping)
         or not isinstance(corrected_empty, Mapping)
+        or not isinstance(wrong_nonempty, Mapping)
         or not isinstance(first_pass_empty, Mapping)
         or not isinstance(failure_analysis, Mapping)
         or not isinstance(failure_analysis.get("by_instance"), Mapping)
@@ -83,13 +85,36 @@ def _validate_trustworthy_verdict(
         or corrected_empty.get("introduced") != []
         or first_pass_empty.get("introduced") != []
         or decision.get("behavior_healthy") is not True
+        or wrong_nonempty.get("no_regression") is not True
+        or decision.get("wrong_nonempty_no_regression") is not True
         or decision.get("trustworthy_beats_v2p10") is not True
         or decision.get("resolved_delta")
         != candidate["resolved"] - control["resolved"]
     ):
         raise ValueError("final verdict is not a trustworthy win")
+    wrong_sets: dict[str, set[str]] = {}
+    for key in ("v2p10", "v2p11", "introduced", "eliminated"):
+        values = wrong_nonempty.get(key)
+        if (
+            not isinstance(values, list)
+            or len(values) != len(set(values))
+            or any(not isinstance(value, str) for value in values)
+        ):
+            raise ValueError("final verdict is not a trustworthy win")
+        wrong_sets[key] = set(values)
+    wrong_delta = len(wrong_sets["v2p11"]) - len(wrong_sets["v2p10"])
+    if (
+        wrong_sets["introduced"]
+        != wrong_sets["v2p11"] - wrong_sets["v2p10"]
+        or wrong_sets["eliminated"]
+        != wrong_sets["v2p10"] - wrong_sets["v2p11"]
+        or wrong_nonempty.get("delta") != wrong_delta
+        or decision.get("wrong_nonempty_delta") != wrong_delta
+        or wrong_delta > 0
+    ):
+        raise ValueError("final verdict is not a trustworthy win")
     if full_ids is None:
-        return
+        return None
     full_set = set(full_ids)
     paired = verdict.get("paired")
     required_failure_keys = {
@@ -140,6 +165,61 @@ def _validate_trustworthy_verdict(
         )
     ):
         raise ValueError("failure analysis is incomplete")
+    empty_sets: dict[str, set[str]] = {}
+    for key in ("v2p10", "v2p11", "introduced", "eliminated"):
+        values = corrected_empty.get(key)
+        if (
+            not isinstance(values, list)
+            or len(values) != len(set(values))
+            or any(
+                not isinstance(value, str) or value not in full_set
+                for value in values
+            )
+        ):
+            raise ValueError("failure analysis empty evidence is invalid")
+        empty_sets[key] = set(values)
+    if (
+        empty_sets["introduced"]
+        != empty_sets["v2p11"] - empty_sets["v2p10"]
+        or empty_sets["eliminated"]
+        != empty_sets["v2p10"] - empty_sets["v2p11"]
+        or len(empty_sets["v2p10"]) != control["empty"]
+        or len(empty_sets["v2p11"]) != candidate["empty"]
+    ):
+        raise ValueError("failure analysis empty evidence differs")
+    resolved_sets = {
+        "v2p10": paired_sets["v2p10_only"]
+        | paired_sets["both_resolved"],
+        "v2p11": paired_sets["v2p11_only"]
+        | paired_sets["both_resolved"],
+    }
+    if any(
+        resolved_sets[label] & empty_sets[label]
+        for label in ("v2p10", "v2p11")
+    ):
+        raise ValueError("failure analysis has resolved-empty overlap")
+    derived_wrong = {
+        label: full_set - resolved_sets[label] - empty_sets[label]
+        for label in ("v2p10", "v2p11")
+    }
+    if any(
+        wrong_sets[label] != derived_wrong[label]
+        for label in ("v2p10", "v2p11")
+    ):
+        raise ValueError("failure analysis wrong non-empty evidence differs")
+    expected_wrong = {
+        "v2p10": set(failure_analysis["v2p10_nonempty_unresolved"])
+        | set(failure_analysis["v2p10_model_failure_ids"]),
+        "v2p11": set(failure_analysis["v2p11_nonempty_unresolved"])
+        | set(failure_analysis["v2p11_model_failure_ids"]),
+    }
+    if (
+        not wrong_sets["v2p10"].issubset(full_set)
+        or not wrong_sets["v2p11"].issubset(full_set)
+        or wrong_sets["v2p10"] != expected_wrong["v2p10"]
+        or wrong_sets["v2p11"] != expected_wrong["v2p11"]
+    ):
+        raise ValueError("failure analysis wrong non-empty evidence differs")
     by_instance = failure_analysis["by_instance"]
     assert isinstance(by_instance, Mapping)
     expected_ids = full_set - paired_sets["both_resolved"]
@@ -159,6 +239,14 @@ def _validate_trustworthy_verdict(
             )
         ):
             raise ValueError("failure analysis instance evidence is invalid")
+    return {
+        label: {
+            "resolved": resolved_sets[label],
+            "empty": empty_sets[label],
+            "wrong_nonempty": derived_wrong[label],
+        }
+        for label in ("v2p10", "v2p11")
+    }
 
 
 def _build_report(

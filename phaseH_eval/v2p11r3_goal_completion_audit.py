@@ -103,9 +103,11 @@ def publish_goal_audit(
     if len(full_ids) != 300 or len(set(full_ids)) != 300:
         raise ValueError("final audit requires the exact Lite300 population")
     verdict = _read_object(verdict_path)
-    _validate_trustworthy_verdict(
+    verdict_outcomes = _validate_trustworthy_verdict(
         verdict, candidate_name=candidate_name, full_ids=full_ids,
     )
+    if verdict_outcomes is None:
+        raise ValueError("final verdict outcome evidence is incomplete")
     v2p10_score = validate_official_score_binding(
         v2p10_score_path, full_ids_path=full_ids_path,
         composite_path=v2p10_composite_path,
@@ -116,6 +118,40 @@ def publish_goal_audit(
         composite_path=v2p11_composite_path,
         predictions_path=v2p11_predictions_path,
     )
+    for label, score_report, summary in (
+        ("v2p10", v2p10_score, verdict.get("v2p10")),
+        ("v2p11", v2p11_score, verdict.get("v2p11")),
+    ):
+        final = score_report.get("final")
+        resolved_ids = (
+            final.get("resolved_ids")
+            if isinstance(final, Mapping)
+            else None
+        )
+        empty_ids = (
+            final.get("empty_ids")
+            if isinstance(final, Mapping)
+            else None
+        )
+        if (
+            not isinstance(summary, Mapping)
+            or not isinstance(resolved_ids, list)
+            or not isinstance(empty_ids, list)
+            or len(resolved_ids) != len(set(resolved_ids))
+            or len(empty_ids) != len(set(empty_ids))
+            or any(
+                not isinstance(instance_id, str)
+                for instance_id in resolved_ids + empty_ids
+            )
+            or set(resolved_ids) & set(empty_ids)
+            or set(resolved_ids) != verdict_outcomes[label]["resolved"]
+            or set(empty_ids) != verdict_outcomes[label]["empty"]
+            or final.get("resolved") != summary.get("resolved")
+            or final.get("empty") != summary.get("empty")
+        ):
+            raise ValueError(
+                f"{label} official score outcomes differ from verdict"
+            )
     model_contract = _model_contract(candidate_model_path)
     model_contract["served_name"] = candidate_name
     provenance = validate_completion_provenance(
@@ -128,7 +164,9 @@ def publish_goal_audit(
     _validate_behavior_poststage(provenance)
     control = verdict["v2p10"]
     candidate = verdict["v2p11"]
+    wrong_nonempty = verdict["wrong_nonempty"]
     assert isinstance(control, Mapping) and isinstance(candidate, Mapping)
+    assert isinstance(wrong_nonempty, Mapping)
     report = {
         "schema_version": 1,
         "artifact_type": "v2p11r3_goal_completion_audit",
@@ -139,6 +177,7 @@ def publish_goal_audit(
             "v2p11_beats_v2p10": True,
             "empty_patch_no_regression": True,
             "behavior_healthy": True,
+            "wrong_nonempty_no_regression": True,
             "stage_a_strict_fable_rows": 36,
             "recent_strict_fable_rows": 15,
             "reasoned_fable_tool_turns": 468,
@@ -157,9 +196,18 @@ def publish_goal_audit(
             "failure_analysis_bound": True,
         },
         "score": {
-            "v2p10": {"resolved": control["resolved"], "empty": control["empty"]},
-            "v2p11r3": {"resolved": candidate["resolved"], "empty": candidate["empty"]},
+            "v2p10": {
+                "resolved": control["resolved"],
+                "empty": control["empty"],
+                "wrong_nonempty": len(wrong_nonempty["v2p10"]),
+            },
+            "v2p11r3": {
+                "resolved": candidate["resolved"],
+                "empty": candidate["empty"],
+                "wrong_nonempty": len(wrong_nonempty["v2p11"]),
+            },
             "resolved_delta": candidate["resolved"] - control["resolved"],
+            "wrong_nonempty_delta": wrong_nonempty["delta"],
         },
         "artifacts": {
             "full_ids": _binding(full_ids_path),

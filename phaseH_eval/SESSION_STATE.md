@@ -3289,3 +3289,15 @@ Full analysis + run-by-run history: `phaseD_sft/V6_49K_RETROSPECTIVE.md`. Compre
   chain does not make that incompatible call. Re-running through `validate_official_score_binding`
   and `validate_v2p10_training_lineage_contract` passed without edits. No canonical artifact was
   changed. The next live check remains the portability completion/error boundary.
+
+### v2.11r4 downstream regression preflight (2026-08-01 12:46 PDT)
+
+- A fresh focused regression pass covering the successor gate, automatic r4 chain, empty-retry
+  panel construction, joined full300 composite, official score binding, v2.10 lineage, full300
+  comparison/evaluator, and r3/Fable provenance passed `59/59` locally and `59/59` in the remote
+  `.venv-eval` environment. Bash syntax is clean for
+  `run_v2p11r4_blend25_chain.sh`, `run_v2p11_portability_gate.sh`,
+  `run_v2p10_empty_diff_goal.sh`, and `eval_v2p11_full300_after_merge.sh`.
+- SHA-256 parity was checked for the four production shell runners, the six Python gate/composite/
+  lineage/provenance modules, and all nine focused test files; all 19 local and remote hashes match
+  exactly. No live portability status was polled and no runtime or canonical artifact was changed.

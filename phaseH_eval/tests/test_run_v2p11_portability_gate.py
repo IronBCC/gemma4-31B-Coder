@@ -24,6 +24,23 @@ def test_portability_launcher_is_valid_bash() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_interpolation_validator_is_defined_after_sourcing() -> None:
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$SCRIPT_UNDER_TEST"; '
+            "declare -F validate_interpolation_candidate",
+        ],
+        cwd=ROOT,
+        env={**os.environ, "SCRIPT_UNDER_TEST": str(SCRIPT)},
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_portability_launcher_uses_stock_controller_free_harness() -> None:
     script = SCRIPT.read_text()
 

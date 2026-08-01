@@ -210,6 +210,9 @@ assert json.loads(audit_path.read_text()) == {
     "complete": True,
 }
 
+PY
+}
+
 validate_interpolation_candidate() {
   "$EVAL_PY" phaseH_eval/v2p11_interpolation_lineage.py \
     --manifest "$INTERPOLATION_MANIFEST" \
@@ -217,8 +220,6 @@ validate_interpolation_candidate() {
     --source-model "$INTERPOLATION_SOURCE_MODEL" \
     --output-model "$CANDIDATE_MODEL" \
     --candidate-name "$CANDIDATE_NAME"
-}
-PY
 }
 
 start_owned_serve() {

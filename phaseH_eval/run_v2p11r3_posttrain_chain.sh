@@ -31,6 +31,8 @@ FINAL_MERGE_MARKER="${FINAL_MERGE_MARKER:-runs/v2p11r3_behavior_final_merge_comp
 PORTABILITY_IDS="${PORTABILITY_IDS:-data/v2p11_portability_verified10_ids.json}"
 VERIFIED_EXCLUSIONS="${VERIFIED_EXCLUSIONS:-data/swe_verified_eval_exclusions_v1.json}"
 FULL_IDS="${FULL_IDS:-data/swebench_lite_test_ids.json}"
+V2P10_COMPOSITE="runs/v2p10_full300_composite.json"
+V2P10_LINEAGE="runs/v2p11_v2p10_training_lineage.json"
 PORTABILITY_ROOT="runs/${ARTIFACT_TAG}_portability_stock"
 CONTROL_ROOT="runs/v2p11_portability_stock/v2p10"
 CANDIDATE_ROOT="$PORTABILITY_ROOT/candidate"
@@ -56,6 +58,54 @@ log() {
 halt() {
   log "HALT: $*"
   exit 1
+}
+
+ensure_v2p10_lineage() {
+  "$EVAL_PY" phaseH_eval/capture_json_contract.py \
+    --out "$V2P10_LINEAGE" -- \
+    "$EVAL_PY" phaseH_eval/v2p10_training_lineage.py \
+      --marker runs/v2p10_train_merge_complete.json \
+      --run-manifest adapters/teacher_sft_v2p10_bf16/run_manifest.json \
+      --dataset-manifest data/teacher_train_mix_v2p10/manifest.json \
+      --train-jsonl data/teacher_train_mix_v2p10/train.jsonl \
+      --adapter adapters/teacher_sft_v2p10_bf16/adapter_model.safetensors \
+      --merge-audit \
+        /media/ironbcc/CrucialX10/models/merged/teacher_sft_v2p10_full/v2p10_merge_audit.json \
+      --model \
+        /media/ironbcc/CrucialX10/models/merged/teacher_sft_v2p10_full \
+      --composite "$V2P10_COMPOSITE" \
+      --stage-data-manifest \
+        data/teacher_train_mix_v2p11_frozen1247/manifest.json
+  "$EVAL_PY" - "$V2P10_LINEAGE" "$V2P10_COMPOSITE" \
+    "$INIT_ADAPTER" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from phaseH_eval.empty_retry_composite import _binding
+from phaseH_eval.v2p11r3_completion_provenance import (
+    _validate_v2p10_init_lineage,
+)
+
+lineage, composite, initial = map(Path, sys.argv[1:])
+report = _validate_v2p10_init_lineage(
+    lineage_path=lineage,
+    v2p10_composite_path=composite,
+    training={
+        "init_adapter": _binding(
+            initial / "adapter_model.safetensors"
+        ),
+        "init_adapter_config": _binding(
+            initial / "adapter_config.json"
+        ),
+        "init_adapter_path": str(initial.resolve()),
+    },
+)
+print(json.dumps({
+    "adapter_sha256": report["adapter"]["sha256"],
+    "lineage_sha256": report["contract"]["sha256"],
+}, sort_keys=True))
+PY
 }
 
 wait_for_memory() {
@@ -349,22 +399,25 @@ publish_provenance() {
       --final-model "$MERGED" --merge-audit "$MERGE_AUDIT" \
       --portability-gate "$PORTABILITY_GATE" \
       --full-ids "$FULL_IDS" \
-      --v2p10 runs/v2p10_full300_composite.json --out "$PROVENANCE"
+      --v2p10 "$V2P10_COMPOSITE" \
+      --v2p10-lineage "$V2P10_LINEAGE" --out "$PROVENANCE"
   else
     "$EVAL_PY" - \
-      "$PROVENANCE" "$MERGED" "$CANDIDATE_NAME" "$FULL_IDS" <<'PY'
+      "$PROVENANCE" "$MERGED" "$CANDIDATE_NAME" "$FULL_IDS" \
+      "$V2P10_LINEAGE" <<'PY'
 import sys
 from pathlib import Path
 from phaseH_eval.v2p11_completion_provenance import _model_contract
 from phaseH_eval.v2p11r3_behavior_completion_provenance import validate_completion_provenance
 
-provenance, model, name, full_ids = sys.argv[1:]
+provenance, model, name, full_ids, v2p10_lineage = sys.argv[1:]
 contract = _model_contract(Path(model).resolve())
 contract["served_name"] = name
 validate_completion_provenance(
     Path(provenance),
     full_ids_path=Path(full_ids),
     v2p10_composite_path=Path("runs/v2p10_full300_composite.json"),
+    v2p10_lineage_path=Path(v2p10_lineage),
     candidate_model_contract=contract,
     candidate_name=name,
 )
@@ -388,7 +441,8 @@ run_full300() {
 audit_goal() {
   "$EVAL_PY" phaseH_eval/v2p11r3_goal_completion_audit.py \
     --verdict "$VERDICT" --full-ids "$FULL_IDS" \
-    --v2p10 runs/v2p10_full300_composite.json \
+    --v2p10 "$V2P10_COMPOSITE" \
+    --v2p10-lineage "$V2P10_LINEAGE" \
     --v2p10-preds runs/v2p10_full300_preds.json \
     --v2p10-score runs/v2p10_full300_official_score_binding.json \
     --v2p11 "$COMPOSITE" --v2p11-preds "$PREDICTIONS" \
@@ -406,6 +460,7 @@ main() {
   [[ -x "$TRAIN_PY" && -x "$EVAL_PY" ]] || halt "required Python environment is missing"
   [[ -d "$DATA" && -d "$INIT_ADAPTER" && -d "$ADAPTER" ]] || halt "training artifacts are missing"
   [[ -f "$CONTEXT_AUDIT" ]] || halt "r3 context audit is missing"
+  ensure_v2p10_lineage
   ensure_training_evidence
   wait_for_memory
   run_behavior_poststage

@@ -5,6 +5,7 @@ import re
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "phaseH_eval" / "run_v2p11r3_posttrain_chain.sh"
 TRAIN_SCRIPT = ROOT / "phaseH_eval" / "train_v2p11r3_reasoned_gpu1.sh"
+EVAL_SCRIPT = ROOT / "phaseH_eval" / "eval_v2p11_full300_after_merge.sh"
 
 
 def _shell_default(script: str, variable: str) -> str:
@@ -19,6 +20,7 @@ def _shell_default(script: str, variable: str) -> str:
 
 def test_r3_posttrain_chain_keeps_the_corrected_candidate_isolated() -> None:
     script = SCRIPT.read_text()
+    eval_script = EVAL_SCRIPT.read_text()
 
     assert "v2p11r3-reasoned-train-gpu1.service" in script
     assert "teacher_train_mix_v2p11_fable1262_reasoned_v1" in script
@@ -27,6 +29,12 @@ def test_r3_posttrain_chain_keeps_the_corrected_candidate_isolated() -> None:
     assert "train_v2p11r3_behavior_gpu1.sh" in script
     assert "teacher_sft_v2p11r3_behavior_full" in script
     assert "v2p11r3_behavior_completion_provenance.py" in script
+    assert "v2p10_training_lineage.py" in script
+    assert "_validate_v2p10_init_lineage" in script
+    assert "--v2p10-lineage" in script
+    assert script.count('--v2p10-lineage "$V2P10_LINEAGE"') == 2
+    assert 'V2P10_LINEAGE="runs/v2p11_v2p10_training_lineage.json"' in eval_script
+    assert '--v2p10-lineage "$V2P10_LINEAGE"' in eval_script
     assert "v2p11r3_goal_completion_audit.py" in script
     assert "LINEAGE_MODE=posttrain" in script
     assert "v2p11r3_behavior_posttrain_complete.json" in script

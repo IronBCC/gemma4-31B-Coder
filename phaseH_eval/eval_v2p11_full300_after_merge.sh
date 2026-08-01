@@ -22,6 +22,7 @@ COMPLEMENT_IDS="data/swebench_lite_complement150_ids.json"
 V2P10_FIXED_SOURCE="runs/fixed150_v2p10"
 V2P10_COMPLEMENT_SOURCE="runs/fixed150_v2p10_complement150_v1"
 V2P10_COMPOSITE="runs/v2p10_full300_composite.json"
+V2P10_LINEAGE="runs/v2p11_v2p10_training_lineage.json"
 V2P10_PREDICTIONS="runs/v2p10_full300_preds.json"
 V2P10_SCORE_BINDING="runs/v2p10_full300_official_score_binding.json"
 
@@ -317,7 +318,7 @@ fi
 [[ -f "$PROVENANCE" ]] ||
   halt "v2.11 completion provenance is missing: $PROVENANCE"
 [[ -f "$V2P10_COMPOSITE" && -f "$V2P10_PREDICTIONS" &&
-  -f "$V2P10_SCORE_BINDING" ]] ||
+  -f "$V2P10_SCORE_BINDING" && -f "$V2P10_LINEAGE" ]] ||
   halt "v2.10 corrected full300 artifacts are missing"
 [[ "$(sha256sum "$FULL_IDS" | awk '{print $1}')" == "$FULL_IDS_SHA256" ]] ||
   halt "full300 ID SHA mismatch"
@@ -325,7 +326,7 @@ fi
 "$EVAL_PY" - \
   "$NAME" "$MODEL" "$LINEAGE_MODE" "$POSTTRAIN_MARKER" \
   "$FINAL_AUDIT" "$PORTABILITY_MARKER" "$PROVENANCE" \
-  "$FULL_IDS" "$V2P10_COMPOSITE" <<'PY'
+  "$FULL_IDS" "$V2P10_COMPOSITE" "$V2P10_LINEAGE" <<'PY'
 import hashlib
 import json
 import sys
@@ -346,6 +347,7 @@ from phaseH_eval.v2p11_completion_provenance import _model_contract
     provenance_value,
     full_ids_value,
     v2p10_value,
+    v2p10_lineage_value,
 ) = sys.argv[1:]
 model_path = Path(model_value).resolve()
 marker_path = Path(marker_value)
@@ -386,6 +388,7 @@ validate_completion_provenance(
     provenance_path,
     full_ids_path=full_ids_path,
     v2p10_composite_path=v2p10_path,
+    v2p10_lineage_path=Path(v2p10_lineage_value),
     candidate_model_contract=model_contract,
     candidate_name=name,
 )
@@ -446,6 +449,7 @@ fi
 comparison_args=(
   --full-ids "$FULL_IDS"
   --v2p10 "$V2P10_COMPOSITE"
+  --v2p10-lineage "$V2P10_LINEAGE"
   --v2p10-preds "$V2P10_PREDICTIONS"
   --v2p10-score-binding "$V2P10_SCORE_BINDING"
   --v2p11 "$COMPOSITE"

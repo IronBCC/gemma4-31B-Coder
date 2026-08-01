@@ -148,6 +148,7 @@ def _build_report(
     portability_gate_path: Path,
     full_ids_path: Path,
     v2p10_composite_path: Path,
+    v2p10_lineage_path: Path,
 ) -> dict[str, Any]:
     base = _build_r3_report(
         candidate_name=candidate_name,
@@ -161,6 +162,7 @@ def _build_report(
         portability_gate_path=portability_gate_path,
         full_ids_path=full_ids_path,
         v2p10_composite_path=v2p10_composite_path,
+        v2p10_lineage_path=v2p10_lineage_path,
     )
     recovery_data_path = Path(recovery_data_path).resolve()
     behavior_data_path = Path(behavior_data_path).resolve()
@@ -222,6 +224,7 @@ def validate_completion_provenance(
     *,
     full_ids_path: Path,
     v2p10_composite_path: Path,
+    v2p10_lineage_path: Path,
     candidate_model_contract: Mapping[str, Any],
     candidate_name: str,
 ) -> dict[str, Any]:
@@ -231,6 +234,7 @@ def validate_completion_provenance(
     training = report.get("training")
     final_model = report.get("final_model")
     portability = report.get("portability")
+    v2p10_lineage = report.get("v2p10_training_lineage")
     poststage = report.get("behavior_poststage")
     if (
         report.get("schema_version") != 1
@@ -243,6 +247,8 @@ def validate_completion_provenance(
         or not isinstance(final_model, Mapping)
         or not isinstance(portability, Mapping)
         or not isinstance(portability.get("gate"), Mapping)
+        or not isinstance(v2p10_lineage, Mapping)
+        or not isinstance(v2p10_lineage.get("contract"), Mapping)
         or not isinstance(poststage, Mapping)
         or not isinstance(poststage.get("phase_markers"), Mapping)
         or not isinstance(poststage.get("contract_inputs"), Mapping)
@@ -298,6 +304,7 @@ def validate_completion_provenance(
         ),
         full_ids_path=Path(full_ids_path),
         v2p10_composite_path=Path(v2p10_composite_path),
+        v2p10_lineage_path=Path(v2p10_lineage_path).resolve(),
     )
     if report != expected:
         raise ValueError("v2.11r3 behavior completion provenance changed")
@@ -357,6 +364,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--portability-gate", type=Path, required=True)
     parser.add_argument("--full-ids", type=Path, required=True)
     parser.add_argument("--v2p10", type=Path, required=True)
+    parser.add_argument("--v2p10-lineage", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
     report = publish_completion_provenance(
@@ -379,6 +387,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         portability_gate_path=args.portability_gate,
         full_ids_path=args.full_ids,
         v2p10_composite_path=args.v2p10,
+        v2p10_lineage_path=args.v2p10_lineage,
         output_path=args.out,
     )
     print(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import hashlib
 import json
+import copy
 from pathlib import Path
 
 import pytest
@@ -206,6 +207,8 @@ def test_behavior_provenance_rebuilds_from_bound_inputs(
         "model_path": str(final_model.resolve()),
         "served_name": "teacher_sft_v2p11r3_behavior",
     }
+    v2p10_lineage = tmp_path / "v2p10-lineage.json"
+    v2p10_lineage.write_text("{}\n")
     base_report = {
         "schema_version": 1,
         "artifact_type": "v2p11r3_completion_provenance",
@@ -217,6 +220,9 @@ def test_behavior_provenance_rebuilds_from_bound_inputs(
         },
         "full_ids": {"path": str((tmp_path / "ids.json").resolve())},
         "v2p10_full300": {"path": str((tmp_path / "v2p10.json").resolve())},
+        "v2p10_training_lineage": {
+            "contract": binding(v2p10_lineage),
+        },
         "dataset": {
             "path": str((tmp_path / "dataset").resolve()),
             "context_audit": {"path": str((tmp_path / "context.json").resolve())},
@@ -234,7 +240,13 @@ def test_behavior_provenance_rebuilds_from_bound_inputs(
             "gate": {"path": str((tmp_path / "portability.json").resolve())}
         },
     }
-    monkeypatch.setattr(module, "_build_r3_report", lambda **_: base_report)
+    captured: dict[str, object] = {}
+
+    def build_r3_report(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return base_report
+
+    monkeypatch.setattr(module, "_build_r3_report", build_r3_report)
     for path in (
         tmp_path / "ids.json",
         tmp_path / "v2p10.json",
@@ -282,6 +294,7 @@ def test_behavior_provenance_rebuilds_from_bound_inputs(
         portability_gate_path=tmp_path / "portability.json",
         full_ids_path=tmp_path / "ids.json",
         v2p10_composite_path=tmp_path / "v2p10.json",
+        v2p10_lineage_path=v2p10_lineage,
     )
 
     assert report["artifact_type"] == "v2p11r3_behavior_completion_provenance"
@@ -292,6 +305,7 @@ def test_behavior_provenance_rebuilds_from_bound_inputs(
     }
     assert report["behavior_poststage"]["coverage_counts"] == EXPECTED_COVERAGE
     assert report["final_model"] == model_contract
+    assert captured["v2p10_lineage_path"] == v2p10_lineage
 
     provenance = tmp_path / "behavior-provenance.json"
     provenance.write_text(json.dumps(report, sort_keys=True) + "\n")
@@ -299,6 +313,7 @@ def test_behavior_provenance_rebuilds_from_bound_inputs(
         provenance,
         full_ids_path=tmp_path / "ids.json",
         v2p10_composite_path=tmp_path / "v2p10.json",
+        v2p10_lineage_path=v2p10_lineage,
         candidate_model_contract=model_contract,
         candidate_name="teacher_sft_v2p11r3_behavior",
     )
@@ -306,3 +321,58 @@ def test_behavior_provenance_rebuilds_from_bound_inputs(
     assert validated["artifact"]["path"] == str(provenance.resolve())
     assert validated["behavior_poststage"]["coverage_counts"] == EXPECTED_COVERAGE
     assert validated["evaluation_exclusion"]["overlap"] == 0
+
+
+def test_behavior_provenance_validation_uses_external_lineage_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module(
+        "phaseH_eval.v2p11r3_behavior_completion_provenance"
+    )
+    canonical_lineage = tmp_path / "canonical-lineage.json"
+    attacker_lineage = tmp_path / "attacker-lineage.json"
+    canonical_lineage.write_text("{}\n", encoding="utf-8")
+    attacker_lineage.write_text("{}\n", encoding="utf-8")
+    model_contract = {
+        "model_path": str((tmp_path / "model").resolve()),
+        "served_name": "teacher_sft_v2p11r3_behavior",
+    }
+    report = {
+        "schema_version": 1,
+        "artifact_type": "v2p11r3_behavior_completion_provenance",
+        "status": "complete",
+        "candidate_name": "teacher_sft_v2p11r3_behavior",
+        "lineage": module.LINEAGE,
+        "dataset": {},
+        "training": {},
+        "final_model": model_contract,
+        "portability": {"gate": {}},
+        "v2p10_training_lineage": {
+            "contract": binding(attacker_lineage),
+        },
+        "behavior_poststage": {
+            "phase_markers": {},
+            "contract_inputs": {},
+        },
+    }
+    monkeypatch.setattr(module, "_read_object", lambda _path: report)
+
+    def rebuild(**kwargs: object) -> dict[str, object]:
+        rebuilt = copy.deepcopy(report)
+        rebuilt["v2p10_training_lineage"] = {
+            "contract": binding(Path(kwargs["v2p10_lineage_path"])),
+        }
+        return rebuilt
+
+    monkeypatch.setattr(module, "_build_report", rebuild)
+
+    with pytest.raises(ValueError, match="provenance changed"):
+        module.validate_completion_provenance(
+            tmp_path / "provenance.json",
+            full_ids_path=tmp_path / "ids.json",
+            v2p10_composite_path=tmp_path / "v2p10.json",
+            v2p10_lineage_path=canonical_lineage,
+            candidate_model_contract=model_contract,
+            candidate_name="teacher_sft_v2p11r3_behavior",
+        )

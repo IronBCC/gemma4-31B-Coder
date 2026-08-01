@@ -25,6 +25,9 @@ from phaseH_eval.v2p11r2_completion_provenance import (
 from phaseH_eval.v2p11_stage_data_contract import (
     validate_stage_data as _validate_stage_data,
 )
+from phaseH_eval.v2p10_training_lineage import (
+    validate_v2p10_training_lineage_contract,
+)
 
 
 EXPECTED_ROWS = 1_262
@@ -250,10 +253,77 @@ def _validate_training(
         "adapter_config": _binding(adapter / "adapter_config.json"),
         "init_adapter": baseline,
         "init_adapter_config": _binding(init_adapter / "adapter_config.json"),
+        "init_adapter_path": str(init_adapter),
         "completion": _binding(completion_path),
         "training_journal": journal,
         "watchdog_log": watchdog,
         "changed_tensor_count": completion["changed_tensor_count"],
+    }
+
+
+def _validate_v2p10_init_lineage(
+    *,
+    lineage_path: Path,
+    v2p10_composite_path: Path,
+    training: Mapping[str, Any],
+) -> dict[str, Any]:
+    lineage_path = Path(lineage_path).resolve()
+    lineage = validate_v2p10_training_lineage_contract(
+        lineage_path,
+        composite_path=Path(v2p10_composite_path).resolve(),
+    )
+    artifacts = lineage.get("artifacts")
+    init_adapter = training.get("init_adapter")
+    init_adapter_config = training.get("init_adapter_config")
+    init_adapter_path = training.get("init_adapter_path")
+    canonical_adapter = (
+        artifacts.get("adapter")
+        if isinstance(artifacts, Mapping)
+        else None
+    )
+    if (
+        not isinstance(artifacts, Mapping)
+        or not isinstance(init_adapter, Mapping)
+        or not isinstance(canonical_adapter, Mapping)
+        or canonical_adapter != init_adapter
+    ):
+        raise ValueError(
+            "r3 training does not use the canonical v2.10 init adapter"
+        )
+    canonical_path = canonical_adapter.get("path")
+    canonical_directory = (
+        Path(canonical_path).resolve().parent
+        if isinstance(canonical_path, str) and canonical_path
+        else None
+    )
+    if (
+        not isinstance(init_adapter_config, Mapping)
+        or not isinstance(init_adapter_path, str)
+        or not init_adapter_path
+        or canonical_directory is None
+    ):
+        raise ValueError(
+            "r3 training does not use the canonical v2.10 init adapter"
+        )
+    try:
+        canonical_config = _binding(canonical_directory / "adapter_config.json")
+    except OSError as exc:
+        raise ValueError(
+            "canonical v2.10 init adapter config is unavailable"
+        ) from exc
+    if (
+        canonical_config != init_adapter_config
+        or Path(init_adapter_path).resolve() != canonical_directory
+    ):
+        raise ValueError(
+            "r3 training does not use the canonical v2.10 init adapter"
+        )
+    return {
+        "contract": _binding(lineage_path),
+        "adapter": dict(artifacts["adapter"]),
+        "adapter_config": dict(canonical_config),
+        "adapter_path": str(canonical_directory),
+        "training": dict(lineage["training"]),
     }
 
 
@@ -294,6 +364,7 @@ def _build_report(
     adapter_path: Path, init_adapter_path: Path, training_completion_path: Path,
     final_model_path: Path, merge_audit_path: Path, portability_gate_path: Path,
     full_ids_path: Path, v2p10_composite_path: Path,
+    v2p10_lineage_path: Path,
 ) -> dict[str, Any]:
     if not candidate_name or candidate_name == "teacher_sft_v2p10":
         raise ValueError("v2.11r3 candidate name is invalid")
@@ -313,6 +384,11 @@ def _build_report(
         dataset=dataset_path, adapter=adapter_path, init_adapter=init_adapter_path,
         completion_path=training_completion_path,
     )
+    v2p10_lineage = _validate_v2p10_init_lineage(
+        lineage_path=v2p10_lineage_path,
+        v2p10_composite_path=v2p10_composite_path,
+        training=training,
+    )
     final = _validate_final(
         candidate_name=candidate_name, final_model=final_model_path,
         merge_audit=merge_audit_path, portability_gate=portability_gate_path,
@@ -325,6 +401,7 @@ def _build_report(
         "lineage": {"kind": "direct_lora_from_v2p10", "reasoned_fable_contract": True},
         "full_ids": _binding(Path(full_ids_path).resolve()),
         "v2p10_full300": _binding(Path(v2p10_composite_path).resolve()),
+        "v2p10_training_lineage": v2p10_lineage,
         "dataset": dataset,
         "training": {"rows": EXPECTED_ROWS, "max_seq": 32768, "optimizer_steps": 79, **training},
         "final_model": final["model_contract"],
@@ -340,7 +417,8 @@ def publish_completion_provenance(
     *, candidate_name: str, dataset_path: Path, dataset_context_audit_path: Path,
     adapter_path: Path, init_adapter_path: Path, training_completion_path: Path,
     final_model_path: Path, merge_audit_path: Path, portability_gate_path: Path,
-    full_ids_path: Path, v2p10_composite_path: Path, output_path: Path,
+    full_ids_path: Path, v2p10_composite_path: Path,
+    v2p10_lineage_path: Path, output_path: Path,
 ) -> dict[str, Any]:
     report = _build_report(
         candidate_name=candidate_name, dataset_path=dataset_path,
@@ -349,6 +427,7 @@ def publish_completion_provenance(
         final_model_path=final_model_path, merge_audit_path=merge_audit_path,
         portability_gate_path=portability_gate_path, full_ids_path=full_ids_path,
         v2p10_composite_path=v2p10_composite_path,
+        v2p10_lineage_path=v2p10_lineage_path,
     )
     _publish_json_noreplace(Path(output_path).resolve(), report)
     return report
@@ -356,17 +435,21 @@ def publish_completion_provenance(
 
 def validate_completion_provenance(
     provenance_path: Path, *, full_ids_path: Path, v2p10_composite_path: Path,
+    v2p10_lineage_path: Path,
     candidate_model_contract: Mapping[str, Any], candidate_name: str,
 ) -> dict[str, Any]:
     report = _read_object(Path(provenance_path).resolve())
     dataset = report.get("dataset")
     training = report.get("training")
+    v2p10_lineage = report.get("v2p10_training_lineage")
     final_model = report.get("final_model")
     portability = report.get("portability")
     if (
         report.get("artifact_type") != "v2p11r3_completion_provenance"
         or report.get("candidate_name") != candidate_name
         or not isinstance(dataset, Mapping) or not isinstance(training, Mapping)
+        or not isinstance(v2p10_lineage, Mapping)
+        or not isinstance(v2p10_lineage.get("contract"), Mapping)
         or not isinstance(final_model, Mapping) or not isinstance(portability, Mapping)
         or not isinstance(portability.get("gate"), Mapping)
     ):
@@ -382,6 +465,7 @@ def validate_completion_provenance(
         merge_audit_path=Path(str(report.get("merge_audit", {}).get("path", ""))),
         portability_gate_path=Path(str(portability["gate"].get("path", ""))),
         full_ids_path=Path(full_ids_path), v2p10_composite_path=Path(v2p10_composite_path),
+        v2p10_lineage_path=Path(v2p10_lineage_path).resolve(),
     )
     if report != expected:
         raise ValueError("v2.11r3 completion provenance changed")
@@ -403,6 +487,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--portability-gate", type=Path, required=True)
     parser.add_argument("--full-ids", type=Path, required=True)
     parser.add_argument("--v2p10", type=Path, required=True)
+    parser.add_argument("--v2p10-lineage", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
     report = publish_completion_provenance(
@@ -411,7 +496,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         init_adapter_path=args.init_adapter, training_completion_path=args.training_completion,
         final_model_path=args.final_model, merge_audit_path=args.merge_audit,
         portability_gate_path=args.portability_gate, full_ids_path=args.full_ids,
-        v2p10_composite_path=args.v2p10, output_path=args.out,
+        v2p10_composite_path=args.v2p10,
+        v2p10_lineage_path=args.v2p10_lineage, output_path=args.out,
     )
     print(json.dumps({"status": report["status"], "candidate_name": report["candidate_name"]}, sort_keys=True))
     return 0

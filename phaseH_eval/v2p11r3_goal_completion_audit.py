@@ -15,6 +15,12 @@ from phaseH_eval.v2p11_completion_provenance import _model_contract
 from phaseH_eval.v2p11r2_goal_completion_audit import _validate_trustworthy_verdict
 
 
+CANONICAL_V2P10_LINEAGE = (
+    Path(__file__).resolve().parents[1]
+    / "runs/v2p11_v2p10_training_lineage.json"
+)
+
+
 def _validate_reasoned_lineage(provenance: Mapping[str, Any]) -> None:
     training = provenance.get("training")
     dataset = provenance.get("dataset")
@@ -79,6 +85,7 @@ def publish_goal_audit(
     v2p10_score_path: Path, v2p11_composite_path: Path,
     v2p11_predictions_path: Path, v2p11_score_path: Path,
     provenance_path: Path, candidate_model_path: Path,
+    v2p10_lineage_path: Path = CANONICAL_V2P10_LINEAGE,
     candidate_name: str, output_path: Path,
 ) -> dict[str, Any]:
     verdict_path = Path(verdict_path).resolve()
@@ -90,6 +97,7 @@ def publish_goal_audit(
     v2p11_predictions_path = Path(v2p11_predictions_path).resolve()
     v2p11_score_path = Path(v2p11_score_path).resolve()
     provenance_path = Path(provenance_path).resolve()
+    v2p10_lineage_path = Path(v2p10_lineage_path).resolve()
     candidate_model_path = Path(candidate_model_path).resolve()
     full_ids = _read_ids(full_ids_path)
     if len(full_ids) != 300 or len(set(full_ids)) != 300:
@@ -113,6 +121,7 @@ def publish_goal_audit(
     provenance = validate_completion_provenance(
         provenance_path, full_ids_path=full_ids_path,
         v2p10_composite_path=v2p10_composite_path,
+        v2p10_lineage_path=v2p10_lineage_path,
         candidate_model_contract=model_contract, candidate_name=candidate_name,
     )
     _validate_reasoned_lineage(provenance)
@@ -176,6 +185,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--verdict", type=Path, required=True)
     parser.add_argument("--full-ids", type=Path, required=True)
     parser.add_argument("--v2p10", type=Path, required=True)
+    parser.add_argument("--v2p10-lineage", type=Path, required=True)
     parser.add_argument("--v2p10-preds", type=Path, required=True)
     parser.add_argument("--v2p10-score", type=Path, required=True)
     parser.add_argument("--v2p11", type=Path, required=True)
@@ -192,6 +202,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         v2p10_score_path=args.v2p10_score, v2p11_composite_path=args.v2p11,
         v2p11_predictions_path=args.v2p11_preds, v2p11_score_path=args.v2p11_score,
         provenance_path=args.provenance, candidate_model_path=args.candidate_model,
+        v2p10_lineage_path=args.v2p10_lineage,
         candidate_name=args.candidate_name, output_path=args.out,
     )
     print(json.dumps(report["score"], sort_keys=True))

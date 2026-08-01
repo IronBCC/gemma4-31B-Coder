@@ -34,6 +34,12 @@ from phaseH_eval.v2p10_training_lineage import (
 )
 
 
+CANONICAL_V2P10_LINEAGE = (
+    Path(__file__).resolve().parents[1]
+    / "runs/v2p11_v2p10_training_lineage.json"
+)
+
+
 @dataclass(frozen=True)
 class FirstPassPanel:
     tag: str
@@ -254,10 +260,14 @@ def validate_completion_provenance(
     *,
     full_ids_path: Path,
     v2p10_composite_path: Path,
+    v2p10_lineage_path: Path | None = None,
     candidate_model_contract: Mapping[str, Any],
     candidate_name: str = "teacher_sft_v2p11",
 ) -> dict[str, Any]:
     provenance_path = Path(provenance_path).resolve()
+    canonical_v2p10_lineage = Path(
+        v2p10_lineage_path or CANONICAL_V2P10_LINEAGE
+    ).resolve()
     report = _read_object(provenance_path)
     if (
         report.get("artifact_type")
@@ -286,6 +296,7 @@ def validate_completion_provenance(
             provenance_path,
             full_ids_path=full_ids_path,
             v2p10_composite_path=v2p10_composite_path,
+            v2p10_lineage_path=canonical_v2p10_lineage,
             candidate_model_contract=candidate_model_contract,
             candidate_name=candidate_name,
         )
@@ -301,6 +312,7 @@ def validate_completion_provenance(
             provenance_path,
             full_ids_path=full_ids_path,
             v2p10_composite_path=v2p10_composite_path,
+            v2p10_lineage_path=canonical_v2p10_lineage,
             candidate_model_contract=candidate_model_contract,
             candidate_name=candidate_name,
         )
@@ -971,6 +983,7 @@ def compare_full300(
     *,
     full_ids_path: Path,
     v2p10_composite_path: Path,
+    v2p10_lineage_path: Path | None = None,
     v2p11_composite_path: Path,
     v2p11_predictions_path: Path,
     candidate_name: str = "teacher_sft_v2p11",
@@ -1076,6 +1089,7 @@ def compare_full300(
             provenance_path,
             full_ids_path=full_ids_path,
             v2p10_composite_path=v2p10_composite_path,
+            v2p10_lineage_path=v2p10_lineage_path,
             candidate_model_contract=candidate["model_contract"],
             candidate_name=candidate_name,
         )
@@ -1573,6 +1587,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--full-ids", type=Path, required=True)
     parser.add_argument("--v2p10", type=Path, required=True)
+    parser.add_argument(
+        "--v2p10-lineage",
+        type=Path,
+        default=CANONICAL_V2P10_LINEAGE,
+    )
     parser.add_argument("--v2p10-preds", type=Path)
     parser.add_argument("--v2p10-score-binding", type=Path)
     parser.add_argument("--v2p11", type=Path, required=True)
@@ -1616,6 +1635,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     report = compare_full300(
         full_ids_path=args.full_ids,
         v2p10_composite_path=args.v2p10,
+        v2p10_lineage_path=args.v2p10_lineage,
         v2p10_predictions_path=args.v2p10_preds,
         v2p10_score_binding_path=args.v2p10_score_binding,
         v2p11_composite_path=args.v2p11,

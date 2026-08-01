@@ -250,21 +250,16 @@ def _curriculum_messages(
             passing_tests.append(index)
     if not mutation_candidates:
         raise ValueError("recovery row lacks a successful source mutation")
-    mutation_index = next(
-        (
-            index
-            for index in reversed(mutation_candidates)
-            if _tool_command(messages[index]).lstrip().startswith("git apply ")
-        ),
-        mutation_candidates[-1],
-    )
+    mutation_index = mutation_candidates[-1]
     viable_tests = [
         index
         for index in passing_tests
-        if index != mutation_index
+        if index > mutation_index
     ]
     if not viable_tests:
-        raise ValueError("recovery row lacks a passing focused test")
+        raise ValueError(
+            "recovery row lacks a passing focused test after source mutation"
+        )
     test_index = viable_tests[-1]
     messages[mutation_index]["loss"] = True
     messages[test_index]["loss"] = True

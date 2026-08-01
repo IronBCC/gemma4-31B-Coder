@@ -85,8 +85,9 @@ finish_memory_watchdog() {
 }
 
 stop_owned_serve() {
-  local pid watchdog_status=0
+  local pid serve_status=0 watchdog_pid watchdog_status=0
   pid="$serve_pid"
+  watchdog_pid="${memory_watchdog_pid:-}"
   [[ -n "$pid" ]] || return 0
   if kill -0 "$pid" 2>/dev/null; then
     kill -TERM "$pid"
@@ -96,14 +97,18 @@ stop_owned_serve() {
     done
   fi
   if kill -0 "$pid" 2>/dev/null; then
+    log "HALT: owned serve PID $pid did not stop"
     return 1
   fi
-  wait "$pid" 2>/dev/null || true
-  serve_pid=""
+  wait "$pid" 2>/dev/null || serve_status=$?
   if [[ -n "${memory_watchdog_pid:-}" ]]; then
     finish_memory_watchdog || watchdog_status=$?
   fi
-  (( watchdog_status == 0 ))
+  serve_pid=""
+  if (( watchdog_status != 0 )); then
+    log "HALT: watchdog for owned serve PID $pid exited status=$watchdog_status watchdog_pid=$watchdog_pid serve_status=$serve_status"
+    return 1
+  fi
 }
 
 cleanup() {
@@ -111,7 +116,6 @@ cleanup() {
   trap - EXIT
   set +e
   if ! stop_owned_serve; then
-    log "HALT: owned serve PID $serve_pid did not stop"
     status=1
   fi
   exit "$status"
@@ -293,17 +297,37 @@ else
   log "serve ready pid=$serve_pid"
 fi
 
-"$EVAL_PY" phaseH_eval/retest_empties.py \
-  --name "$NAME" --port "$PORT" --ids "$IDS" --runid "$RUN_ID" \
-  --batch 20 --workers 16 --pull-workers 5 --seed "$SEED" \
-  >> "$LOG" 2>&1
+guard_serve_pid="$serve_pid"
+guard_watch_args=(--watch-pid "serve=$guard_serve_pid")
+if [[ "$REUSE_SERVE" == "1" ]]; then
+  guard_serve_pid="$matched_pid"
+  guard_watch_args=(--watch-pid "serve=$guard_serve_pid")
+else
+  guard_watch_args+=(--watch-pid "watchdog=$memory_watchdog_pid")
+fi
+evaluation_status=0
+"$EVAL_PY" phaseH_eval/run_while_pids_alive.py \
+  "${guard_watch_args[@]}" \
+  -- "$EVAL_PY" phaseH_eval/retest_empties.py \
+    --name "$NAME" --port "$PORT" --ids "$IDS" --runid "$RUN_ID" \
+    --batch 20 --workers 16 --pull-workers 5 --seed "$SEED" \
+    >> "$LOG" 2>&1 || evaluation_status=$?
+if (( evaluation_status != 0 )); then
+  owned_pid="$guard_serve_pid"
+  owned_watchdog_pid="$memory_watchdog_pid"
+  watchdog_status=0
+  if [[ -n "${memory_watchdog_pid:-}" ]] &&
+    ! kill -0 "$memory_watchdog_pid" 2>/dev/null; then
+    finish_memory_watchdog || watchdog_status=$?
+  fi
+  halt "evaluation stopped status=$evaluation_status serve_pid=$owned_pid watchdog_pid=$owned_watchdog_pid watchdog_status=$watchdog_status"
+fi
 
 "$EVAL_PY" phaseH_eval/eval_v2p10_promotion.py validate-fixed \
   --name "$NAME" --ids "$IDS" --run-root "runs/$RUN_ID" \
   --out "runs/$RUN_ID/acceptance.json"
 
-stop_owned_serve ||
-  halt "owned serve PID $serve_pid did not stop"
+stop_owned_serve || exit 1
 
 if [[ "$MODE" == "primary" ]]; then
   log "complete primary_run=runs/$RUN_ID"

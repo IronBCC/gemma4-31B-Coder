@@ -69,6 +69,19 @@ def test_empty_diff_runner_guards_host_memory_during_owned_serve() -> None:
     assert "memory_watchdog_pid" in script
 
 
+def test_empty_diff_runner_fails_closed_if_serve_or_watchdog_exits() -> None:
+    script = SCRIPT.read_text()
+
+    assert "phaseH_eval/run_while_pids_alive.py" in script
+    assert 'guard_serve_pid="$serve_pid"' in script
+    assert 'guard_watch_args=(--watch-pid "serve=$guard_serve_pid")' in script
+    assert 'guard_serve_pid="$matched_pid"' in script
+    assert 'guard_watch_args+=(--watch-pid "watchdog=$memory_watchdog_pid")' in script
+    assert "watchdog for owned serve PID $pid exited status=$watchdog_status" in script
+    assert "watchdog_pid=$owned_watchdog_pid" in script
+    assert 'owned serve PID $serve_pid did not stop' not in script
+
+
 def test_empty_diff_runner_is_hard_bound_to_gpu1() -> None:
     script = SCRIPT.read_text()
 

@@ -66,8 +66,32 @@ _SOURCE_DIFF_EXCLUDES = (
 _SOURCE_DIFF_PATHS = " ".join(
     f"':(exclude,glob){pattern}'" for pattern in _SOURCE_DIFF_EXCLUDES
 )
+_UNTRACKED_ARTIFACT_EXCLUDES = (
+    "repro*",
+    "**/repro*",
+    "**/repro*/**",
+    "scratch*",
+    "**/scratch*",
+    "**/scratch*/**",
+    "manage.py",
+    "**/manage.py",
+    "patch.txt",
+    "**/patch.txt",
+    "*.db",
+    "**/*.db",
+    "*.sqlite",
+    "**/*.sqlite",
+    "*.sqlite3",
+    "**/*.sqlite3",
+    "*.log",
+    "**/*.log",
+)
+_UNTRACKED_SOURCE_DIFF_PATHS = " ".join(
+    f"':(exclude,glob){pattern}'"
+    for pattern in (*_SOURCE_DIFF_EXCLUDES, *_UNTRACKED_ARTIFACT_EXCLUDES)
+)
 SOURCE_ONLY_DIFF_COMMAND = (
-    f"git add -N -- . {_SOURCE_DIFF_PATHS} && "
+    f"git add -N -- . {_UNTRACKED_SOURCE_DIFF_PATHS} && "
     f"git diff HEAD -- . {_SOURCE_DIFF_PATHS} > patch.txt && cat patch.txt"
 )
 RECOVERY_DIFF_COMMAND = SOURCE_ONLY_DIFF_COMMAND

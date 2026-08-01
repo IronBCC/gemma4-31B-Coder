@@ -301,6 +301,48 @@ class ModelClampTests(unittest.TestCase):
             self.assertNotIn("setup.py", patch)
             self.assertNotIn("tox.ini", patch)
 
+    def test_source_only_diff_omits_untracked_reproduction_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test"],
+                cwd=repo,
+                check=True,
+            )
+            (repo / "src").mkdir()
+            (repo / "src" / "old.py").write_text("old = 1\n")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+            (repo / "src" / "new.py").write_text("new = 1\n")
+            (repo / "reproduce_issue.py").write_text("print('debug')\n")
+            reproduction = repo / "reproduction"
+            reproduction.mkdir()
+            (reproduction / "manage.py").write_text("print('debug')\n")
+            (reproduction / "db.sqlite3").write_bytes(b"debug")
+
+            completed = subprocess.run(
+                SOURCE_ONLY_DIFF_COMMAND,
+                cwd=repo,
+                shell=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            patch = (repo / "patch.txt").read_text()
+            self.assertIn("diff --git a/src/new.py b/src/new.py", patch)
+            self.assertNotIn("reproduce_issue.py", patch)
+            self.assertNotIn("reproduction/manage.py", patch)
+            self.assertNotIn("reproduction/db.sqlite3", patch)
+
     def test_protected_submission_rejection_rebuilds_source_only_patch(self):
         messages = [
             _assistant_command("sed -i 's/a/b/' src/x.py"),

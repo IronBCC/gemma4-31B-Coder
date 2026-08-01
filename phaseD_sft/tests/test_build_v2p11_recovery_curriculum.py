@@ -212,6 +212,29 @@ def test_accepts_legacy_user_observations_and_terminal_verified_git_apply(
         ),
         call_id="verified-correction",
     )
+    row["messages"].extend(
+        [
+            {
+                "role": "user",
+                "content": (
+                    "OBSERVATION:\n<returncode>0</returncode>\n<output></output>"
+                ),
+                "tool_calls": [],
+            },
+            _assistant(
+                "python -m pytest tests/test_mod.py -q",
+                call_id="post-correction-test",
+            ),
+            {
+                "role": "user",
+                "content": (
+                    "OBSERVATION:\n<returncode>0</returncode>\n"
+                    "<output>1 passed</output>"
+                ),
+                "tool_calls": [],
+            },
+        ]
+    )
     train = source / "train.jsonl"
     train.write_text(json.dumps(row, sort_keys=True) + "\n", encoding="utf-8")
     manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
@@ -225,6 +248,109 @@ def test_accepts_legacy_user_observations_and_terminal_verified_git_apply(
     )
 
     assert result["rows"] == 3
+
+
+def test_rejects_passing_test_before_verifier_correction(
+    tmp_path: Path,
+) -> None:
+    source, exclusion = _source_dataset(tmp_path)
+    row = json.loads((source / "train.jsonl").read_text(encoding="utf-8"))
+    row["messages"] = row["messages"][:-1]
+    row["messages"].extend(
+        [
+            {
+                "role": "user",
+                "content": (
+                    "VERIFIER FEEDBACK:\nThe legacy candidate does not repair "
+                    "the bug-mutated task."
+                ),
+                "tool_calls": [],
+            },
+            _assistant(
+                (
+                    "git apply - <<'PATCH'\n"
+                    "diff --git a/src/mod.py b/src/mod.py\n"
+                    "PATCH"
+                ),
+                call_id="verified-correction",
+            ),
+        ]
+    )
+    train = source / "train.jsonl"
+    train.write_text(json.dumps(row, sort_keys=True) + "\n", encoding="utf-8")
+    manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
+    manifest["train_jsonl_sha256"] = hashlib.sha256(train.read_bytes()).hexdigest()
+    _write_json(source / "manifest.json", manifest)
+
+    with pytest.raises(
+        ValueError,
+        match="passing focused test after source mutation",
+    ):
+        build_recovery_curriculum(
+            source=source,
+            output=tmp_path / "output",
+            exclusion_path=exclusion,
+        )
+
+
+def test_rejects_passing_test_before_later_successful_source_mutation(
+    tmp_path: Path,
+) -> None:
+    source, exclusion = _source_dataset(tmp_path)
+    row = json.loads((source / "train.jsonl").read_text(encoding="utf-8"))
+    row["messages"] = row["messages"][:-1]
+    row["messages"].extend(
+        [
+            {
+                "role": "user",
+                "content": "VERIFIER FEEDBACK:\nApply the verified correction.",
+                "tool_calls": [],
+            },
+            _assistant(
+                (
+                    "git apply - <<'PATCH'\n"
+                    "diff --git a/src/mod.py b/src/mod.py\n"
+                    "PATCH"
+                ),
+                call_id="verified-correction",
+            ),
+            _tool(
+                "<returncode>0</returncode>\n<output></output>",
+                call_id="verified-correction",
+            ),
+            _assistant(
+                "python -m pytest tests/test_mod.py -q",
+                call_id="post-correction-test",
+            ),
+            _tool(
+                "<returncode>0</returncode>\n<output>1 passed</output>",
+                call_id="post-correction-test",
+            ),
+            _assistant(
+                "sed -i 's/new/newer/' src/mod.py",
+                call_id="later-edit",
+            ),
+            _tool(
+                "<returncode>0</returncode>\n<output></output>",
+                call_id="later-edit",
+            ),
+        ]
+    )
+    train = source / "train.jsonl"
+    train.write_text(json.dumps(row, sort_keys=True) + "\n", encoding="utf-8")
+    manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
+    manifest["train_jsonl_sha256"] = hashlib.sha256(train.read_bytes()).hexdigest()
+    _write_json(source / "manifest.json", manifest)
+
+    with pytest.raises(
+        ValueError,
+        match="passing focused test after source mutation",
+    ):
+        build_recovery_curriculum(
+            source=source,
+            output=tmp_path / "output",
+            exclusion_path=exclusion,
+        )
 
 
 def test_accepts_a_passing_test_invoked_through_a_shell_python_variable(

@@ -3327,3 +3327,45 @@ Full analysis + run-by-run history: `phaseD_sft/V6_49K_RETROSPECTIVE.md`. Compre
   6-10-hour estimate: fixed150 primary completion is now projected around `15:55-17:15 PDT`, with
   the range allowing for larger image pulls and harder repositories. The next meaningful boundary
   is a material ETA change, failure/safety event, or fixed150 completion; do not poll each batch.
+
+### v2.11r4 rejection and clean raw-base successor (2026-08-01 16:27 PDT)
+
+- R4 fixed150 is rejected as a diagnostic, not a promotion result. Its exact owned vLLM PID
+  `3846187` was terminated by host-memory watchdog PID `3846188` at `14:58:07 PDT` when
+  `MemAvailable` reached `11.287224 GiB`, below the `12 GiB` floor. The old evaluator continued
+  after the serve died and manufactured 50 empty outputs in batches 5-7; the chain eventually
+  failed at `15:28 PDT`. The only interpretable pre-kill primary evidence is 96 generated outcomes
+  plus four pull failures: 50 resolved, 38 wrong non-empty, and eight model-empty. On the 88
+  candidate-nonempty tasks, matched v2.10 is 52 resolved, 30 wrong, and six empty; paired movement
+  is six r4-only wins and eight v2.10-only wins. No r4 fixed150 gate or full300 verdict exists.
+- Failure analysis found a training-construction error rather than a Fable admission error. R3 was
+  initialized from v2.10 and then replayed the complete frozen 1,211-row v2.10 mix plus 51 new
+  Fable rows, followed by a 138-row recovery curriculum whose legacy traces could supervise a
+  known-wrong edit before verifier correction. The later KTO stage worsened the matched recovery
+  ablation from 23/50 to 12/50. R4 only attenuated that lineage by blending 75% v2.10 with 25% r3.
+  Separately, `git add -N -- .` admitted untracked reproduction artifacts into final patches: eight
+  of r4's 38 paired wrong patches were artifact-only, versus zero of 30 for v2.10.
+- The replacement is a fresh raw-base LoRA, not another continuation or blend. Dataset
+  `data/teacher_train_mix_v2p11_fable1262` is exactly the frozen 1,211 v2.10 rows followed by 51
+  newly admitted Fable-5 rows: 36 Stage-A rows and 15 recent strict final-patch rows. Its manifest
+  SHA-256 is `40531f44c8d5ab1d47a179418aa1adaf1ca31d0f0265f262b15c5fd424b4758a` and
+  `train.jsonl` SHA-256 is `3d131c531ca060ad2472304b95b423f292cefde94cf4538788ef52ce36b919c1`.
+  `runs/v2p11_clean_fable51_context_audit.json` proves 1,262 rows, maximum rendered length 26,594,
+  zero rows over 32,768 tokens, 79 optimizer steps, and `init_adapter=null`.
+- Training is active only on GPU1 as `v2p11-clean-fable51-train-gpu1-v2.service`, invocation
+  `bf042e80eda24928a28c6c0784cbc0b2`, wrapper PID `68011`, trainer PID `68900`, and watchdog PID
+  `68902`. At optimizer step 3/79 the measured remaining ETA was 24,556 seconds, projecting training
+  completion near `23:12 PDT`; GPU1 utilization was 59% with 66,618 MiB used, and the latest host
+  memory samples were 43-45 GiB available against the 12-GiB floor. Do not query or touch GPU0.
+- Recovery admission now chooses the last successful source mutation and requires a later passing
+  focused test; the posttrain contract rejects supervised legacy edits before verifier feedback.
+  Final-diff collection excludes untracked reproduction/scratch/database/log artifacts while still
+  admitting legitimate new source files. Evaluation now runs in an owned process group watched
+  against the exact serve/watchdog PIDs, terminates surviving descendants on either guard failure or
+  normal leader exit, and cannot validate or compose partial post-serve artifacts. Fresh local and
+  remote verification completed as 104 tests plus five subtests; Bash syntax, Python compilation,
+  diff whitespace, and all 12 scoped local/remote file hashes match.
+- Next boundary: finish and validate the 79-step adapter, merge it into a distinct complete model,
+  run a controller-free portability/regression gate, and proceed to the same full300 plus empty-only
+  correction only if correctness is not below canonical v2.10. The promotion target remains strictly
+  greater than v2.10's verified 157/300 on the identical 300 IDs.

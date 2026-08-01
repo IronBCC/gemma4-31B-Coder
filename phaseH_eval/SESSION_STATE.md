@@ -3075,3 +3075,23 @@ Full analysis + run-by-run history: `phaseD_sft/V6_49K_RETROSPECTIVE.md`. Compre
   GPU1. Allow roughly 4-7 hours after r3 for recovery/KTO/merges/portability and roughly 12-14 hours
   for the matched full300 including bounded empty correction. The current final-verdict window is
   approximately 16:00-20:00 PDT on 2026-08-01, subject to actual recovery/KTO throughput.
+
+### v2.11r3 poststage interruption recovery (2026-07-31 19:20 PDT)
+
+- Commit `818a2de` makes incomplete recovery-SFT and KTO outputs restartable without deleting
+  evidence. Checkpointless recovery output and every KTO `.inprogress` directory are atomically
+  renamed to unique `.interrupted-*` archives; a verified real recovery checkpoint is resumed.
+  Top-level and checkpoint symlinks fail closed, archive collisions cannot replace either
+  directory, and the launcher branches on the helper's authoritative post-race status.
+- The commit contains exactly four files:
+  `phaseH_eval/train_v2p11r3_behavior_gpu1.sh`, its launcher test,
+  `phaseH_eval/v2p11_poststage_recovery.py`, and its recovery tests. All unrelated tracked and
+  untracked work remains outside the commit. Local and remote broad verification each passed
+  `99/99`; shell syntax, helper compilation, and checksum parity also passed. The remote test
+  interpreter is `.venv-eval/bin/python`; runtime recovery remains bound to `.venv-train/bin/python`.
+- After verifying the prior CPU waiter's exact PID and loop command, it was replaced by
+  `v2p11r3-posttrain-waiter.service`, PID `2584583`, invocation
+  `eafdcf7be89e4b268c70cb1b495781bf`. It retains the 60-second named-unit wait and now has
+  `Restart=on-failure`, `RestartSec=60`, `StartLimitBurst=3`, and a 30-minute start-limit interval.
+  It performs no GPU query or work while waiting. The training and final-verdict ETA boundaries
+  remain approximately 22:48 PDT on 2026-07-31 and 16:00-20:00 PDT on 2026-08-01, respectively.

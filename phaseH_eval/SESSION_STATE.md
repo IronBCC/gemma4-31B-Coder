@@ -3301,3 +3301,29 @@ Full analysis + run-by-run history: `phaseD_sft/V6_49K_RETROSPECTIVE.md`. Compre
 - SHA-256 parity was checked for the four production shell runners, the six Python gate/composite/
   lineage/provenance modules, and all nine focused test files; all 19 local and remote hashes match
   exactly. No live portability status was polled and no runtime or canonical artifact was changed.
+
+### v2.11r4 portability verdict and fixed150 batch-0 boundary (2026-08-01 13:37 PDT)
+
+- Controller-free portability10 completed at `13:11:23 PDT` and passed. The immutable gate
+  `runs/v2p11r4_blend25_portability_gate.json` has SHA-256
+  `1e4cefd4cacc8a6d413fea61c93a89aac3b0bc68670dfd3d9ac3ce3b16369a8f`.
+  Candidate r4 resolved 6/10 versus v2.10 at 5/10; both had one empty and zero format errors. All five
+  criteria passed: at most one candidate empty, no empty/format/repeat-loop regression, and the
+  resolution floor. Both sides contain 10 prediction rows, 10 trajectories, and one batch
+  `preds.json` file.
+- The automatic chain then entered matched fixed150. Its exact wrapper is PID `3845892`, vLLM PID
+  `3846187`, engine PID `3846388`, host-memory watchdog PID `3846188`, controller PID `3847107`,
+  and current Mini-SWE child PID `3847784`. `/v1/models` on `:8013` returns only
+  `teacher_sft_v2p11r4_blend25` at the exact interpolated-model path. GPU1 owns 89,010 MiB; do not
+  query or touch GPU0.
+- Fixed150 batch 0 generated its 20 instances from `13:14:46` through `13:35:05 PDT`, then published
+  20 prediction rows, 20 trajectories, and one batch `preds.json` file. It resolved 12/20 with zero
+  empty outputs. The exact matched v2.10 batch resolves 13/20 with two empties. Paired r4 versus
+  v2.10 is two candidate-only wins, three control-only losses, ten both resolved, and five neither;
+  thus the provisional net is -1. R4 has eight wrong-nonempty versus five, one repeat loop versus
+  zero, and one tool-format error versus zero, while eliminating both control empties. This is only
+  20/150 and is not a promotion decision; the pre-full300 gate remains absent until all 150 finish.
+- Batch 1 began image pulls at `13:35:10 PDT`. The measured batch-0 wall time replaces the old
+  6-10-hour estimate: fixed150 primary completion is now projected around `15:55-17:15 PDT`, with
+  the range allowing for larger image pulls and harder repositories. The next meaningful boundary
+  is a material ETA change, failure/safety event, or fixed150 completion; do not poll each batch.

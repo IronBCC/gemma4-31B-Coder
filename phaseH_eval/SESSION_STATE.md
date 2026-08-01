@@ -3164,3 +3164,52 @@ Full analysis + run-by-run history: `phaseD_sft/V6_49K_RETROSPECTIVE.md`. Compre
   r3 outputs cover the same 50 tasks, so only the already-merged recovery checkpoint is running.
   Do not query or touch GPU0. Check next at the ablation completion/error boundary, estimated around
   11:00-12:00 PDT.
+
+### v2.11r3 recovery-stage ablation verdict (2026-08-01 10:53 PDT)
+
+- `v2p11r3-recovery-ablation50-gpu1.service` completed successfully and is now inactive with
+  `MainPID=0`, `ExecMainStatus=0`, and `Result=success`; GPU1 had no compute process after cleanup.
+  The exact run is `runs/v2p11r3_recovery_ablation50` over the immutable 50-ID artifact
+  `data/v2p11r3_stage_ablation50_ids.json` SHA-256
+  `581727784f273e54daa8a70833a17a7fa16581a7619a1a3c87733f21866251b3`.
+- The run is complete at 50 predictions, 50 unique trajectories, 50 usable outcomes, 23 resolved,
+  one model-empty output (`django__django-12915`), zero pull failures, and zero Docker failures.
+  `runs/v2p11r3_recovery_ablation50/acceptance.json` has SHA-256
+  `ba44b507725c9a1669732f48ba5e6647d90607bcd94ff436601d5a719eeb2595`;
+  `summary.json` has SHA-256
+  `d9ffc105dbabdffca1c241e9ba9aa6827350a048330d75ee8c190a49e1c9a60f`;
+  `preds_all.json` has SHA-256
+  `7a11ad106303eacbcc77a90df3b68c1cc664cdb030ad85b27ef371a5e31c268f`.
+- On the exact first-pass decision set, canonical v2.10 resolves 38/50 and final r3 resolves 12/50.
+  Recovery versus v2.10 is 19 both resolved, four recovery-only, 19 v2.10-only, and eight neither;
+  recovery therefore misses the v2.10 floor by 15. Recovery versus final r3 is four both resolved,
+  19 recovery-only, eight r3-only, and 19 neither, a net recovery advantage of 11. This isolates the
+  main correctness collapse to recovery SFT, with KTO worsening the same set further. Empty/format
+  mitigation alone is not sufficient to promote either checkpoint.
+- No recovery full300 will run. The next candidate must remain anchored to v2.10 while retaining only
+  an attenuated amount of the admitted 92-row Fable and behavior signal already realized in r3; it
+  must pass controller-free portability and a matched pre-full300 correctness/empty/loop gate before
+  consuming a full300 evaluation. Do not query or touch GPU0.
+
+### v2.11r4 conservative successor live chain (2026-08-01 12:00 PDT)
+
+- The sole candidate is `teacher_sft_v2p11r4_blend25`, defined as
+  `0.75 * v2.10 + 0.25 * v2.11r3_behavior`. Canonical v2.10 remains 157/300; r3 remains 124/300.
+  Full300 is conditional on controller-free portability10 and a matched fixed150 gate that preserves
+  correctness and wrong-nonempty while strictly improving empty patches or repeat loops.
+- Gate/chain code is committed as `ba7aeb3`; the padding-only tokenizer compatibility fix is committed
+  as `9e96eee`. The first materialization attempt failed closed before writing an output because r3's
+  merge had copied adapter padding state. Live comparison proved identical 262,144-token vocabularies,
+  special/added-token IDs, chat template, and representative encodings; only
+  `tokenizer.json.padding` and `tokenizer_config.json.padding_side` differ. The fix copies the v2.10
+  tokenizer, binds both raw hashes plus a normalized semantic hash, and still rejects vocabulary or
+  token-ID drift. Focused verification is 97 passed.
+- The corrected chain launched at `2026-08-01 11:59:01 PDT` as
+  `v2p11r4-blend25-chain-gpu1.service`, exact PID `3798384`. Its CPU-only child is
+  `v2p11r4-blend25-materialize.service`, exact PID `3798398`. At 25 seconds the bounded staging output
+  was 5.8 GiB and the child was actively CPU/I/O bound at about 2.7 GiB RSS. No final output is yet
+  published and no GPU is used during construction. The chain will proceed automatically to GPU1/8013
+  portability, fixed150, and only on gate pass full300. Do not query or touch GPU0.
+- Next evidence boundary: materialization completion/error, initially expected around 12:10-12:20 PDT.
+  If it succeeds, portability is approximately 1-2 hours and fixed150 approximately 6-10 hours; a
+  passing full300 then requires another approximately 8-14 hours.

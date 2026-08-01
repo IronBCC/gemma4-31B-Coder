@@ -316,6 +316,19 @@ def validate_completion_provenance(
             candidate_model_contract=candidate_model_contract,
             candidate_name=candidate_name,
         )
+    if report.get("artifact_type") == "v2p11r4_successor_prefull_gate":
+        from phaseH_eval.v2p11_successor_gate import (
+            validate_interpolation_completion_provenance,
+        )
+
+        return validate_interpolation_completion_provenance(
+            provenance_path,
+            full_ids_path=full_ids_path,
+            v2p10_composite_path=v2p10_composite_path,
+            v2p10_lineage_path=canonical_v2p10_lineage,
+            candidate_model_contract=candidate_model_contract,
+            candidate_name=candidate_name,
+        )
     fable = report.get("fable")
     exclusion = report.get("evaluation_exclusion")
     final_model = report.get("final_model")

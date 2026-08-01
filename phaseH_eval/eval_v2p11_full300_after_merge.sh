@@ -12,6 +12,10 @@ ARTIFACT_TAG="${ARTIFACT_TAG:-v2p11}"
 LINEAGE_MODE="${LINEAGE_MODE:-posttrain}"
 POSTTRAIN_MARKER="${POSTTRAIN_MARKER:-runs/v2p11_posttrain_complete.json}"
 FINAL_AUDIT="${FINAL_AUDIT:-$MODEL/v2p11_final_merge_audit.json}"
+INTERPOLATION_MANIFEST="${INTERPOLATION_MANIFEST:-$MODEL/interpolation_manifest.json}"
+INTERPOLATION_ANCHOR_MODEL="${INTERPOLATION_ANCHOR_MODEL:-/media/ironbcc/CrucialX10/models/merged/teacher_sft_v2p10_full}"
+INTERPOLATION_SOURCE_MODEL="${INTERPOLATION_SOURCE_MODEL:-/media/ironbcc/CrucialX10/models/merged/teacher_sft_v2p11r3_behavior_full}"
+PREFULL_GATE="${PREFULL_GATE:-runs/v2p11r4_blend25_prefull_gate.json}"
 PORTABILITY_MARKER="${PORTABILITY_MARKER:-runs/${ARTIFACT_TAG}_portability_gate.json}"
 PROVENANCE="${PROVENANCE:-runs/${ARTIFACT_TAG}_completion_provenance.json}"
 FULL_IDS="data/swebench_lite_test_ids.json"
@@ -298,8 +302,8 @@ PY
 [[ "$GPU_INDEX" == "1" ]] ||
   halt "GPU_INDEX is fixed to GPU1; GPU0 is unavailable"
 case "$LINEAGE_MODE" in
-  posttrain|direct_lora) ;;
-  *) halt "LINEAGE_MODE must be posttrain or direct_lora" ;;
+  posttrain|direct_lora|interpolation) ;;
+  *) halt "LINEAGE_MODE must be posttrain, direct_lora, or interpolation" ;;
 esac
 [[ "$WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]] ||
   halt "WAIT_SECONDS must be a positive integer"
@@ -308,11 +312,26 @@ esac
 [[ -x "$EVAL_PY" ]] || halt "evaluation Python is missing: $EVAL_PY"
 [[ -f "$RUNNER" ]] || halt "evaluation runner is missing: $RUNNER"
 [[ -d "$MODEL" ]] || halt "v2.11 merged model is missing: $MODEL"
-if [[ "$LINEAGE_MODE" == "posttrain" ]]; then
-  [[ -f "$POSTTRAIN_MARKER" ]] ||
-    halt "v2.11 posttrain marker is missing: $POSTTRAIN_MARKER"
-fi
-[[ -f "$FINAL_AUDIT" ]] || halt "v2.11 final merge audit is missing"
+case "$LINEAGE_MODE" in
+  posttrain)
+    [[ -f "$POSTTRAIN_MARKER" ]] ||
+      halt "v2.11 posttrain marker is missing: $POSTTRAIN_MARKER"
+    [[ -f "$FINAL_AUDIT" ]] || halt "v2.11 final merge audit is missing"
+    ;;
+  direct_lora)
+    [[ -f "$FINAL_AUDIT" ]] || halt "v2.11 final merge audit is missing"
+    ;;
+  interpolation)
+    [[ -f "$INTERPOLATION_MANIFEST" ]] ||
+      halt "v2.11 interpolation manifest is missing"
+    [[ -f "$PREFULL_GATE" ]] ||
+      halt "v2.11r4 pre-full300 gate is missing"
+    [[ -d "$INTERPOLATION_ANCHOR_MODEL" ]] ||
+      halt "v2.11 interpolation anchor model is missing"
+    [[ -d "$INTERPOLATION_SOURCE_MODEL" ]] ||
+      halt "v2.11 interpolation source model is missing"
+    ;;
+esac
 [[ -f "$PORTABILITY_MARKER" ]] ||
   halt "controller-free portability gate is missing: $PORTABILITY_MARKER"
 [[ -f "$PROVENANCE" ]] ||
@@ -326,7 +345,9 @@ fi
 "$EVAL_PY" - \
   "$NAME" "$MODEL" "$LINEAGE_MODE" "$POSTTRAIN_MARKER" \
   "$FINAL_AUDIT" "$PORTABILITY_MARKER" "$PROVENANCE" \
-  "$FULL_IDS" "$V2P10_COMPOSITE" "$V2P10_LINEAGE" <<'PY'
+  "$FULL_IDS" "$V2P10_COMPOSITE" "$V2P10_LINEAGE" \
+  "$INTERPOLATION_MANIFEST" "$INTERPOLATION_ANCHOR_MODEL" \
+  "$INTERPOLATION_SOURCE_MODEL" "$PREFULL_GATE" <<'PY'
 import hashlib
 import json
 import sys
@@ -348,6 +369,10 @@ from phaseH_eval.v2p11_completion_provenance import _model_contract
     full_ids_value,
     v2p10_value,
     v2p10_lineage_value,
+    interpolation_manifest_value,
+    interpolation_anchor_value,
+    interpolation_source_value,
+    prefull_gate_value,
 ) = sys.argv[1:]
 model_path = Path(model_value).resolve()
 marker_path = Path(marker_value)
@@ -356,7 +381,6 @@ portability_path = Path(portability_value)
 provenance_path = Path(provenance_value)
 full_ids_path = Path(full_ids_value)
 v2p10_path = Path(v2p10_value)
-audit = json.loads(audit_path.read_text())
 portability = json.loads(portability_path.read_text())
 sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
 if lineage_mode == "posttrain":
@@ -365,33 +389,59 @@ if lineage_mode == "posttrain":
     assert marker["recovery_optimizer_steps"] == 105
     assert marker["kto_optimizer_steps"] == 25
     assert marker["final_merge_audit_sha256"] == sha(audit_path)
-assert audit == {
-    "schema_version": 1,
-    "architecture": "Gemma4ForConditionalGeneration",
-    "expected_tensors": 1188,
-    "actual_tensors": 1188,
-    "expected_vision": 356,
-    "actual_vision": 356,
-    "missing_tensors": [],
-    "unexpected_tensors": [],
-    "misplaced_tensors": [],
-    "nonfinite_tensors": [],
-    "complete": True,
-}
+if lineage_mode != "interpolation":
+    audit = json.loads(audit_path.read_text())
+    assert audit == {
+        "schema_version": 1,
+        "architecture": "Gemma4ForConditionalGeneration",
+        "expected_tensors": 1188,
+        "actual_tensors": 1188,
+        "expected_vision": 356,
+        "actual_vision": 356,
+        "missing_tensors": [],
+        "unexpected_tensors": [],
+        "misplaced_tensors": [],
+        "nonfinite_tensors": [],
+        "complete": True,
+    }
 assert portability["schema_version"] == 1
 assert portability["status"] == "complete"
 assert portability["passed"] is True
 assert portability["candidate_name"] == name
 model_contract = _model_contract(model_path)
 model_contract["served_name"] = name
-validate_completion_provenance(
-    provenance_path,
-    full_ids_path=full_ids_path,
-    v2p10_composite_path=v2p10_path,
-    v2p10_lineage_path=Path(v2p10_lineage_value),
-    candidate_model_contract=model_contract,
-    candidate_name=name,
-)
+if lineage_mode == "interpolation":
+    from phaseH_eval.v2p11_interpolation_lineage import (
+        validate_interpolation_lineage,
+    )
+    from phaseH_eval.v2p11_successor_gate import (
+        validate_interpolation_completion_provenance,
+    )
+    validate_interpolation_lineage(
+        manifest_path=Path(interpolation_manifest_value),
+        anchor_model_path=Path(interpolation_anchor_value),
+        source_model_path=Path(interpolation_source_value),
+        output_model_path=model_path,
+        candidate_name=name,
+    )
+    assert provenance_path.resolve() == Path(prefull_gate_value).resolve()
+    validate_interpolation_completion_provenance(
+        provenance_path,
+        full_ids_path=full_ids_path,
+        v2p10_composite_path=v2p10_path,
+        v2p10_lineage_path=Path(v2p10_lineage_value),
+        candidate_model_contract=model_contract,
+        candidate_name=name,
+    )
+else:
+    validate_completion_provenance(
+        provenance_path,
+        full_ids_path=full_ids_path,
+        v2p10_composite_path=v2p10_path,
+        v2p10_lineage_path=Path(v2p10_lineage_value),
+        candidate_model_contract=model_contract,
+        candidate_name=name,
+    )
 PY
 
 run_primary "$FIXED_IDS" "$FIXED_SOURCE" 150 1 "v2.11 fixed150 primary"

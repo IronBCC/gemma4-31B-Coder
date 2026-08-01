@@ -117,6 +117,19 @@ class SummarizeSmokeTests(unittest.TestCase):
 
         self.assertEqual(metrics["resolved"], 8)
 
+    def test_finds_report_above_timestamped_artifact_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            run = root / "runs" / "eval_20260719_073151" / "smoke_model" / "model"
+            run.mkdir(parents=True)
+            (root / "openai__model.smoke_model.json").write_text(
+                json.dumps({"resolved_instances": 9})
+            )
+
+            metrics = summarize_run(run)
+
+        self.assertEqual(metrics["resolved"], 9)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sys
+import tempfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -17,7 +19,9 @@ if str(ROOT) not in sys.path:
 from phaseD_sft.progress import EtaProgress
 from phaseD_sft.train_rust_lora import (
     label_tokens_for_spans,
+    load_training_dataset,
     rendered_assistant_turn_spans,
+    supervised_assistant_turn_spans,
 )
 
 
@@ -41,6 +45,27 @@ def ordered_parallel_map(items, function, *, workers: int):
         yield from executor.map(function, items)
 
 
+def write_report_atomic(path: Path, report: dict) -> None:
+    """Publish a machine-readable verifier report without partial JSON."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def validate_one(tokenizer, idx: int, messages: list[dict]):
     """Render, label, and validate one sample using an already-loaded tokenizer."""
     counts = Counter()
@@ -48,10 +73,24 @@ def validate_one(tokenizer, idx: int, messages: list[dict]):
     thinking_examples: list[dict] = []
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     spans, fallback_used = rendered_assistant_turn_spans(tokenizer, messages, text)
+    supervised_spans, supervised_fallback_used = supervised_assistant_turn_spans(
+        tokenizer, messages, text
+    )
 
     counts["examples"] += 1
     counts["assistant_messages"] += sum(1 for msg in messages if msg.get("role") == "assistant")
+    counts["assistant_messages_masked_by_loss_flag"] += sum(
+        1
+        for msg in messages
+        if msg.get("role") == "assistant" and msg.get("loss", True) is False
+    )
+    counts["assistant_messages_supervised"] += sum(
+        1
+        for msg in messages
+        if msg.get("role") == "assistant" and msg.get("loss", True) is not False
+    )
     counts["fallback_spans"] += int(fallback_used)
+    counts["supervised_fallback_spans"] += int(supervised_fallback_used)
     counts["gemma_turns"] += text.count("<|turn>")
     counts["assistant_turn_markers"] += sum(text[start:end].startswith("<|turn>model\n") for start, end in spans)
     counts["tool_call_open"] += sum("<|tool_call>" in text[start:end] for start, end in spans)
@@ -88,7 +127,9 @@ def validate_one(tokenizer, idx: int, messages: list[dict]):
             thinking_examples.append({
                 "idx": int(idx),
                 "role": msg.get("role"),
-                "in_supervised_assistant_turn": bool(content and pos >= 0 and is_subspan((pos, pos + len(content)), spans)),
+                "in_supervised_assistant_turn": bool(
+                    content and pos >= 0 and is_subspan((pos, pos + len(content)), supervised_spans)
+                ),
                 "preview": content[:240].replace("\n", "\\n"),
             })
 
@@ -104,7 +145,7 @@ def validate_one(tokenizer, idx: int, messages: list[dict]):
         input_ids = input_ids[0]
     if offsets and isinstance(offsets[0], list) and offsets[0] and isinstance(offsets[0][0], (list, tuple)):
         offsets = offsets[0]
-    labels, supervised = label_tokens_for_spans(input_ids, offsets, spans)
+    labels, supervised = label_tokens_for_spans(input_ids, offsets, supervised_spans)
     if supervised <= 0:
         failures.append(f"{idx}: no supervised tokens")
     decoded = tokenizer.decode([tok for tok, lab in zip(input_ids, labels) if lab != -100])
@@ -123,6 +164,12 @@ def main() -> int:
     parser.add_argument("--samples", type=int, default=500)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--report-out",
+        type=Path,
+        default=None,
+        help="atomically write the final JSON report for manifest binding",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=1,
@@ -140,14 +187,13 @@ def main() -> int:
     if args.workers <= 0:
         parser.error("--workers must be positive")
 
-    from datasets import load_from_disk
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.base)
     print("[template] using base tokenizer Gemma chat template", flush=True)
     print(f"[workers] {args.workers} (one shared tokenizer; ThreadPoolExecutor)", flush=True)
 
-    ds = load_from_disk(args.data)
+    ds = load_training_dataset(args.data)
     rng = random.Random(args.seed)
     indices = list(range(len(ds)))
     rng.shuffle(indices)
@@ -200,6 +246,8 @@ def main() -> int:
         "failure_count": len(failures),
     }
     print(json.dumps(report, indent=2, ensure_ascii=False))
+    if args.report_out is not None:
+        write_report_atomic(args.report_out, report)
     return 1 if failures else 0
 
 

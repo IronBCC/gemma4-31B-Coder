@@ -2140,6 +2140,8 @@ def build_fable5_pilot(
             trajectory_id TEXT NOT NULL,
             source_terminal_sha256 TEXT NOT NULL,
             fixture_sha256 TEXT NOT NULL,
+            source_tree_sha TEXT NOT NULL,
+            task_tree_sha TEXT NOT NULL,
             verify_cmd TEXT NOT NULL,
             protected_paths_json TEXT NOT NULL,
             converted_json TEXT NOT NULL,
@@ -2326,11 +2328,12 @@ def build_fable5_pilot(
                 """
                 INSERT INTO candidates (
                     task, language, category, trajectory_id,
-                    source_terminal_sha256, fixture_sha256, verify_cmd,
+                    source_terminal_sha256, fixture_sha256,
+                    source_tree_sha, task_tree_sha, verify_cmd,
                     protected_paths_json, converted_json, content_sha256,
                     first_edit_index, max_read_streak, normalized_command_count,
                     canonical_terminal_sha256, token_count, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'candidate')
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'candidate')
                 """,
                 (
                     selected.task,
@@ -2339,6 +2342,8 @@ def build_fable5_pilot(
                     trajectory_id,
                     terminal_sha,
                     seed.fixture_sha256,
+                    seed.source_tree_sha,
+                    seed.task_tree_sha,
                     seed.verify_cmd,
                     _canonical_json_bytes(list(seed.protected_paths)).decode("utf-8"),
                     _canonical_json_bytes(converted).decode("utf-8"),
@@ -2507,7 +2512,8 @@ def build_fable5_pilot(
             """
             SELECT candidate_key, task, trajectory_id,
                    language, source_terminal_sha256, content_sha256,
-                   fixture_sha256, verify_cmd, protected_paths_json
+                   fixture_sha256, source_tree_sha, task_tree_sha,
+                   verify_cmd, protected_paths_json
             FROM candidates WHERE status = 'unique_candidate'
             ORDER BY language, task
             """
@@ -2520,6 +2526,8 @@ def build_fable5_pilot(
             source_terminal_sha,
             content_sha,
             fixture_sha,
+            source_tree_sha,
+            task_tree_sha,
             verify_cmd,
             protected_paths_json,
         ) in replay_cursor:
@@ -2539,6 +2547,8 @@ def build_fable5_pilot(
                     protected_paths=tuple(json.loads(protected_paths_json)),
                     verify_cmd=verify_cmd,
                     fixture_sha256=fixture_sha,
+                    source_tree_sha=source_tree_sha,
+                    task_tree_sha=task_tree_sha,
                 ),
                 language=language,
             )

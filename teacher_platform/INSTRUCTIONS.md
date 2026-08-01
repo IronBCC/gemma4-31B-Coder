@@ -19,7 +19,7 @@ The box has the images, the venvs, and matching arch.
 
 ```
 PY=.venv-eval/bin/python            # eval venv: has datasets/docker deps
-PLAT="$PY teacher_platform/teacher_platform.py"
+PLAT="$PY -m teacher_platform"
 ```
 
 ## Backend model IDs (must be exact — a wrong slug 400s and now fail-fast aborts)
@@ -48,8 +48,10 @@ Hard rules (do not skip — each earned a failed adapter):
 - **Duds ≠ failures.** A quota-wall row has `n_assistant_events<=2` and
   `patch_len=0`; it means the task never ran. The tools already exclude these —
   never count them as teacher misses.
-- **A row is verified only if `resolved: true`** (its patch passed the instance's
-  FAIL_TO_PASS tests in-container). Everything downstream uses `resolved.jsonl`.
+- **A row is verified only with complete strict evidence**: a fresh baseline
+  fails F2P while P2P passes, the reference passes, the candidate passes
+  F2P+P2P twice, protected hashes remain stable, and every artifact hash
+  matches. Candidate-only F2P labels from older runs are diagnostics.
 
 ---
 
@@ -148,7 +150,24 @@ Collect from **multiple teachers** into sibling dirs (`runs/teacher_claude`,
 
 ---
 
-## Step 2 — Merge (consolidate verified positives)
+## Step 2 — Revalidate legacy or already-running extractions
+
+New collections run strict controls automatically. Older collections and an
+extraction started with pre-admission code must be replayed into a new
+directory; never mutate the live extraction:
+
+```
+$PLAT revalidate --glob 'runs/teacher_fable_new*' \
+      --tasks data/hard_tasks.jsonl \
+      --exclude data/swe_verified_eval_exclusions_v1.json \
+                data/python_eval_repo_denylist_v1.json \
+      --out-dir runs/teacher_fable_new_revalidated
+```
+
+The `.work` ledger is resumable. Only the atomically published output is an
+eligible merge input.
+
+## Step 3 — Merge (consolidate strictly verified positives)
 
 ```
 $PLAT merge --glob 'runs/teacher_*' --out-dir runs/teacher_merged
@@ -156,26 +175,30 @@ $PLAT merge --glob 'runs/teacher_*' --out-dir runs/teacher_merged
 
 Produces `runs/teacher_merged/`:
 - `results.jsonl` — every real attempt (all backends, deduped by instance)
-- `resolved.jsonl` — F2P-verified positives = **the trainable set**
+- `resolved.jsonl` — strict-control positives with exact evidence
 - `<id>.stream.jsonl` + `<id>.patch` — artifacts for each positive
 - `manifest.json` — counts, per-backend resolve rates
 
 ---
 
-## Step 3 — Prepare for training (render to SFT format)
+## Step 4 — Prepare for training (render to SFT format)
 
 ```
-$PLAT prepare --merged runs/teacher_merged --tasks data/hard_tasks.jsonl --out data/teacher_sft
+$PLAT prepare --merged runs/teacher_merged --tasks data/hard_tasks.jsonl \
+      --exclude data/swe_verified_eval_exclusions_v1.json \
+                data/python_eval_repo_denylist_v1.json \
+      --out data/teacher_sft
 ```
 
 This is the **critical** step. It parses each teacher stream into
 `(thought, command, observation)` steps and renders them as mini-SWE SFT:
 `system` + PR problem, then per step `assistant`(THOUGHT + one `bash` tool_call)
-and `user`(OBSERVATION). It **strips the `docker exec <cid> bash -c` wrapper** so
+and `user`(OBSERVATION), followed by the real terminal assistant response.
+Assistant targets carry `loss=true`; conditioning carries `loss=false`. It
+**strips the `docker exec <cid> bash -c` wrapper** so
 the student learns bare `/testbed` commands, not the teacher's harness shape —
-this is what prevents the data-mirror regression. Check
-`data/teacher_sft.manifest.json`: `median_first_edit_cmd` should be small
-(edit-first); `dropped_unparseable` should be near 0.
+this is what prevents the data-mirror regression. Preparation rejects an
+unparseable or unbound row instead of silently degrading the dataset.
 
 ---
 
@@ -203,7 +226,7 @@ $PLAT blend --sources data/teacher_sft data/open_swe_sft \
 and the mix. Decontamination is your responsibility: always pass eval instance
 ids to `ingest --exclude`.
 
-## Step 4 — Smoke-test for training
+## Step 5 — Full-dataset format gate and smoke-test
 
 ```
 # structural + Gemma format-loss gates (no GPU):
@@ -214,9 +237,10 @@ $PLAT smoke-train --data data/teacher_sft --micro-train
 ```
 
 PASS criteria: every row has a system message + at least one assistant
-`bash` tool_call; `verify_gemma_format_loss.py` reports 0 failures; (optional)
-the 2-step micro-train completes without error. Only then hand the dataset to a
-real training run.
+`bash` tool_call; every row is checked by `verify_gemma_format_loss.py`; its
+zero-failure report is immutably bound into `manifest.json`; (optional) the
+2-step micro-train completes. `train_rust_lora.py` refuses schema-v2 teacher
+datasets while this gate is pending or their JSONL hash has drifted.
 
 ---
 
@@ -225,7 +249,10 @@ real training run.
 ```
 $PLAT collect --tasks data/hard_tasks.jsonl --out-dir runs/teacher_claude --backend claude --loop
 $PLAT merge   --glob 'runs/teacher_*' --out-dir runs/teacher_merged
-$PLAT prepare --merged runs/teacher_merged --tasks data/hard_tasks.jsonl --out data/teacher_sft
+$PLAT prepare --merged runs/teacher_merged --tasks data/hard_tasks.jsonl \
+      --exclude data/swe_verified_eval_exclusions_v1.json \
+                data/python_eval_repo_denylist_v1.json --out data/teacher_sft
+$PLAT smoke-train --data data/teacher_sft
 $PLAT ingest  --out data/open_swe_sft --resolved-only --language python --exclude data/lite_eval_ids.jsonl
 $PLAT blend   --sources data/teacher_sft data/open_swe_sft --out data/main_train_mix
 $PLAT smoke-train --data data/main_train_mix
@@ -235,8 +262,7 @@ $PLAT smoke-train --data data/main_train_mix
 - **`collect` writes only 2s duds** → quota wall; the loop pauses automatically.
   Check the wall wording is caught: `credit_exhausted_in_stream` keys on HTTP
   429. If a new wording slips through, add it there.
-- **`prepare` drops many rows** → the stream parser didn't recognize the backend
-  format; check `normalize_steps` for that backend against a sample
-  `.stream.jsonl`.
+- **`prepare` rejects a row** → treat it as a provenance or normalization
+  defect; check the artifact/task hash and balanced tool-result/terminal ledger.
 - **`smoke-train` format gate fails** → inspect the offending row's `messages`;
   usually a tool_call arguments blob isn't valid JSON.

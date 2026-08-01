@@ -1,0 +1,15 @@
+{
+  "repo_denylist": [
+    "astropy/astropy",
+    "django/django",
+    "matplotlib/matplotlib",
+    "pallets/flask",
+    "sympy/sympy"
+  ],
+  "schema_version": 1,
+  "scope": "active_python_promotion_holdouts",
+  "sources": [
+    "data/expert_iter1_pool_manifest.json:lite_exclusion_ids",
+    "data/python_verified_teacher_holdout35_manifest.json:selected_ids"
+  ]
+}

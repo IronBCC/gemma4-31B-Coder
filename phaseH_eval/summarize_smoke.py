@@ -68,7 +68,7 @@ def _non_empty_prediction_count(run_dir: Path) -> int | None:
 def _resolved_count(run_dir: Path) -> int | None:
     """Find the SWE-bench final report written beside the repository root."""
     pattern = f"*smoke_{run_dir.name}.json"
-    for directory in (run_dir, run_dir.parent, run_dir.parent.parent, run_dir.parent.parent.parent):
+    for directory in (run_dir, *run_dir.parents):
         for path in sorted(directory.glob(pattern), key=lambda item: item.stat().st_mtime, reverse=True):
             try:
                 report = json.loads(path.read_text())

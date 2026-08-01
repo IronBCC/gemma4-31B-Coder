@@ -1,5 +1,6 @@
 import ast
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 
 from phaseD_sft import verify_gemma_format_loss as verifier
@@ -29,6 +30,14 @@ class _FixtureTokenizer:
 
 
 class VerifyGemmaFormatLossTests(unittest.TestCase):
+    def test_verifier_uses_shared_dataset_loader(self):
+        source = Path(__file__).parents[1] / "verify_gemma_format_loss.py"
+        text = source.read_text(encoding="utf-8")
+
+        self.assertIn("load_training_dataset", text)
+        self.assertIn("ds = load_training_dataset(args.data)", text)
+        self.assertNotIn("ds = load_from_disk(args.data)", text)
+
     def test_format_only_verifier_does_not_import_unsloth(self):
         source = Path(__file__).parents[1] / "verify_gemma_format_loss.py"
         tree = ast.parse(source.read_text(encoding="utf-8"))
@@ -54,6 +63,17 @@ class VerifyGemmaFormatLossTests(unittest.TestCase):
             [49, 4, 81, 1, 16],
         )
 
+    def test_report_writer_replaces_atomically(self):
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "report.json"
+            verifier.write_report_atomic(path, {"failure_count": 0})
+
+            self.assertEqual(
+                path.read_text(encoding="utf-8"),
+                '{\n  "failure_count": 0\n}\n',
+            )
+            self.assertEqual(list(Path(temporary).glob(".report.json.*")), [])
+
     def test_validate_one_exercises_render_and_label_helpers(self):
         counts, supervised, failures, _ = verifier.validate_one(
             _FixtureTokenizer(),
@@ -66,6 +86,31 @@ class VerifyGemmaFormatLossTests(unittest.TestCase):
 
         self.assertEqual(counts["assistant_messages"], 1)
         self.assertGreater(supervised, 0)
+        self.assertEqual(failures, [])
+
+    def test_validate_one_reports_and_honors_selective_assistant_loss(self):
+        messages = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "read", "loss": False},
+            {"role": "user", "content": "OBSERVATION:\nsource"},
+            {"role": "assistant", "content": "edit", "loss": True},
+        ]
+
+        counts, supervised, failures, _ = verifier.validate_one(
+            _FixtureTokenizer(),
+            18,
+            messages,
+        )
+        _, all_supervised, _, _ = verifier.validate_one(
+            _FixtureTokenizer(),
+            19,
+            [{key: value for key, value in message.items() if key != "loss"} for message in messages],
+        )
+
+        self.assertEqual(counts["assistant_messages_masked_by_loss_flag"], 1)
+        self.assertEqual(counts["assistant_messages_supervised"], 1)
+        self.assertGreater(supervised, 0)
+        self.assertLess(supervised, all_supervised)
         self.assertEqual(failures, [])
 
 

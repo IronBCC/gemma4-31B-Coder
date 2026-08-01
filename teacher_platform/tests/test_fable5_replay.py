@@ -281,6 +281,12 @@ def test_materialize_seed_admits_exact_commit_and_records_object_ids(tmp_path: P
     assert any("archive" in argv[4:] for argv, _env in fake.calls)
 
 
+def test_materialize_seed_canonicalizes_exact_python_alias(tmp_path: Path) -> None:
+    contract = _materialized(tmp_path, _archive(task_json=_task_json(lang="py")))
+
+    assert contract.language == "python"
+
+
 def test_git_boundary_disables_replacements_lazy_fetch_and_inherited_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1070,8 +1076,11 @@ def test_default_docker_client_environment_cannot_redirect_to_network_or_context
 
     env = replay._sanitized_docker_environment()
 
+    expected_path = (
+        f"/usr/local/bin:{os.defpath}" if sys.platform == "darwin" else os.defpath
+    )
     assert env == {
-        "PATH": os.defpath,
+        "PATH": expected_path,
         "HOME": "/var/empty",
         "XDG_CONFIG_HOME": "/var/empty",
         "DOCKER_CONFIG": "/var/empty/.docker",
@@ -1155,7 +1164,7 @@ class FakeDockerRuntime:
         if verb == "inspect":
             tmpfs = {
                 "/seed": "rw,nosuid,nodev,noexec,size=4294967296,uid=65534,gid=65534,mode=0755",
-                "/work": "rw,nosuid,nodev,size=4294967296,uid=65532,gid=65532,mode=0755",
+                "/work": "rw,nosuid,nodev,exec,size=4294967296,uid=65532,gid=65532,mode=0755",
                 "/scratch": "rw,nosuid,nodev,size=4294967296,uid=65532,gid=65532,mode=0700",
                 "/control": "rw,nosuid,nodev,noexec,size=1048576,uid=65533,gid=65533,mode=0755",
                 "/result": "rw,nosuid,nodev,noexec,size=1048576,uid=0,gid=0,mode=0755",
@@ -1189,7 +1198,11 @@ class FakeDockerRuntime:
                     "PidsLimit": 256,
                     "Tmpfs": tmpfs,
                     "Ulimits": [
-                        {"Name": "fsize", "Soft": 1_048_576, "Hard": 1_048_576}
+                        {
+                            "Name": "fsize",
+                            "Soft": 512 * 1024**2,
+                            "Hard": 512 * 1024**2,
+                        }
                     ],
                     "Binds": None,
                     "Mounts": [],
@@ -1303,6 +1316,7 @@ def _docker_execute(
     effective_timeout: int = 300,
     clock: object | None = None,
     protected_path: str = "test_src.py",
+    raw_output_callback: object | None = None,
 ):
     candidate = tmp_path / "candidate"
     candidate.mkdir()
@@ -1314,6 +1328,11 @@ def _docker_execute(
         runner=runtime,
         disk_free_bytes=runtime.disk_free_bytes,
         token_factory=lambda: "a" * 32,
+        **(
+            {"raw_output_callback": raw_output_callback}
+            if raw_output_callback is not None
+            else {}
+        ),
         **({"clock": clock} if clock is not None else {}),
     )
     return executor.execute(
@@ -1460,6 +1479,21 @@ def test_docker_executor_uses_the_complete_restricted_state_machine(tmp_path: Pa
     assert runtime.input_modes["verifier.sh"] == 0o555
     assert runtime.input_modes["wrapper.sh"] == 0o555
     assert runtime.stage_mode == 0o555
+
+
+def test_docker_executor_publishes_bounded_raw_output_after_cleanup(
+    tmp_path: Path,
+) -> None:
+    observed: list[tuple[object, bytes]] = []
+
+    evidence = _docker_execute(
+        FakeDockerRuntime(verifier_output=b"exact bounded output\n"),
+        tmp_path,
+        raw_output_callback=lambda run, output: observed.append((run, output)),
+    )
+
+    assert observed == [(evidence, b"exact bounded output\n")]
+    assert observed[0][0].cleanup_state == "verified_removed"
 
 
 def test_readonly_container_starts_before_seed_tmpfs_stream(tmp_path: Path) -> None:
@@ -1968,7 +2002,11 @@ def test_docker_executor_rejects_effective_container_policy_drift(tmp_path: Path
             "HostConfig",
             "Ulimits",
             [
-                {"Name": "fsize", "Soft": 1_048_576, "Hard": 1_048_576},
+                {
+                    "Name": "fsize",
+                    "Soft": 512 * 1024**2,
+                    "Hard": 512 * 1024**2,
+                },
                 {"Name": "nofile", "Soft": 1_024, "Hard": 1_024},
             ],
         ),
@@ -2218,6 +2256,22 @@ def test_docker_executor_enforces_the_40_gib_floor_before_create(tmp_path: Path)
     with pytest.raises(ReplayContractError, match="disk floor"):
         _docker_execute(runtime, tmp_path)
     assert not runtime.calls
+
+
+def test_sanitized_docker_environment_can_find_root_owned_docker_desktop_cli() -> None:
+    environment = replay._sanitized_docker_environment()
+
+    if replay.sys.platform == "darwin":
+        assert environment["PATH"].split(":")[0] == "/usr/local/bin"
+    else:
+        assert environment["PATH"] == replay.os.defpath
+
+
+def test_compiled_verifier_policy_allows_bounded_test_binaries() -> None:
+    policy = replay.DockerPolicy(images=(("python", IMAGE_DIGEST),))
+
+    assert "exec" in replay._tmpfs_policy(policy)["/work"].split(",")
+    assert policy.file_limit_blocks == 512 * 1024**2
 
 
 def test_docker_executor_enforces_disk_floor_after_exact_cleanup(tmp_path: Path) -> None:
@@ -3897,6 +3951,48 @@ def test_control_set_requires_failing_baseline_passing_reference_and_two_candida
         "candidate",
         "candidate",
     ]
+
+
+def test_control_set_binds_an_explicit_non_fable_dataset_revision(
+    tmp_path: Path,
+) -> None:
+    contract = _materialized(tmp_path)
+    plan = _plan_for(
+        contract,
+        _call("Write", {"file_path": "/testbed/src.py", "content": "new\n"}),
+    )
+    revision = "5fff3f3d7db1d8edd995eaab50758bb08dc7bf28"
+
+    class UniqueRunExecutor(FakeRestrictedExecutor):
+        def execute(self, **kwargs: object):
+            run = super().execute(**kwargs)
+            return dataclasses.replace(run, run_id=f"{self.counter:032x}")
+
+    controls = replay.run_control_set(
+        contract,
+        plan,
+        trajectory_id="1" * 64,
+        source_terminal_sha256="2" * 64,
+        executor=UniqueRunExecutor(
+            {"baseline": [1], "reference": [0], "candidate": [0, 0]}
+        ),
+        workspace=tmp_path / "controls",
+        reference_builder=lambda seed, destination: _copy_reference_fixture(
+            seed, destination
+        ),
+        dataset_revision=revision,
+    )
+
+    payload = replay.replay_evidence_payload(controls.candidate)
+    assert controls.candidate.dataset_revision == revision
+    assert (
+        replay.validate_replay_evidence_payload(
+            payload, expected_dataset_revision=revision
+        ).dataset_revision
+        == revision
+    )
+    with pytest.raises(ReplayContractError):
+        replay.validate_replay_evidence_payload(payload)
 
 
 def _copy_reference_fixture(contract: object, destination: Path) -> object:

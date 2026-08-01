@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 import hashlib
 import json
+import os
 import re
 from typing import Any
 
@@ -13,11 +15,116 @@ from typing import Any
 # while failing runaway loops fast enough for the harness recovery to act.
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_MAX_OBSERVATION_CHARS = 2_000
-NO_EDIT_PRESSURE_STEP = 25
-FORCE_DIFF_STEP = 37
-FORCE_SUBMIT_STEP = 38
+# The force-diff / force-submit floors are a LAST RESORT, not the step budget.  They used
+# to be hardcoded at 37/38, which made the agent config's `step_limit` decorative: every
+# run ended at ~39 assistant steps and most "empty patch" outcomes were this injection
+# rather than model behaviour.  They now sit just under the real step limit, so raising
+# `step_limit` actually buys the agent more steps.
+#
+#   MSWEA_STEP_LIMIT        real agent step limit (smoke_single.sh exports it from the config)
+#   MSWEA_FORCE_DIFF_STEP   explicit override; 0 disables the forced diff
+#   MSWEA_FORCE_SUBMIT_STEP explicit override; 0 disables the forced submit
+#   MSWEA_NO_EDIT_PRESSURE_STEP explicit override for the "stop reading" nudge
+DEFAULT_STEP_LIMIT = 120
+FORCE_DIFF_MARGIN = 3
+FORCE_SUBMIT_MARGIN = 2
+NO_EDIT_PRESSURE_FRACTION = 0.6
 REPEATED_READ_THRESHOLD = 5
 REPEATED_EDIT_THRESHOLD = 3
+REPEATED_FAILURE_THRESHOLD = 3
+RECOVERY_DIAGNOSTIC_COMMAND = (
+    "git diff --check; git status --short; "
+    "git diff -- . | sed -n '1,240p'"
+)
+_SOURCE_DIFF_EXCLUDES = (
+    "**/test/**",
+    "**/tests/**",
+    "**/testing/**",
+    "**/fixture/**",
+    "**/fixtures/**",
+    "**/benchmark/**",
+    "**/benchmarks/**",
+    "**/harness/**",
+    "**/harnesses/**",
+    "**/test_*.py",
+    "**/*_test.py",
+    "**/*_tests.py",
+    "**/conftest.py",
+    "**/eval.sh",
+    "**/evaluation.sh",
+    "**/noxfile.py",
+    "**/pyproject.toml",
+    "**/pytest.ini",
+    "**/run_tests.py",
+    "**/run_tests.sh",
+    "**/runtests.py",
+    "**/setup.cfg",
+    "**/setup.py",
+    "**/test-requirements.txt",
+    "**/tox.ini",
+)
+_SOURCE_DIFF_PATHS = " ".join(
+    f"':(exclude,glob){pattern}'" for pattern in _SOURCE_DIFF_EXCLUDES
+)
+SOURCE_ONLY_DIFF_COMMAND = (
+    f"git add -N -- . {_SOURCE_DIFF_PATHS} && "
+    f"git diff HEAD -- . {_SOURCE_DIFF_PATHS} > patch.txt && cat patch.txt"
+)
+RECOVERY_DIFF_COMMAND = SOURCE_ONLY_DIFF_COMMAND
+_RETURNCODE_RE = re.compile(r"<returncode>\s*(-?\d+)\s*</returncode>", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class CommandOutcome:
+    """One unambiguously paired bash command and its rendered observation."""
+
+    command: str
+    returncode: int | None
+    output_sha256: str
+
+
+def _env_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return None
+
+
+def step_limit() -> int:
+    """Real agent step limit for this run (env, else the historical default)."""
+
+    value = _env_int("MSWEA_STEP_LIMIT")
+    return value if value and value > 0 else DEFAULT_STEP_LIMIT
+
+
+def force_diff_step() -> int | None:
+    """Command count at which the harness injects `git diff`; None disables it."""
+
+    override = _env_int("MSWEA_FORCE_DIFF_STEP")
+    if override is not None:
+        return override if override > 0 else None
+    return max(4, step_limit() - FORCE_DIFF_MARGIN)
+
+
+def force_submit_step() -> int | None:
+    """Command count at which the harness injects submit; None disables it."""
+
+    override = _env_int("MSWEA_FORCE_SUBMIT_STEP")
+    if override is not None:
+        return override if override > 0 else None
+    return max(5, step_limit() - FORCE_SUBMIT_MARGIN)
+
+
+def no_edit_pressure_step() -> int:
+    """Command count at which the agent is told to stop reading and edit."""
+
+    override = _env_int("MSWEA_NO_EDIT_PRESSURE_STEP")
+    if override is not None and override > 0:
+        return override
+    return max(3, int(step_limit() * NO_EDIT_PRESSURE_FRACTION))
 DEFAULT_STOP_SEQUENCES = (
     "<|turn>",
     "<|turn>model",
@@ -118,7 +225,10 @@ def add_budget_pressure_messages(messages: list[dict[str, Any]]) -> list[dict[st
 
     kinds = [command_kind(command) for command in commands]
     pressure: list[str] = []
-    if len(commands) >= NO_EDIT_PRESSURE_STEP and "edit" not in kinds:
+    recovery_pressure = recovery_pressure_for_history(messages)
+    if recovery_pressure:
+        pressure.append(recovery_pressure)
+    if len(commands) >= no_edit_pressure_step() and "edit" not in kinds:
         pressure.append(
             "Budget warning: you have inspected enough. Stop reading, make the smallest source edit now, "
             "then run a focused check and submit a git diff."
@@ -143,26 +253,202 @@ def forced_command_for_history(messages: list[dict[str, Any]]) -> str | None:
     if not commands:
         return None
 
+    outcomes = extract_command_outcomes(messages)
+    failed_command, after_diagnostic = _repeated_failed_command(outcomes)
+    if failed_command and not after_diagnostic:
+        return RECOVERY_DIAGNOSTIC_COMMAND
+    if failed_command and after_diagnostic:
+        return None
+
+    if last_submission_was_rejected(messages):
+        return SOURCE_ONLY_DIFF_COMMAND
+
     last_forced = last_guarded_forced_command(messages)
     if last_forced and command_kind(last_forced) == "diff":
-        return "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt"
+        if last_tool_output_contains_diff(messages):
+            return "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt"
+        if last_forced.strip() == RECOVERY_DIFF_COMMAND:
+            return None
+        return RECOVERY_DIFF_COMMAND
 
     kinds = [command_kind(command) for command in commands]
     repeated_command, repeated_count = repeated_tail_command(commands)
     if repeated_command:
         repeated_kind = command_kind(repeated_command)
         if repeated_kind == "read" and repeated_count >= REPEATED_READ_THRESHOLD:
-            return "git diff -- . > patch.txt && cat patch.txt"
+            return SOURCE_ONLY_DIFF_COMMAND
         if repeated_kind == "edit" and repeated_count >= REPEATED_EDIT_THRESHOLD:
-            return "git diff -- . > patch.txt && cat patch.txt"
+            matching_outcomes = _tail_outcomes(outcomes, repeated_command, REPEATED_EDIT_THRESHOLD)
+            if not outcomes or (
+                len(matching_outcomes) == REPEATED_EDIT_THRESHOLD
+                and all(row.returncode == 0 for row in matching_outcomes)
+            ):
+                return SOURCE_ONLY_DIFF_COMMAND
         if repeated_kind == "diff" and repeated_count >= 2:
             return "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt"
 
-    if len(commands) >= FORCE_DIFF_STEP and "diff" not in kinds:
-        return "git diff -- . > patch.txt && cat patch.txt"
-    if len(commands) >= FORCE_SUBMIT_STEP and "diff" in kinds and "submit" not in kinds:
+    diff_step = force_diff_step()
+    submit_step = force_submit_step()
+    if diff_step is not None and len(commands) >= diff_step and "diff" not in kinds:
+        return SOURCE_ONLY_DIFF_COMMAND
+    if (
+        submit_step is not None
+        and len(commands) >= submit_step
+        and "diff" in kinds
+        and "submit" not in kinds
+    ):
         return "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt"
     return None
+
+
+def last_submission_was_rejected(messages: list[dict[str, Any]]) -> bool:
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            return False
+        content = str(message.get("content") or "")
+        raw = str(message.get("extra", {}).get("raw_output") or "")
+        if "SUBMISSION REJECTED:" in content or "SUBMISSION REJECTED:" in raw:
+            return True
+    return False
+
+
+def recovery_pressure_for_history(messages: list[dict[str, Any]]) -> str | None:
+    """Describe how to recover after an exact command fails three times."""
+
+    failed_command, after_diagnostic = _repeated_failed_command(
+        extract_command_outcomes(messages)
+    )
+    if not failed_command:
+        return None
+    if after_diagnostic:
+        return (
+            f"Diagnostic complete. The failed command was `{failed_command}`. "
+            "Do not run this command again unchanged; inspect its error and the current diff, "
+            "then repair or revert the damaged hunk before running a focused behavior check."
+        )
+    return (
+        f"Recovery required: `{failed_command}` failed repeatedly. "
+        "Do not run this command again unchanged. Inspect the failing output and current diff, "
+        "then repair or revert the damaged hunk."
+    )
+
+
+def extract_command_outcomes(
+    messages: list[dict[str, Any]],
+) -> list[CommandOutcome]:
+    """Pair only an unambiguous assistant bash call with its adjacent observation."""
+
+    outcomes: list[CommandOutcome] = []
+    for index, message in enumerate(messages[:-1]):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        call = _single_bash_call(message)
+        if call is None:
+            continue
+        command, call_id = call
+        observation = messages[index + 1]
+        if not _is_adjacent_command_observation(observation, call_id):
+            continue
+        content = str(observation.get("content") or "")
+        match = _RETURNCODE_RE.search(content)
+        returncode = int(match.group(1)) if match else None
+        raw_output = observation.get("extra", {}).get("raw_output")
+        hash_input = raw_output if isinstance(raw_output, str) else content
+        outcomes.append(CommandOutcome(
+            command=command,
+            returncode=returncode,
+            output_sha256=hashlib.sha256(
+                hash_input.encode("utf-8", "replace")
+            ).hexdigest(),
+        ))
+    return outcomes
+
+
+def _single_bash_call(message: dict[str, Any]) -> tuple[str, str | None] | None:
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list) and tool_calls:
+        if len(tool_calls) != 1 or not isinstance(tool_calls[0], dict):
+            return None
+        tool_call = tool_calls[0]
+        function = tool_call.get("function") or {}
+        if not isinstance(function, dict) or function.get("name") != "bash":
+            return None
+        command = _command_from_tool_arguments(function.get("arguments"))
+        if command is None:
+            return None
+        call_id = tool_call.get("id")
+        return command, call_id if isinstance(call_id, str) else None
+
+    actions = message.get("extra", {}).get("actions", []) or []
+    bash_actions = [
+        action for action in actions
+        if isinstance(action, dict) and isinstance(action.get("command"), str)
+    ]
+    if len(bash_actions) != 1:
+        return None
+    action = bash_actions[0]
+    call_id = action.get("tool_call_id")
+    return action["command"], call_id if isinstance(call_id, str) else None
+
+
+def _is_adjacent_command_observation(
+    message: Any,
+    call_id: str | None,
+) -> bool:
+    if not isinstance(message, dict):
+        return False
+    content = str(message.get("content") or "")
+    role = str(message.get("role") or "").lower()
+    if role != "tool" and not (
+        role == "user" and _RETURNCODE_RE.search(content)
+    ):
+        return False
+    observation_call_id = message.get("tool_call_id")
+    if (
+        call_id is not None
+        and observation_call_id is not None
+        and observation_call_id != call_id
+    ):
+        return False
+    return True
+
+
+def _tail_outcomes(
+    outcomes: list[CommandOutcome],
+    command: str,
+    count: int,
+) -> list[CommandOutcome]:
+    normalized = command.strip()
+    if len(outcomes) < count:
+        return []
+    tail = outcomes[-count:]
+    if any(row.command.strip() != normalized for row in tail):
+        return []
+    return tail
+
+
+def _repeated_failed_command(
+    outcomes: list[CommandOutcome],
+) -> tuple[str | None, bool]:
+    if not outcomes:
+        return None, False
+    after_diagnostic = outcomes[-1].command.strip() == RECOVERY_DIAGNOSTIC_COMMAND
+    candidates = outcomes[:-1] if after_diagnostic else outcomes
+    if len(candidates) < REPEATED_FAILURE_THRESHOLD:
+        return None, after_diagnostic
+    tail = candidates[-REPEATED_FAILURE_THRESHOLD:]
+    normalized = tail[-1].command.strip()
+    if (
+        any(row.returncode in (None, 0) for row in tail)
+    ):
+        return None, after_diagnostic
+    same_command = all(row.command.strip() == normalized for row in tail)
+    same_failure = len({row.output_sha256 for row in tail}) == 1
+    if not same_command and not same_failure:
+        return None, after_diagnostic
+    return normalized, after_diagnostic
 
 
 def last_guarded_forced_command(messages: list[dict[str, Any]]) -> str | None:
@@ -173,7 +459,8 @@ def last_guarded_forced_command(messages: list[dict[str, Any]]) -> str | None:
         if not isinstance(response, dict):
             continue
         command = response.get("guarded_forced_command")
-        return command if isinstance(command, str) else None
+        if isinstance(command, str):
+            return command
     return None
 
 

@@ -17,7 +17,8 @@ _COMMAND_EDIT_RE = re.compile(
     r"python3? - <<|str_replace|open\(.+[\"']w[\"']"
 )
 _COMMAND_READ_RE = re.compile(
-    r"^\s*(cat |find |grep |rg |sed -n|head |tail |ls |pwd|git (status|diff|show|log))"
+    r"^\s*(# OPEN_SWE_EDITOR_VIEW\b|cat |find |grep |rg |sed -n|head |tail |ls |pwd|"
+    r"git (status|diff|show|log))"
 )
 
 

@@ -2411,6 +2411,68 @@ def test_replay_gate_requires_exact_noncontrol_hash_bound_evidence(
     assert rejected.manifest["replay_drop"] == 1
 
 
+def test_replay_gate_preserves_seed_tree_bindings_through_staging(
+    tmp_path: Path,
+) -> None:
+    row, verify = pipeline_row("py-tree-binding")
+    source_tree_sha = "a" * 40
+    task_tree_sha = "b" * 40
+    base_config = fixture_build_config(
+        tmp_path / "dataset",
+        [row],
+        {"py-tree-binding": verify},
+        skip_replay=False,
+    )
+
+    def seed_contract(task: str) -> SeedContract:
+        return SeedContract(
+            task=task,
+            protected_paths=("tests/test_contract.py",),
+            verify_cmd=verify,
+            fixture_sha256=hashlib.sha256(task.encode()).hexdigest(),
+            source_tree_sha=source_tree_sha,
+            task_tree_sha=task_tree_sha,
+        )
+
+    def replay_lookup(candidate: ReplayCandidate) -> ReplayEvidence:
+        assert candidate.seed.source_tree_sha == source_tree_sha
+        assert candidate.seed.task_tree_sha == task_tree_sha
+        return ReplayEvidence(
+            trajectory_id=candidate.trajectory_id,
+            source_terminal_sha256=candidate.source_terminal_sha256,
+            candidate_content_sha256=candidate.content_sha256,
+            fixture_sha256=candidate.seed.fixture_sha256,
+            resolved=True,
+            schema_version=2,
+            evidence_sha256="1" * 64,
+            run_contract_sha256="2" * 64,
+            task=candidate.seed.task,
+            language=candidate.language or "",
+            dataset_revision=DATASET_REVISION,
+            source_commit_sha=candidate.seed.source_commit_sha,
+            source_tree_sha=source_tree_sha,
+            task_tree_sha=task_tree_sha,
+            operation_sha256="5" * 64,
+            candidate_tree_sha256="6" * 64,
+            candidate_diff_sha256="7" * 64,
+            verifier_sha256=hashlib.sha256(verify.encode()).hexdigest(),
+            protected_paths=tuple(sorted(candidate.seed.protected_paths)),
+            policy_output_limit_bytes=4 * 1024**2,
+            strict_run_count=2,
+        )
+
+    result = build_fable5_pilot(
+        [row],
+        dataclasses.replace(
+            base_config,
+            seed_contract=seed_contract,
+            replay_lookup=replay_lookup,
+        ),
+    )
+
+    assert len(result.rows) == 1
+
+
 @pytest.mark.parametrize("resolved", ["false", 1, 0, None])
 def test_replay_gate_rejects_nonboolean_resolved_identity(
     tmp_path: Path, resolved: object

@@ -14,11 +14,98 @@ frozen base — never merge (would destroy the frozen-base guarantee).
 from __future__ import annotations
 
 import argparse
+import gc
+import hashlib
 import json
 import os
+from pathlib import Path
 import re
 import sys
 import time
+
+
+def assert_training_dataset_admitted(path: str | os.PathLike[str]) -> None:
+    """Fail closed for teacher datasets carrying the schema-v2 admission manifest."""
+
+    dataset_path = Path(path)
+    manifest_path = dataset_path / "manifest.json"
+    if not dataset_path.is_dir() or not manifest_path.is_file():
+        return
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("training dataset manifest is unreadable") from exc
+    if manifest.get("schema_version") != 2:
+        return
+    train_jsonl = dataset_path / "train.jsonl"
+    digest = hashlib.sha256(train_jsonl.read_bytes()).hexdigest()
+    if manifest.get("dataset_variant") == "teacher_train_mix_v2p11_fable_reasoned_v1":
+        gate = manifest.get("format_loss_gate")
+        report = gate.get("report") if isinstance(gate, dict) else None
+        report_path = Path(str(report.get("path", ""))) if isinstance(report, dict) else None
+        structural = manifest.get("structural_gates")
+        if (
+            manifest.get("complete") is not True
+            or manifest.get("all_training_gates_complete") is not True
+            or manifest.get("training_admitted") != manifest.get("rendered")
+            or manifest.get("evaluation_overlap") != 0
+            or manifest.get("fable_rows") != 92
+            or manifest.get("canonical_bash_tool_turns") != 517
+            or manifest.get("reasoned_tool_turns") != 468
+            or structural != {
+                "all_fable_supervised_tool_calls_are_canonical_bash": True,
+                "all_messages_have_boolean_loss": True,
+                "evaluation_overlap": 0,
+                "reasoned_tool_turns": 468,
+            }
+            or not isinstance(gate, dict)
+            or gate.get("status") != "passed_full_dataset_verification"
+            or gate.get("failure_count") != 0
+            or gate.get("samples") != manifest.get("rendered")
+            or report_path is None
+            or not report_path.is_file()
+            or report.get("sha256") != hashlib.sha256(report_path.read_bytes()).hexdigest()
+            or manifest.get("train_jsonl_sha256") != digest
+        ):
+            raise ValueError("teacher dataset admission or format/loss gate is incomplete")
+        return
+    gate = manifest.get("standard_native_format_loss_gate")
+    if (
+        manifest.get("all_training_gates_complete") is not True
+        or manifest.get("training_admitted") != manifest.get("rendered")
+        or not isinstance(gate, dict)
+        or gate.get("status") != "passed"
+        or gate.get("failure_count") != 0
+        or manifest.get("train_jsonl_sha256") != digest
+    ):
+        raise ValueError("teacher dataset admission or format/loss gate is incomplete")
+
+
+def load_training_dataset(path: str | os.PathLike[str]):
+    """Load a Hugging Face dataset directory or a JSONL dataset file."""
+    from datasets import Dataset, load_from_disk
+
+    dataset_path = Path(path)
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"dataset path does not exist: {dataset_path}")
+    if dataset_path.is_dir():
+        manifest_path = dataset_path / "manifest.json"
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError("training dataset manifest is unreadable") from exc
+            if manifest.get("schema_version") == 2:
+                train_jsonl = dataset_path / "train.jsonl"
+                if not train_jsonl.is_file():
+                    raise ValueError("schema-v2 teacher dataset is missing train.jsonl")
+                return Dataset.from_json(str(train_jsonl))
+        return load_from_disk(str(dataset_path))
+    if dataset_path.is_file():
+        return Dataset.from_json(str(dataset_path))
+    raise ValueError(
+        f"dataset path must be a Hugging Face dataset directory or JSONL file: {dataset_path}"
+    )
 
 
 def rendered_assistant_turn_spans(tokenizer, messages: list[dict], text: str) -> tuple[list[tuple[int, int]], bool]:
@@ -64,6 +151,28 @@ def rendered_assistant_turn_spans(tokenizer, messages: list[dict], text: str) ->
             end = pos + len(content)
         spans.append((start, end))
     return spans, True
+
+
+def supervised_assistant_turn_spans(
+    tokenizer, messages: list[dict], text: str
+) -> tuple[list[tuple[int, int]], bool]:
+    """Return assistant spans whose message-level ``loss`` flag is not false.
+
+    Existing datasets do not carry the flag and therefore retain the historical
+    all-assistant-turn objective. Patch-decision datasets can mark earlier
+    assistant actions ``loss=False`` while preserving them as conditioning.
+    """
+    spans, fallback_used = rendered_assistant_turn_spans(tokenizer, messages, text)
+    assistant_messages = [message for message in messages if message.get("role") == "assistant"]
+    if len(spans) != len(assistant_messages):
+        raise ValueError(
+            f"assistant span/message mismatch: spans={len(spans)} messages={len(assistant_messages)}"
+        )
+    return [
+        span
+        for message, span in zip(assistant_messages, spans)
+        if message.get("loss", True) is not False
+    ], fallback_used
 
 
 def label_tokens_for_spans(input_ids: list[int], offsets: list[tuple[int, int]], spans: list[tuple[int, int]]) -> tuple[list[int], int]:
@@ -124,6 +233,212 @@ def configure_attention_implementation(model, implementation: str | None) -> int
             if child is not None:
                 config_stack.append(child)
     return configured
+
+
+def ignore_data_skip_for_run(*, resume: bool) -> bool:
+    """Preserve exact dataset position when restoring a Trainer checkpoint."""
+
+    return not resume
+
+
+def should_force_checkpoint(*, global_step: int, save_steps: int) -> bool:
+    """Honor the requested absolute cadence even when checkpoint state restores an older one."""
+
+    return global_step > 0 and save_steps > 0 and global_step % save_steps == 0
+
+
+def resolve_gradient_checkpointing(mode: str) -> str | bool:
+    """Map the CLI policy to the Unsloth PEFT loader contract."""
+
+    if mode in {"unsloth", "bounded_unsloth", "hybrid"}:
+        return "unsloth"
+    if mode == "standard":
+        return True
+    raise ValueError(f"unsupported gradient checkpointing mode: {mode}")
+
+
+def configure_hybrid_gradient_checkpointing(
+    model,
+    checkpoint_module,
+    *,
+    standard_stride: int = 10,
+) -> dict[str, int]:
+    """Use native reentrant checkpoints for a bounded subset of text layers."""
+
+    from functools import partial
+
+    if standard_stride < 2:
+        raise ValueError("hybrid checkpoint standard stride must be at least 2")
+    pristine_checkpoint = getattr(
+        checkpoint_module,
+        "_unsloth_pristine_checkpoint",
+        None,
+    )
+    if not callable(pristine_checkpoint):
+        raise RuntimeError("pristine PyTorch checkpoint function is unavailable")
+
+    layers = [
+        module
+        for module in model.modules()
+        if type(module).__name__ == "Gemma4TextDecoderLayer"
+        and getattr(module, "gradient_checkpointing", False)
+        and callable(getattr(module, "_gradient_checkpointing_func", None))
+    ]
+    if not layers:
+        raise RuntimeError("no checkpoint-enabled Gemma4 text layers found")
+
+    standard_layers = 0
+    for index, layer in enumerate(layers):
+        if index % standard_stride == 0:
+            layer._gradient_checkpointing_func = partial(
+                pristine_checkpoint,
+                use_reentrant=True,
+            )
+            standard_layers += 1
+    return {
+        "text_layers": len(layers),
+        "offloaded_layers": len(layers) - standard_layers,
+        "standard_layers": standard_layers,
+        "standard_stride": standard_stride,
+    }
+
+
+def recycle_bounded_unsloth_host_buffers(
+    torch_module,
+    checkpointing_module,
+) -> dict[str, int | bool]:
+    """Replace Unsloth's retained pinned activation pool with bounded pageable buffers."""
+
+    expected_count = int(
+        getattr(checkpointing_module, "INITIAL_CPU_BUFFER_COUNT", -1)
+    )
+    initial_elements = int(
+        getattr(checkpointing_module, "INITIAL_CPU_BUFFER_SIZE", -1)
+    )
+    buffers = getattr(checkpointing_module, "CPU_BUFFERS", None)
+    if expected_count != 200 or initial_elements != 128 * 1024:
+        raise RuntimeError(
+            "unexpected Unsloth host-buffer constants: "
+            f"count={expected_count} elements={initial_elements}"
+        )
+    if not isinstance(buffers, list) or len(buffers) != expected_count:
+        count = None if buffers is None else len(buffers)
+        raise RuntimeError(
+            f"unexpected Unsloth CPU buffer pool: count={count} expected={expected_count}"
+        )
+    if getattr(checkpointing_module, "BACKWARD_PASS", None) is not True:
+        raise RuntimeError(
+            "refusing to recycle Unsloth host buffers outside a completed backward"
+        )
+    cpu_index = getattr(checkpointing_module, "CPU_INDEX", None)
+    if not isinstance(cpu_index, int) or not 0 <= cpu_index <= expected_count:
+        raise RuntimeError(
+            f"unexpected Unsloth CPU buffer index: {cpu_index!r}"
+        )
+    cuda = getattr(torch_module, "cuda", None)
+    cuda_synchronize = getattr(cuda, "synchronize", None)
+    if (
+        not callable(getattr(cuda, "is_available", None))
+        or not cuda.is_available()
+        or not callable(cuda_synchronize)
+    ):
+        raise RuntimeError("CUDA synchronization is unavailable")
+    cuda_synchronize()
+    try:
+        dtypes = {buffer.dtype for buffer in buffers}
+        retained_bytes = sum(
+            int(buffer.untyped_storage().nbytes()) for buffer in buffers
+        )
+        pinned_buffers = sum(bool(buffer.is_pinned()) for buffer in buffers)
+    except (AttributeError, TypeError) as exc:
+        raise RuntimeError("Unsloth CPU buffer pool contains invalid entries") from exc
+    if len(dtypes) != 1:
+        raise RuntimeError(f"Unsloth CPU buffer dtypes diverged: {dtypes!r}")
+    host_empty_cache = getattr(
+        getattr(torch_module, "_C", None),
+        "_host_emptyCache",
+        None,
+    )
+    if not callable(host_empty_cache):
+        raise RuntimeError("PyTorch host allocator cache drain is unavailable")
+
+    dtype = next(iter(dtypes))
+    replacement = [
+        torch_module.empty(initial_elements, dtype=dtype, device="cpu")
+        for _ in range(expected_count)
+    ]
+    if any(bool(buffer.is_pinned()) for buffer in replacement):
+        raise RuntimeError("bounded Unsloth replacement buffer remained pinned")
+    checkpointing_module.CPU_BUFFERS = replacement
+    del buffers
+    gc.collect()
+    host_empty_cache()
+    return {
+        "buffer_count": expected_count,
+        "initial_buffer_elements": initial_elements,
+        "retained_bytes": retained_bytes,
+        "pinned_buffers": pinned_buffers,
+        "pageable_buffers": len(replacement),
+        "cuda_synchronized": True,
+        "host_cache_drained": True,
+    }
+
+
+def release_cuda_cache(torch_module) -> dict[str, int] | None:
+    """Release only unoccupied CUDA allocator blocks and report the reservation delta."""
+
+    cuda = torch_module.cuda
+    if not cuda.is_available():
+        return None
+    allocated = int(cuda.memory_allocated())
+    reserved_before = int(cuda.memory_reserved())
+    cuda.empty_cache()
+    reserved_after = int(cuda.memory_reserved())
+    return {
+        "allocated_bytes": allocated,
+        "reserved_before_bytes": reserved_before,
+        "reserved_after_bytes": reserved_after,
+    }
+
+
+def configure_inductor_compile_threads(
+    torch_module,
+    unsloth_compile_common,
+    requested_threads: int | str | None = None,
+) -> dict[str, int]:
+    """Apply the requested bounded Inductor worker count after Unsloth patches."""
+
+    try:
+        requested_threads = int(
+            requested_threads
+            if requested_threads is not None
+            else os.environ.get("TORCHINDUCTOR_COMPILE_THREADS", "1")
+        )
+    except ValueError as exc:
+        raise ValueError("TORCHINDUCTOR_COMPILE_THREADS must be an integer") from exc
+    if not 1 <= requested_threads <= 32:
+        raise ValueError("TORCHINDUCTOR_COMPILE_THREADS must be between 1 and 32")
+    os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = str(requested_threads)
+    torch_module._inductor.config.compile_threads = requested_threads
+
+    def configured_compile_threads() -> int:
+        return requested_threads
+
+    unsloth_compile_common.determine_compile_threads = configured_compile_threads
+    unsloth_compile_common.torch_compile_options["compile_threads"] = requested_threads
+
+    generated_options = unsloth_compile_common.get_torch_compile_options()
+    torch_threads = int(torch_module._inductor.config.compile_threads)
+    unsloth_threads = int(generated_options.get("compile_threads", -1))
+    if torch_threads != requested_threads or unsloth_threads != requested_threads:
+        raise RuntimeError(
+            "failed to enforce bounded Inductor compilation: "
+            f"requested={requested_threads} torch={torch_threads} unsloth={unsloth_threads}"
+        )
+    return {
+        "torch_inductor_compile_threads": torch_threads,
+        "unsloth_compile_threads": unsloth_threads,
+    }
 
 
 def install_hf_flex_routing_debug() -> None:
@@ -218,6 +533,12 @@ def main() -> int:
     )
     ap.add_argument("--init-adapter", default=None,
                     help="initialize from an existing adapter dir, but start a fresh optimizer/scheduler")
+    ap.add_argument(
+        "--gradient-checkpointing",
+        choices=("unsloth", "bounded_unsloth", "standard", "hybrid"),
+        default="unsloth",
+        help="activation checkpointing policy; bounded_unsloth recycles pageable host buffers after each backward",
+    )
     ap.add_argument("--full-transcript-loss", action="store_true",
                     help="train on all rendered tokens; default is assistant-message tokens only")
     ap.add_argument("--assistant-content-only-loss", action="store_true",
@@ -225,12 +546,39 @@ def main() -> int:
     ap.add_argument("--resume", action="store_true",
                     help="resume from the latest checkpoint in --out (reboot-safe)")
     a = ap.parse_args()
+    assert_training_dataset_admitted(a.data)
 
+    requested_compile_threads = os.environ.get("TORCHINDUCTOR_COMPILE_THREADS", "1")
     from unsloth import FastLanguageModel
     import torch
-    from datasets import load_from_disk
+    from unsloth_zoo.temporary_patches import common as unsloth_compile_common
     from transformers import Trainer, TrainerCallback
     from trl import SFTConfig, SFTTrainer
+
+    unsloth_compile_disabled = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1"
+    unsloth_double_buffer_disabled = (
+        os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER", "0") == "1"
+    )
+    torchdynamo_disabled = os.environ.get("TORCHDYNAMO_DISABLE", "0") == "1"
+    torch_compile_disabled = os.environ.get("TORCH_COMPILE_DISABLE", "0") == "1"
+    if unsloth_compile_disabled != bool(unsloth_compile_common.UNSLOTH_COMPILE_DISABLE):
+        raise RuntimeError(
+            "UNSLOTH_COMPILE_DISABLE was not applied before importing Unsloth"
+        )
+    compile_policy = configure_inductor_compile_threads(
+        torch,
+        unsloth_compile_common,
+        requested_compile_threads,
+    )
+    print(
+        "[progress] event=compile_policy "
+        f"torch_inductor_compile_threads={compile_policy['torch_inductor_compile_threads']} "
+        f"unsloth_compile_threads={compile_policy['unsloth_compile_threads']} "
+        f"unsloth_compile_disabled={int(unsloth_compile_disabled)} "
+        f"torchdynamo_disabled={int(torchdynamo_disabled)} "
+        f"torch_compile_disabled={int(torch_compile_disabled)}",
+        flush=True,
+    )
 
     if a.resume and not a.init_adapter:
         checkpoints_dir = a.out
@@ -244,6 +592,7 @@ def main() -> int:
             print(f"[resume] no checkpoint found, initializing from final adapter in {a.out}", flush=True)
 
     model_name = a.init_adapter or a.base
+    gradient_checkpointing = resolve_gradient_checkpointing(a.gradient_checkpointing)
     print(f"[load] model={model_name} base={a.base} 4bit={a.load_4bit} max_seq={a.max_seq}", flush=True)
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_name,
@@ -269,8 +618,65 @@ def main() -> int:
             bias="none",
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                             "gate_proj", "up_proj", "down_proj"],
-            use_gradient_checkpointing="unsloth",   # Unsloth patched (use_cache=False handled)
+            use_gradient_checkpointing=gradient_checkpointing,
             random_state=0,
+        )
+
+    hybrid_checkpoint_policy = None
+    bounded_unsloth_host_buffer_policy = None
+    unsloth_gradient_checkpointing = None
+    if a.gradient_checkpointing == "hybrid":
+        import torch.utils.checkpoint as checkpoint_module
+
+        hybrid_checkpoint_policy = configure_hybrid_gradient_checkpointing(
+            model,
+            checkpoint_module,
+            standard_stride=10,
+        )
+        if hybrid_checkpoint_policy != {
+            "text_layers": 60,
+            "offloaded_layers": 54,
+            "standard_layers": 6,
+            "standard_stride": 10,
+        }:
+            raise RuntimeError(
+                f"unexpected Gemma4 hybrid checkpoint policy: {hybrid_checkpoint_policy}"
+            )
+        print(
+            "[progress] event=gradient_checkpoint_policy "
+            f"mode=hybrid text_layers={hybrid_checkpoint_policy['text_layers']} "
+            f"offloaded_layers={hybrid_checkpoint_policy['offloaded_layers']} "
+            f"standard_layers={hybrid_checkpoint_policy['standard_layers']} "
+            f"standard_stride={hybrid_checkpoint_policy['standard_stride']}",
+            flush=True,
+        )
+    elif a.gradient_checkpointing == "bounded_unsloth":
+        if not unsloth_double_buffer_disabled:
+            raise RuntimeError(
+                "bounded Unsloth checkpointing requires "
+                "UNSLOTH_DISABLE_DOUBLE_BUFFER=1 before importing Unsloth"
+            )
+        import unsloth_zoo.gradient_checkpointing as unsloth_gradient_checkpointing
+
+        initial_recycle = recycle_bounded_unsloth_host_buffers(
+            torch,
+            unsloth_gradient_checkpointing,
+        )
+        bounded_unsloth_host_buffer_policy = {
+            "buffer_count": initial_recycle["buffer_count"],
+            "initial_buffer_elements": initial_recycle["initial_buffer_elements"],
+            "pageable_buffers": initial_recycle["pageable_buffers"],
+            "recycle_after_backward": True,
+            "cuda_synchronized": initial_recycle["cuda_synchronized"],
+            "host_cache_drained": initial_recycle["host_cache_drained"],
+        }
+        print(
+            "[progress] event=unsloth_host_buffer_recycle phase=initial "
+            f"retained_bytes={initial_recycle['retained_bytes']} "
+            f"pinned_buffers={initial_recycle['pinned_buffers']} "
+            f"pageable_buffers={initial_recycle['pageable_buffers']} "
+            "cuda_synchronized=1 host_cache_drained=1",
+            flush=True,
         )
 
     attention_configs_changed = configure_attention_implementation(model, a.attn_implementation)
@@ -301,8 +707,15 @@ def main() -> int:
               f"configs_changed={attention_configs_changed}", flush=True)
     print(f"[progress] event=model_ready epoch_seconds={int(time.time())}", flush=True)
 
-    ds = load_from_disk(a.data)
+    ds = load_training_dataset(a.data)
     print(f"[data] {len(ds)} sft examples", flush=True)
+    selective_assistant_loss = any(
+        message.get("role") == "assistant" and "loss" in message
+        for example in ds
+        for message in example.get("messages", [])
+    )
+    if selective_assistant_loss:
+        print("[data] selective assistant-turn loss flags detected", flush=True)
     os.makedirs(a.out, exist_ok=True)
     with open(os.path.join(a.out, "run_manifest.json"), "w", encoding="utf-8") as fh:
         json.dump(
@@ -326,12 +739,20 @@ def main() -> int:
                 "save_steps": a.save_steps,
                 "save_total_limit": a.save_total_limit,
                 "load_4bit": a.load_4bit,
+                "gradient_checkpointing": a.gradient_checkpointing,
+                "hybrid_checkpoint_policy": hybrid_checkpoint_policy,
+                "bounded_unsloth_host_buffer_policy": bounded_unsloth_host_buffer_policy,
                 "attn_implementation": a.attn_implementation,
                 "attention_configs_changed": attention_configs_changed,
                 "sm120_attn": a.sm120_attn,
                 "debug_hf_flex_routing": a.debug_hf_flex_routing,
                 "full_transcript_loss": a.full_transcript_loss,
                 "assistant_content_only_loss": a.assistant_content_only_loss,
+                "selective_assistant_loss": selective_assistant_loss,
+                "unsloth_compile_disabled": unsloth_compile_disabled,
+                "unsloth_double_buffer_disabled": unsloth_double_buffer_disabled,
+                "torchdynamo_disabled": torchdynamo_disabled,
+                "torch_compile_disabled": torch_compile_disabled,
                 "resume": a.resume,
             },
             fh,
@@ -380,7 +801,7 @@ def main() -> int:
             # Label the exact assistant turn as rendered by Gemma's chat template,
             # including <|turn>model, tool-call JSON, and turn/response delimiters.
             # System/user/tool observations remain conditioning only.
-            spans, _fallback_used = rendered_assistant_turn_spans(tokenizer, messages, text)
+            spans, _fallback_used = supervised_assistant_turn_spans(tokenizer, messages, text)
 
         labels, supervised = label_tokens_for_spans(input_ids, offsets, spans)
         return {
@@ -401,11 +822,11 @@ def main() -> int:
         ds = ds.map(
             assistant_tokenize,
             remove_columns=ds.column_names,
-            num_proc=4,
+            num_proc=1,
             desc="assistant-tokenize",
         )
         before = len(ds)
-        ds = ds.filter(lambda ex: ex["supervised_tokens"] > 0, num_proc=4)
+        ds = ds.filter(lambda ex: ex["supervised_tokens"] > 0, num_proc=1)
         print(f"[data] supervised examples {len(ds)}/{before}", flush=True)
         ds = ds.remove_columns(["supervised_tokens"])
 
@@ -427,9 +848,9 @@ def main() -> int:
         optim="adamw_8bit",
         weight_decay=0.0,
         seed=0,
-        dataset_num_proc=4,
+        dataset_num_proc=1,
         max_seq_length=a.max_seq,
-        ignore_data_skip=True,
+        ignore_data_skip=ignore_data_skip_for_run(resume=a.resume),
         report_to="none",
     )
 
@@ -469,6 +890,29 @@ def main() -> int:
 
         def on_substep_end(self, args, state, control, **kwargs):
             self.completed_microsteps += 1
+            if unsloth_gradient_checkpointing is not None:
+                recycle = recycle_bounded_unsloth_host_buffers(
+                    torch,
+                    unsloth_gradient_checkpointing,
+                )
+                print(
+                    "[progress] event=unsloth_host_buffer_recycle "
+                    "phase=gradient_microstep "
+                    f"retained_bytes={recycle['retained_bytes']} "
+                    f"pinned_buffers={recycle['pinned_buffers']} "
+                    f"pageable_buffers={recycle['pageable_buffers']} "
+                    "cuda_synchronized=1 host_cache_drained=1",
+                    flush=True,
+                )
+            cache = release_cuda_cache(torch)
+            if cache is not None:
+                print(
+                    "[progress] event=cuda_cache_release "
+                    f"allocated_bytes={cache['allocated_bytes']} "
+                    f"reserved_before_bytes={cache['reserved_before_bytes']} "
+                    f"reserved_after_bytes={cache['reserved_after_bytes']}",
+                    flush=True,
+                )
             self._report("gradient_microstep", state)
             return control
 
@@ -477,6 +921,31 @@ def main() -> int:
             now = time.monotonic()
             step_wall_seconds = 0.0 if self.last_optimizer_step_at is None else now - self.last_optimizer_step_at
             self.last_optimizer_step_at = now
+            if should_force_checkpoint(global_step=int(state.global_step), save_steps=int(a.save_steps)):
+                control.should_save = True
+            if unsloth_gradient_checkpointing is not None:
+                recycle = recycle_bounded_unsloth_host_buffers(
+                    torch,
+                    unsloth_gradient_checkpointing,
+                )
+                print(
+                    "[progress] event=unsloth_host_buffer_recycle "
+                    "phase=optimizer_step "
+                    f"retained_bytes={recycle['retained_bytes']} "
+                    f"pinned_buffers={recycle['pinned_buffers']} "
+                    f"pageable_buffers={recycle['pageable_buffers']} "
+                    "cuda_synchronized=1 host_cache_drained=1",
+                    flush=True,
+                )
+            cache = release_cuda_cache(torch)
+            if cache is not None:
+                print(
+                    "[progress] event=cuda_cache_release "
+                    f"allocated_bytes={cache['allocated_bytes']} "
+                    f"reserved_before_bytes={cache['reserved_before_bytes']} "
+                    f"reserved_after_bytes={cache['reserved_after_bytes']}",
+                    flush=True,
+                )
             self._report("optimizer_step", state)
             print(
                 f"[progress] event=optimizer_step_timing optimizer_step={state.global_step}/{state.max_steps} "

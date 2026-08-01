@@ -24,6 +24,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -199,7 +200,7 @@ class DockerPolicy:
     memory_bytes: int = 4 * 1024**3
     pids_limit: int = 256
     tmpfs_bytes: int = 4 * 1024**3
-    file_limit_blocks: int = 1_048_576
+    file_limit_blocks: int = 512 * 1024**2
     output_limit_bytes: int = 4 * 1024**2
     result_limit_bytes: int = 16 * 1024
     disk_floor_bytes: int = 40 * 1024**3
@@ -830,7 +831,7 @@ def materialize_seed(
         raise ReplayContractError("pinned task.json must be an object")
     if payload.get("id") != task:
         raise ReplayContractError("pinned task.json task ID mismatch")
-    language = payload.get("lang")
+    language = {"py": "python"}.get(payload.get("lang"), payload.get("lang"))
     if language not in {"python", "rust", "cpp"}:
         raise ReplayContractError("pinned task.json has unsupported lang")
     verify_cmd = payload.get("verify_cmd")
@@ -1577,8 +1578,13 @@ def preflight_reference_patch(
 
 
 def _sanitized_docker_environment() -> dict[str, str]:
+    path = os.defpath
+    if sys.platform == "darwin":
+        # Docker Desktop installs a root-owned CLI shim here; os.defpath on
+        # macOS omits it, unlike the production Linux host's /usr/bin/docker.
+        path = f"/usr/local/bin:{path}"
     return {
-        "PATH": os.defpath,
+        "PATH": path,
         # Docker treats HOME=/dev/null as a directory and writes a warning to
         # its merged stdout/stderr stream, corrupting machine-readable output.
         # /var is root-owned on the supported host, so this absent path also
@@ -2067,7 +2073,7 @@ def _tmpfs_policy(policy: DockerPolicy) -> dict[str, str]:
             f"uid={policy.observer_uid},gid={policy.observer_gid},mode=0755"
         ),
         "/work": (
-            f"rw,nosuid,nodev,size={policy.tmpfs_bytes},"
+            f"rw,nosuid,nodev,exec,size={policy.tmpfs_bytes},"
             f"uid={policy.verifier_uid},gid={policy.verifier_gid},mode=0755"
         ),
         "/scratch": (
@@ -2170,12 +2176,14 @@ class DockerExecutor:
         disk_free_bytes: Callable[[], int] = _default_docker_free_bytes,
         token_factory: Callable[[], str] = lambda: secrets.token_hex(16),
         clock: Callable[[], float] = time.monotonic,
+        raw_output_callback: Callable[[RunEvidence, bytes], None] | None = None,
     ) -> None:
         self.policy = policy
         self.runner = runner or _SubprocessDockerRuntime()
         self.disk_free_bytes = disk_free_bytes
         self.token_factory = token_factory
         self.clock = clock
+        self.raw_output_callback = raw_output_callback
 
     def _remaining_lifecycle_seconds(
         self, deadline: float, *, command_cap: bool = True
@@ -2860,7 +2868,10 @@ class DockerExecutor:
                 raise ReplayContractError("restricted Docker execution failed") from pending_error
             if evidence is None:
                 raise ReplayContractError("restricted Docker produced no run evidence")
-            return dataclasses.replace(evidence, cleanup_state=cleanup_state)
+            evidence = dataclasses.replace(evidence, cleanup_state=cleanup_state)
+            if self.raw_output_callback is not None:
+                self.raw_output_callback(evidence, raw_output)
+            return evidence
 
 
 _ADMISSION_COMMANDS: Final = {
@@ -2981,6 +2992,7 @@ def _replay_contract_sha(
     contract: SeedContract,
     plan: MutationPlan,
     *,
+    dataset_revision: str,
     trajectory_id: str,
     source_terminal_sha256: str,
     candidate: CandidateState,
@@ -2991,7 +3003,7 @@ def _replay_contract_sha(
         _canonical_json(
             {
                 "schema_version": 2,
-                "dataset_revision": DATASET_REVISION,
+                "dataset_revision": dataset_revision,
                 "source_commit_sha": contract.source_commit_sha,
                 "source_tree_sha": contract.source_tree_sha,
                 "task_tree_sha": contract.task_tree_sha,
@@ -3019,6 +3031,7 @@ def verify_candidate(
     source_terminal_sha256: str,
     executor: RestrictedExecutor,
     workspace: Path,
+    dataset_revision: str = DATASET_REVISION,
 ) -> ReplayEvidence:
     """Rebuild and verify two independent candidate states."""
 
@@ -3092,7 +3105,7 @@ def verify_candidate(
         trajectory_id,
         contract.task,
         contract.language,
-        DATASET_REVISION,
+        dataset_revision,
         contract.source_commit_sha,
         contract.source_tree_sha,
         contract.task_tree_sha,
@@ -3113,6 +3126,7 @@ def verify_candidate(
         _replay_contract_sha(
             contract,
             plan,
+            dataset_revision=dataset_revision,
             trajectory_id=trajectory_id,
             source_terminal_sha256=source_terminal_sha256,
             candidate=states[0],
@@ -3159,6 +3173,7 @@ def run_control_set(
     workspace: Path,
     reference_builder: Callable[[SeedContract, Path], CandidateState] = _default_reference_builder,
     corrupt_builder: Callable[[SeedContract, Path], CandidateState] | None = None,
+    dataset_revision: str = DATASET_REVISION,
 ) -> ControlSetEvidence:
     """Run tainted controls and two-run candidate verification."""
 
@@ -3209,6 +3224,7 @@ def run_control_set(
         source_terminal_sha256=source_terminal_sha256,
         executor=executor,
         workspace=workspace / "candidate",
+        dataset_revision=dataset_revision,
     )
     policy = getattr(executor, "policy", None)
     if type(policy) is not DockerPolicy:
@@ -3677,7 +3693,11 @@ def _validate_positive_candidate_run(run: RunEvidence, evidence: ReplayEvidence)
         raise ReplayContractError("replay evidence does not contain two strict candidate runs")
 
 
-def validate_replay_evidence_payload(payload: object) -> ReplayEvidence:
+def validate_replay_evidence_payload(
+    payload: object,
+    *,
+    expected_dataset_revision: str = DATASET_REVISION,
+) -> ReplayEvidence:
     """Decode and fully validate the only evidence namespace importers may trust."""
 
     if type(payload) is not dict or set(payload) != _REPLAY_EVIDENCE_FIELDS:
@@ -3710,7 +3730,7 @@ def validate_replay_evidence_payload(payload: object) -> ReplayEvidence:
         all(_is_sha256(value) for value in hashes)
         and _TASK_RE.fullmatch(evidence.task) is not None
         and evidence.language in {"python", "rust", "cpp"}
-        and evidence.dataset_revision == DATASET_REVISION
+        and evidence.dataset_revision == expected_dataset_revision
         and evidence.source_commit_sha == MOONSHINER_REVISION
         and _OID_RE.fullmatch(evidence.source_tree_sha) is not None
         and _OID_RE.fullmatch(evidence.task_tree_sha) is not None

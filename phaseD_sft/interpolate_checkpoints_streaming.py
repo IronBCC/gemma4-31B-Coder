@@ -19,6 +19,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from phaseD_sft.atomic_checkpoint_publish import publish_after_audit
+from phaseD_sft.checkpoint_copy_compatibility import compatible_copy_files
 from phaseD_sft.merge_lora_streaming import COPY_FILES
 
 
@@ -264,22 +265,6 @@ def _interpolate_tensor_streaming(
     return output
 
 
-def _compatible_copy_files(anchor: Path, candidate: Path) -> list[str]:
-    copied = []
-    for name in COPY_FILES:
-        left = anchor / name
-        right = candidate / name
-        if left.is_file() != right.is_file():
-            raise ValueError(f"checkpoint copied-file presence mismatch: {name}")
-        if left.is_file():
-            if left.read_bytes() != right.read_bytes():
-                raise ValueError(f"checkpoint copied-file mismatch: {name}")
-            copied.append(name)
-    if "config.json" not in copied:
-        raise ValueError("checkpoint config.json is missing")
-    return sorted(copied)
-
-
 def _normalized_output_contract(
     staging: Path,
     output: Path,
@@ -400,7 +385,11 @@ def main() -> None:
         raise SystemExit(
             f"checkpoint tensor shape/dtype mismatch: {mismatched_specs[:3]}"
         )
-    copied_files = _compatible_copy_files(anchor, candidate)
+    copied_files, controlled_copy_file_differences = compatible_copy_files(
+        anchor,
+        candidate,
+        COPY_FILES,
+    )
     max_rss_bytes = int(args.max_rss_gb * (1 << 30))
     _assert_peak_rss(max_rss_bytes, "preflight")
 
@@ -507,6 +496,9 @@ def main() -> None:
             "total_tensor_bytes": total_size,
             "output_shards": len(groups),
             "copied_files": copied_files,
+            "controlled_copy_file_differences": (
+                controlled_copy_file_differences
+            ),
             "copied_file_bindings": output_contract[
                 "copied_file_bindings"
             ],

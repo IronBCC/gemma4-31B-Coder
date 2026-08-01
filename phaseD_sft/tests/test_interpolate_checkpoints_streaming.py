@@ -282,6 +282,111 @@ def test_rejects_mismatched_copied_files_before_staging(tmp_path: Path):
     assert not list(tmp_path.glob(".output.tmp-*"))
 
 
+def test_allows_only_tokenizer_padding_state_drift_and_copies_anchor(
+    tmp_path: Path,
+):
+    anchor = tmp_path / "anchor"
+    candidate = tmp_path / "candidate"
+    output = tmp_path / "output"
+    key = "model.layer.weight"
+    tensor = torch.ones(2, dtype=torch.bfloat16)
+    placement = {key: "model-00001-of-00001.safetensors"}
+    _write_checkpoint(anchor, tensors={key: tensor}, placement=placement)
+    _write_checkpoint(candidate, tensors={key: tensor}, placement=placement)
+    anchor_tokenizer = {
+        "version": "1.0",
+        "padding": None,
+        "model": {"type": "Unigram", "vocab": [["<pad>", 0.0]]},
+    }
+    candidate_tokenizer = {
+        **anchor_tokenizer,
+        "padding": {
+            "strategy": "BatchLongest",
+            "direction": "Left",
+            "pad_id": 0,
+            "pad_token": "<pad>",
+        },
+    }
+    (anchor / "tokenizer.json").write_text(
+        json.dumps(anchor_tokenizer), encoding="utf-8"
+    )
+    (candidate / "tokenizer.json").write_text(
+        json.dumps(candidate_tokenizer), encoding="utf-8"
+    )
+    (anchor / "tokenizer_config.json").write_text(
+        json.dumps({"model_max_length": 32768, "padding_side": "left"}),
+        encoding="utf-8",
+    )
+    (candidate / "tokenizer_config.json").write_text(
+        json.dumps({"model_max_length": 32768, "padding_side": "right"}),
+        encoding="utf-8",
+    )
+
+    result = _run_interpolation(anchor, candidate, output)
+
+    assert result.returncode == 0, result.stderr
+    assert (output / "tokenizer.json").read_bytes() == (
+        anchor / "tokenizer.json"
+    ).read_bytes()
+    assert (output / "tokenizer_config.json").read_bytes() == (
+        anchor / "tokenizer_config.json"
+    ).read_bytes()
+    manifest = json.loads(
+        (output / "interpolation_manifest.json").read_text(encoding="utf-8")
+    )
+    differences = manifest["controlled_copy_file_differences"]
+    assert set(differences) == {"tokenizer.json", "tokenizer_config.json"}
+    assert differences["tokenizer.json"]["ignored_top_level_fields"] == [
+        "padding"
+    ]
+    assert differences["tokenizer_config.json"][
+        "ignored_top_level_fields"
+    ] == ["padding_side"]
+    assert all(
+        len(row["semantic_sha256"]) == 64 for row in differences.values()
+    )
+    assert all(
+        row["output_source"] == "anchor" for row in differences.values()
+    )
+
+
+def test_rejects_tokenizer_vocabulary_drift_even_when_padding_differs(
+    tmp_path: Path,
+):
+    anchor = tmp_path / "anchor"
+    candidate = tmp_path / "candidate"
+    output = tmp_path / "output"
+    key = "model.layer.weight"
+    tensor = torch.ones(2, dtype=torch.bfloat16)
+    placement = {key: "model-00001-of-00001.safetensors"}
+    _write_checkpoint(anchor, tensors={key: tensor}, placement=placement)
+    _write_checkpoint(candidate, tensors={key: tensor}, placement=placement)
+    (anchor / "tokenizer.json").write_text(
+        json.dumps(
+            {
+                "padding": None,
+                "model": {"vocab": [["<pad>", 0.0], ["a", -1.0]]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (candidate / "tokenizer.json").write_text(
+        json.dumps(
+            {
+                "padding": {"pad_id": 0},
+                "model": {"vocab": [["<pad>", 0.0], ["b", -1.0]]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run_interpolation(anchor, candidate, output)
+
+    assert result.returncode != 0
+    assert "checkpoint copied-file mismatch: tokenizer.json" in result.stderr
+    assert not output.exists()
+
+
 def test_rejects_mismatched_tensor_keys(tmp_path: Path):
     anchor = tmp_path / "anchor"
     candidate = tmp_path / "candidate"

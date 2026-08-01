@@ -24,6 +24,17 @@ def _binding(path: Path) -> dict[str, object]:
     }
 
 
+def _canonical_sha(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _write_model(root: Path, *, payload: bytes) -> None:
     root.mkdir()
     shard = root / "model-00001-of-00001.safetensors"
@@ -58,6 +69,10 @@ def _write_model(root: Path, *, payload: bytes) -> None:
 def _contract(root: Path) -> dict[str, object]:
     index = root / "model.safetensors.index.json"
     shard = root / "model-00001-of-00001.safetensors"
+    copied_files = sorted(
+        COPIED_FILES
+        + (["tokenizer.json"] if (root / "tokenizer.json").is_file() else [])
+    )
     return {
         "model_path": str(root.resolve()),
         "model_config_sha256": hashlib.sha256(
@@ -67,18 +82,93 @@ def _contract(root: Path) -> dict[str, object]:
         "model_safetensors_sha256": None,
         "model_artifacts": [_binding(shard)],
         "copied_file_bindings": [
-            _binding(root / name) for name in COPIED_FILES
+            _binding(root / name) for name in copied_files
         ],
     }
 
 
-def _write_fixture(tmp_path: Path) -> dict[str, Path]:
+def _write_fixture(
+    tmp_path: Path,
+    *,
+    tokenizer_padding_drift: bool = False,
+) -> dict[str, Path]:
     anchor = tmp_path / "v2p10"
     source = tmp_path / "v2p11r3"
     output = tmp_path / "v2p11r4"
     _write_model(anchor, payload=b"anchor")
     _write_model(source, payload=b"source")
     _write_model(output, payload=b"output")
+    controlled_differences = {}
+    copied_files = list(COPIED_FILES)
+    if tokenizer_padding_drift:
+        anchor_tokenizer = {
+            "padding": None,
+            "model": {"vocab": [["<pad>", 0.0], ["code", -1.0]]},
+        }
+        source_tokenizer = {
+            **anchor_tokenizer,
+            "padding": {"direction": "Left", "pad_id": 0},
+        }
+        (anchor / "tokenizer.json").write_text(
+            json.dumps(anchor_tokenizer), encoding="utf-8"
+        )
+        (source / "tokenizer.json").write_text(
+            json.dumps(source_tokenizer), encoding="utf-8"
+        )
+        (output / "tokenizer.json").write_bytes(
+            (anchor / "tokenizer.json").read_bytes()
+        )
+        for root, side in ((anchor, "left"), (source, "right"), (output, "left")):
+            (root / "tokenizer_config.json").write_text(
+                json.dumps(
+                    {"model_max_length": 32768, "padding_side": side}
+                ),
+                encoding="utf-8",
+            )
+        copied_files = sorted(COPIED_FILES + ["tokenizer.json"])
+        controlled_differences = {
+            "tokenizer.json": {
+                "ignored_top_level_fields": ["padding"],
+                "anchor_values": {
+                    "padding": {"present": True, "value": None}
+                },
+                "candidate_values": {
+                    "padding": {
+                        "present": True,
+                        "value": {"direction": "Left", "pad_id": 0},
+                    }
+                },
+                "anchor_sha256": _binding(anchor / "tokenizer.json")[
+                    "sha256"
+                ],
+                "candidate_sha256": _binding(source / "tokenizer.json")[
+                    "sha256"
+                ],
+                "semantic_sha256": _canonical_sha(
+                    {"model": anchor_tokenizer["model"]}
+                ),
+                "output_source": "anchor",
+            },
+            "tokenizer_config.json": {
+                "ignored_top_level_fields": ["padding_side"],
+                "anchor_values": {
+                    "padding_side": {"present": True, "value": "left"}
+                },
+                "candidate_values": {
+                    "padding_side": {"present": True, "value": "right"}
+                },
+                "anchor_sha256": _binding(anchor / "tokenizer_config.json")[
+                    "sha256"
+                ],
+                "candidate_sha256": _binding(source / "tokenizer_config.json")[
+                    "sha256"
+                ],
+                "semantic_sha256": _canonical_sha(
+                    {"model_max_length": 32768}
+                ),
+                "output_source": "anchor",
+            },
+        }
     manifest = {
         "schema_version": 1,
         "artifact_type": "checkpoint_weight_interpolation",
@@ -93,7 +183,8 @@ def _write_fixture(tmp_path: Path) -> dict[str, Path]:
         "copied_nonfloating_tensors": 1,
         "total_tensor_bytes": 12,
         "output_shards": 1,
-        "copied_files": COPIED_FILES,
+        "copied_files": copied_files,
+        "controlled_copy_file_differences": controlled_differences,
         "copied_file_bindings": _contract(output)[
             "copied_file_bindings"
         ],
@@ -133,6 +224,22 @@ def test_validates_exact_interpolation_lineage(tmp_path: Path) -> None:
     assert report["served_name"] == "teacher_sft_v2p11r4_blend25"
     assert report["manifest"] == _binding(paths["manifest"])
     assert report["output"] == _contract(paths["output"])
+
+
+def test_validates_padding_only_tokenizer_drift_with_anchor_output(
+    tmp_path: Path,
+) -> None:
+    paths = _write_fixture(tmp_path, tokenizer_padding_drift=True)
+
+    report = _validate(paths)
+
+    assert set(report["controlled_copy_file_differences"]) == {
+        "tokenizer.json",
+        "tokenizer_config.json",
+    }
+    assert (paths["output"] / "tokenizer.json").read_bytes() == (
+        paths["anchor"] / "tokenizer.json"
+    ).read_bytes()
 
 
 @pytest.mark.parametrize(

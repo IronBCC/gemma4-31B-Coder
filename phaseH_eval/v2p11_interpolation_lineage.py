@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from phaseD_sft.checkpoint_copy_compatibility import compatible_copy_files
+
 
 EXPECTED_ALPHA = 0.25
 EXPECTED_CANDIDATE_NAME = "teacher_sft_v2p11r4_blend25"
@@ -110,21 +112,28 @@ def _model_contract(
     }
 
 
-def _compatible_copy_files(models: Sequence[Path]) -> list[str]:
-    copied = []
-    for name in COPY_FILES:
-        paths = [model / name for model in models]
-        present = [path.is_file() for path in paths]
-        if len(set(present)) != 1:
+def _compatible_copy_files(
+    anchor: Path,
+    source: Path,
+    output: Path,
+) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    try:
+        copied, controlled_differences = compatible_copy_files(
+            anchor,
+            source,
+            COPY_FILES,
+        )
+    except ValueError as exc:
+        name = str(exc).rsplit(": ", 1)[-1]
+        raise ValueError(f"copied checkpoint files differ: {name}") from exc
+    for name in copied:
+        output_path = output / name
+        if (
+            not output_path.is_file()
+            or output_path.read_bytes() != (anchor / name).read_bytes()
+        ):
             raise ValueError(f"copied checkpoint files differ: {name}")
-        if present[0]:
-            hashes = {_sha256(path) for path in paths}
-            if len(hashes) != 1:
-                raise ValueError(f"copied checkpoint files differ: {name}")
-            copied.append(name)
-    if "config.json" not in copied:
-        raise ValueError("copied checkpoint files differ: config.json")
-    return sorted(copied)
+    return copied, controlled_differences
 
 
 def validate_interpolation_lineage(
@@ -155,9 +164,18 @@ def validate_interpolation_lineage(
     if manifest.get("equation") != EXPECTED_EQUATION:
         raise ValueError("interpolation equation changed")
 
-    copied_files = _compatible_copy_files((anchor, source, output))
+    copied_files, controlled_differences = _compatible_copy_files(
+        anchor,
+        source,
+        output,
+    )
     if manifest.get("copied_files") != copied_files:
         raise ValueError("interpolation copied-file list changed")
+    if (
+        manifest.get("controlled_copy_file_differences")
+        != controlled_differences
+    ):
+        raise ValueError("interpolation copied-file differences changed")
     anchor_contract = _model_contract(anchor, copied_files)
     source_contract = _model_contract(source, copied_files)
     output_contract = _model_contract(output, copied_files)
@@ -217,6 +235,7 @@ def validate_interpolation_lineage(
         "anchor": anchor_contract,
         "source": source_contract,
         "output": output_contract,
+        "controlled_copy_file_differences": controlled_differences,
     }
 
 

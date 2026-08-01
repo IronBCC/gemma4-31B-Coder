@@ -24,7 +24,8 @@ There is no alpha grid. If this candidate fails the pre-full300 gate, stop this 
 
 A bounded-memory Python utility streams tensors by key from both sharded checkpoints. It must:
 
-- require exact equality for architecture-bearing configuration and tokenizer/template files;
+- require exact equality for architecture-bearing configuration and tokenizer/template semantics;
+- tolerate only the observed tokenizer runtime-padding fields (`tokenizer.json.padding` and `tokenizer_config.json.padding_side`) when every other JSON field is identical, copy the v2.10 anchor files, and bind both raw hashes plus the normalized semantic hash in the manifest;
 - require identical tensor-key sets and independently resolve each key through each parent's shard index;
 - require equal shape and dtype for every paired tensor;
 - compute floating-point tensors in FP32 as `anchor + 0.25 * (candidate - anchor)`, then cast to the anchor dtype;
@@ -52,5 +53,4 @@ No base, v2, v2.6, v2.7, or other checkpoint is rerun. GPU0 is never queried or 
 
 ## Failure handling
 
-Any parent mismatch, missing tensor, dtype/shape mismatch, copied-file mismatch, RSS breach, partial output, lineage mismatch, portability regression, or fixed150 regression fails closed. A failed candidate is preserved as diagnostic evidence but is not promoted and does not receive full300.
-
+Any parent mismatch, missing tensor, dtype/shape mismatch, tokenizer vocabulary/token-ID or other copied-file mismatch, RSS breach, partial output, lineage mismatch, portability regression, or fixed150 regression fails closed. A failed candidate is preserved as diagnostic evidence but is not promoted and does not receive full300.

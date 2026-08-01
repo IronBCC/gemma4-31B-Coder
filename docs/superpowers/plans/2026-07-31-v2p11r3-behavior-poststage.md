@@ -55,10 +55,10 @@ Run:
 
 ```bash
 PYTHONPATH=$PWD .venv-eval/bin/python - <<'PY'
-from phaseD_sft.build_v2p11_recovery_curriculum import PORTABLE_COMMAND_CLASSES
+from phaseD_sft.build_v2p11_recovery_curriculum import RECOVERY_STYLES
 from phaseH_eval.v2p11_poststage_phase_marker import publish_or_verify
 from phaseH_eval.v2p11_posttrain_contract import PRODUCTION_RECOVERY_ROWS
-assert PORTABLE_COMMAND_CLASSES
+assert RECOVERY_STYLES
 assert callable(publish_or_verify)
 assert PRODUCTION_RECOVERY_ROWS == 138
 PY

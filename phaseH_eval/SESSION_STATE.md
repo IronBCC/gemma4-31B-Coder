@@ -3237,3 +3237,24 @@ Full analysis + run-by-run history: `phaseD_sft/V6_49K_RETROSPECTIVE.md`. Compre
   provisional completion bracket is `19:25 PDT` through `00:25 PDT` on 2026-08-02, to be replaced
   by a measured ETA after the first completed fixed150 batch. Full300 remains conditional on that
   gate and would add approximately 8-14 hours.
+
+### v2.11r4 fixed150 control preflight (2026-08-01 12:31 PDT)
+
+- While portability runs, a fresh CPU-only `_complete_run` validation re-hashed and accepted the
+  exact paired v2.10 control at `runs/fixed150_v2p10`. The immutable ID set has 150 unique rows and
+  SHA-256 `abc550841d4a64740da2a9f18d717973a501c4bf138755d3d55883c67d9c1390`.
+  The control has 150 prediction rows, 150 trajectories, nine batch `preds.json` files, 81 resolved,
+  18 empty, 51 wrong-nonempty, 12 repeat loops, 11 tool-format errors, and 9,595 assistant responses.
+- The revalidated control binds served name `teacher_sft_v2p10`, canonical model path
+  `/media/ironbcc/CrucialX10/models/merged/teacher_sft_v2p10_full`, model-index SHA-256
+  `77a39432f90e34fd77d1605b2d7c9f8b4427b4f671c8b9148583bfd1ff3487ee`, and config SHA-256
+  `e967dd38bc5cfd38bd09a995a7bf4a754075df2b46aba68f7fbb5a791e6d8dd1`.
+  Its acceptance SHA-256 is `6fde5e10adb45213836ae56d2f967a3f5b801f377dc2acd8c242c3d821dbc54e`
+  and `preds_all.json` SHA-256 is
+  `b23f142f0e50d1cb9b9ab0f4815b96a25c06ae78ae968c4dba9b795a4caa5ea6`.
+- The candidate fixed150 launcher uses the identical comparison contract: seed 1, temperature 0.7,
+  step limit 120, 16 generation/scorer workers, batch 20, five pull workers, and
+  `docker_selfretry.DockerSelfRetryEnv`. The successor gate rejects any harness or model-contract
+  mismatch before comparing resolution, wrong-nonempty, empty, or repeat-loop metrics. No live
+  portability status was polled for this offline preflight; the next live check remains its
+  completion/error boundary.

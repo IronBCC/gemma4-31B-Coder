@@ -3131,3 +3131,36 @@ Full analysis + run-by-run history: `phaseD_sft/V6_49K_RETROSPECTIVE.md`. Compre
   static unit definition still waits on only `v2p11r3-reasoned-train-gpu1.service` and then execs
   the newly synced `phaseH_eval/run_v2p11r3_posttrain_chain.sh`. Remaining requirements are runtime
   completion/merge/portability/full300 artifacts and a score-qualified final audit.
+
+### v2.11r3 full300 verdict and successor ablation (2026-08-01 09:35 PDT)
+
+- Reasoning SFT, recovery SFT, KTO, final merge, portability, and the matched Lite300 evaluation
+  are complete. The corrected candidate composite is 300/300 with 124 resolved, two empty, zero
+  pull failures, and zero Docker failures; canonical v2.10 is 157 resolved and two empty. The
+  candidate therefore loses by 33 resolved tasks and adds 33 wrong-nonempty outcomes. It is not
+  promoted and the goal remains active.
+- The first-pass comparison is 122/300 with seven empties for r3 versus 148/300 with 28 empties for
+  v2.10. Empty/loop mitigation worked, but correctness did not: r3 has 21 repeat loops and five
+  tool-format errors versus 24 and ten for v2.10. Corrected paired movement is 41 v2.10-only wins
+  versus eight r3-only wins. The next revision must preserve the behavior gain without the patch
+  correctness regression.
+- The checksum-bound verdict artifacts are
+  `runs/v2p11r3_behavior_vs_v2p10_full300.json` SHA-256
+  `5fe08709fbcecac493ec272f43457b54580d80e7cdf4e9ac318b217f5b000796` and its Markdown companion
+  SHA-256 `1a6f9a9675f602c5ca6ef4928db80c3d1768e3f9825222f954af88ffbbd2d260`.
+  The evaluator did not rerun any task while publishing this verdict.
+- Verdict publication initially failed because provenance represented the inactive single-file
+  hash as `null` while the sharded evaluation composite omitted that optional key. All model paths,
+  names, config/index hashes, and 21 weight-artifact bindings were identical. The validator now
+  normalizes only a missing inactive hash; changed or extra contract fields still fail closed.
+  The focused local and remote suites both pass 26/26.
+- The obsolete CPU retry unit `v2p11r3-posttrain-waiter.service` is inactive with `MainPID=0`.
+  A single recovery-stage ablation is active on GPU1 as
+  `v2p11r3-recovery-ablation50-gpu1.service`, MainPID `3618166`, invocation
+  `f5879a7a71784c7298e3d760b8ada030`. Its immutable ID set
+  `data/v2p11r3_stage_ablation50_ids.json` contains exactly the 38 first-pass v2.10-only tasks plus
+  the 12 first-pass r3-only tasks and has SHA-256
+  `581727784f273e54daa8a70833a17a7fa16581a7619a1a3c87733f21866251b3`. Existing v2.10 and final
+  r3 outputs cover the same 50 tasks, so only the already-merged recovery checkpoint is running.
+  Do not query or touch GPU0. Check next at the ablation completion/error boundary, estimated around
+  11:00-12:00 PDT.

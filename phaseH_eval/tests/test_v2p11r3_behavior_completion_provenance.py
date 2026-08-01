@@ -193,7 +193,7 @@ def test_cross_stage_bindings_reject_spliced_reasoning_adapter(
         )
 
 
-def test_behavior_provenance_rebuilds_from_bound_inputs(
+def test_behavior_provenance_accepts_legacy_sharded_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -206,6 +206,8 @@ def test_behavior_provenance_rebuilds_from_bound_inputs(
     model_contract = {
         "model_path": str(final_model.resolve()),
         "served_name": "teacher_sft_v2p11r3_behavior",
+        "model_index_sha256": "index-sha256",
+        "model_safetensors_sha256": None,
     }
     v2p10_lineage = tmp_path / "v2p10-lineage.json"
     v2p10_lineage.write_text("{}\n")
@@ -321,6 +323,19 @@ def test_behavior_provenance_rebuilds_from_bound_inputs(
     assert validated["artifact"]["path"] == str(provenance.resolve())
     assert validated["behavior_poststage"]["coverage_counts"] == EXPECTED_COVERAGE
     assert validated["evaluation_exclusion"]["overlap"] == 0
+
+    legacy_sharded_contract = dict(model_contract)
+    legacy_sharded_contract.pop("model_safetensors_sha256")
+    legacy_validated = module.validate_completion_provenance(
+        provenance,
+        full_ids_path=tmp_path / "ids.json",
+        v2p10_composite_path=tmp_path / "v2p10.json",
+        v2p10_lineage_path=v2p10_lineage,
+        candidate_model_contract=legacy_sharded_contract,
+        candidate_name="teacher_sft_v2p11r3_behavior",
+    )
+
+    assert legacy_validated["artifact"]["path"] == str(provenance.resolve())
 
 
 def test_behavior_provenance_validation_uses_external_lineage_root(

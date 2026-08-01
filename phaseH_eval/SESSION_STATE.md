@@ -3120,3 +3120,14 @@ Full analysis + run-by-run history: `phaseD_sft/V6_49K_RETROSPECTIVE.md`. Compre
   proof work. Do not query or touch GPU0. The next live evidence boundary remains 22:48 PDT, when
   the named training unit, exact trainer evidence, waiter/poststage unit, and resulting immutable
   artifacts should be checked once.
+- The 20:23 PDT requirement-by-requirement audit found no missing pre-boundary proof logic. A fresh
+  CPU-only remote dataset validation re-proved 1,262 admitted rows, 92 Fable rows, 517 canonical
+  Fable bash turns, 468 reasoned tool turns, 15 recent strict source IDs, 36 Stage-A additions on
+  the frozen 1,211-row v2.10 mix, max rendered length 26,594 under the 32,768-token limit, and the
+  current reasoned train SHA-256 `be1246db2e105256138dcaee79f58d7bd0daaf26910380799d8732a81b88b792`.
+- Fresh CPU-only poststage admission re-proved 138 recovery rows/105 steps, 606 behavior rows,
+  negative counts 33 empty + 55 loop + 228 wrong-nonempty, 707 combined exclusions across 12
+  repositories, all 300 evaluation IDs, and zero overlap. The live waiter was not queried; its
+  static unit definition still waits on only `v2p11r3-reasoned-train-gpu1.service` and then execs
+  the newly synced `phaseH_eval/run_v2p11r3_posttrain_chain.sh`. Remaining requirements are runtime
+  completion/merge/portability/full300 artifacts and a score-qualified final audit.

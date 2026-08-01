@@ -41,6 +41,7 @@ WAIT_TIMEOUT_SECONDS="${WAIT_TIMEOUT_SECONDS:-86400}"
 EXPECTED_RECOVERY_STEPS=105
 GPU_INDEX="${GPU_INDEX:-1}"
 TRAIN_RESUME_ARGS=()
+INTERRUPTED_OUTPUT_STATUS=""
 
 log() {
   echo "[$(TZ=America/Los_Angeles date '+%Y-%m-%d %H:%M:%S %Z')] $*" |
@@ -93,8 +94,11 @@ checkpoints = []
 for path in adapter.glob("checkpoint-*"):
     match = re.fullmatch(r"checkpoint-(\d+)", path.name)
     if match:
+        assert path.is_dir() and not path.is_symlink(), path
         checkpoints.append((int(match.group(1)), path))
-assert checkpoints, "resume requires a numeric recovery checkpoint"
+if not checkpoints:
+    print("none")
+    raise SystemExit(0)
 step, checkpoint = max(checkpoints)
 state = json.loads((checkpoint / "trainer_state.json").read_text())
 assert state["global_step"] == step
@@ -112,6 +116,24 @@ required = {
 assert not (required - {path.name for path in checkpoint.iterdir()})
 print(step)
 PY
+}
+
+archive_interrupted_output() {
+  local path="$1" phase="$2" mode="$3" report
+  report="$(
+    .venv-train/bin/python phaseH_eval/v2p11_poststage_recovery.py \
+      --path "$path" --phase "$phase" --mode "$mode"
+  )" || halt "$phase interrupted-output recovery failed"
+  INTERRUPTED_OUTPUT_STATUS="$(
+    .venv-train/bin/python -c \
+      'import json,sys; print(json.load(sys.stdin)["status"])' \
+      <<<"$report"
+  )" || halt "$phase interrupted-output status is invalid"
+  case "$INTERRUPTED_OUTPUT_STATUS" in
+    absent|archived|checkpointed) ;;
+    *) halt "$phase interrupted-output status is unsupported" ;;
+  esac
+  log "$phase interrupted-output recovery: $report"
 }
 
 validate_merge_audit() {
@@ -507,13 +529,26 @@ if [[ -f "$RECOVERY_MARKER" ||
     "$RECOVERY_ADAPTER/run_manifest.json" \
     "$RECOVERY_ADAPTER/checkpoint-105/trainer_state.json"
   log "reusing verified recovery SFT"
-elif [[ -d "$RECOVERY_ADAPTER" ]]; then
-  if ! latest_step="$(latest_recovery_checkpoint)"; then
-    halt "recovery output exists without a verified resumable checkpoint"
+elif [[ -e "$RECOVERY_ADAPTER" || -L "$RECOVERY_ADAPTER" ]]; then
+  if [[ -L "$RECOVERY_ADAPTER" || ! -d "$RECOVERY_ADAPTER" ]]; then
+    halt "recovery output exists but is not a real directory"
   fi
-  segment_start_step="$latest_step"
-  TRAIN_RESUME_ARGS=("--resume")
-  log "resuming verified recovery checkpoint step=$segment_start_step"
+  archive_interrupted_output \
+    "$RECOVERY_ADAPTER" recovery-sft checkpointless
+  case "$INTERRUPTED_OUTPUT_STATUS" in
+    archived|absent)
+      log "restarting recovery SFT from a preserved checkpointless output"
+      ;;
+    checkpointed)
+      if ! latest_step="$(latest_recovery_checkpoint)" ||
+        [[ "$latest_step" == "none" ]]; then
+        halt "recovery output exists without a verified resumable checkpoint"
+      fi
+      segment_start_step="$latest_step"
+      TRAIN_RESUME_ARGS=("--resume")
+      log "resuming verified recovery checkpoint step=$segment_start_step"
+      ;;
+  esac
 fi
 
 if [[ ! -f "$RECOVERY_MARKER" ]]; then
@@ -565,14 +600,28 @@ if [[ ! -f "$RECOVERY_MARKER" ]]; then
       tail -n 40 "$RECOVERY_LOG"
       halt "recovery SFT failed train=$train_status watchdog=$watchdog_status"
     fi
-    latest_step="$(latest_recovery_checkpoint)"
-    (( latest_step > segment_start_step )) ||
-      halt "recovery resume refused because no checkpoint advanced"
     (( restart_count < MAX_TRAINER_RESTARTS )) ||
       halt "recovery resume refused because restart cap was reached"
     restart_count=$((restart_count + 1))
-    segment_start_step="$latest_step"
-    TRAIN_RESUME_ARGS=("--resume")
+    archive_interrupted_output \
+      "$RECOVERY_ADAPTER" recovery-sft checkpointless
+    case "$INTERRUPTED_OUTPUT_STATUS" in
+      archived|absent)
+        segment_start_step=0
+        TRAIN_RESUME_ARGS=()
+        log "restarting checkpointless recovery segment restart=$restart_count"
+        ;;
+      checkpointed)
+        if ! latest_step="$(latest_recovery_checkpoint)" ||
+          [[ "$latest_step" == "none" ]]; then
+          halt "recovery restart lacks a verified numeric checkpoint"
+        fi
+        (( latest_step > segment_start_step )) ||
+          halt "recovery resume refused because no checkpoint advanced"
+        segment_start_step="$latest_step"
+        TRAIN_RESUME_ARGS=("--resume")
+        ;;
+    esac
     wait_for_gpu_idle "pre-recovery-restart-$restart_count"
   done
   validate_recovery_adapter
@@ -630,8 +679,13 @@ if [[ -f "$KTO_CANARY_MARKER" || -d "$KTO_CANARY" ]]; then
     "$KTO_CANARY/checkpoint-1/trainer_state.json"
   log "reusing verified KTO canary"
 else
-  [[ ! -e "$KTO_CANARY.inprogress" ]] ||
-    halt "KTO canary quarantine output requires inspection: $KTO_CANARY.inprogress"
+  if [[ -e "$KTO_CANARY.inprogress" || -L "$KTO_CANARY.inprogress" ]]; then
+    archive_interrupted_output \
+      "$KTO_CANARY.inprogress" kto-canary always
+    [[ "$INTERRUPTED_OUTPUT_STATUS" == "archived" ||
+      "$INTERRUPTED_OUTPUT_STATUS" == "absent" ]] ||
+      halt "KTO canary interrupted output was not archived"
+  fi
   wait_for_gpu_idle "pre-KTO-canary"
   env CUDA_VISIBLE_DEVICES="$GPU_INDEX" \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -669,8 +723,13 @@ if [[ -f "$KTO_MARKER" || -d "$KTO_ADAPTER" ]]; then
     "$KTO_ADAPTER/checkpoint-25/trainer_state.json"
   log "reusing verified full KTO"
 else
-  [[ ! -e "$KTO_ADAPTER.inprogress" ]] ||
-    halt "full KTO quarantine output requires inspection: $KTO_ADAPTER.inprogress"
+  if [[ -e "$KTO_ADAPTER.inprogress" || -L "$KTO_ADAPTER.inprogress" ]]; then
+    archive_interrupted_output \
+      "$KTO_ADAPTER.inprogress" kto-full always
+    [[ "$INTERRUPTED_OUTPUT_STATUS" == "archived" ||
+      "$INTERRUPTED_OUTPUT_STATUS" == "absent" ]] ||
+      halt "full KTO interrupted output was not archived"
+  fi
   wait_for_gpu_idle "pre-KTO-full"
   env CUDA_VISIBLE_DEVICES="$GPU_INDEX" \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \

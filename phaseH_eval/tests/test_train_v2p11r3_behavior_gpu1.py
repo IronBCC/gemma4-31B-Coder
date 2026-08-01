@@ -72,3 +72,11 @@ def test_behavior_launcher_trains_recovery_and_coverage_kto_on_gpu1() -> None:
     assert "output exists without its immutable input marker" in script
     assert "MAX_TRAINER_RESTARTS" in script
     assert "ram_watchdog.py" in script
+    assert "v2p11_poststage_recovery.py" in script
+    assert "checkpointless" in script
+    assert "recovery-sft" in script
+    assert "kto-canary" in script
+    assert "kto-full" in script
+    assert "quarantine output requires inspection" not in script
+    assert "INTERRUPTED_OUTPUT_STATUS" in script
+    assert "checkpointed)" in script

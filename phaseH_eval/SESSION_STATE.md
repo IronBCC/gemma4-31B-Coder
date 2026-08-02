@@ -3397,3 +3397,40 @@ Full analysis + run-by-run history: `phaseD_sft/V6_49K_RETROSPECTIVE.md`. Compre
   controller-free portability10, publish clean provenance, then execute the identical full300 with
   empty-only correction. Do not query or touch GPU0; recheck at training completion or a real guard/
   service failure, not every optimizer step.
+
+### Clean rejection and submit-fix successor launch (2026-08-02 11:48 PDT)
+
+- The complete clean-v2.11 full300 composite is rejected: 145/300 corrected resolved with ten
+  corrected model empties, versus canonical v2.10 at 157/300 with two. Both contain 300 predictions,
+  300 trajectories, zero pull failures, and zero Docker failures. Clean v2.11 also increased tool
+  format errors from 10/17,303 assistant responses to 21/17,381 while reducing exact repeat loops
+  from 24 to 17. This selects the single allowed `submit_fix` successor path; no recovery SFT, KTO,
+  interpolation, or second successor is authorized. The checksum-heavy standalone comparator remains
+  PID `1604045`; at `11:46 PDT` it had not yet published its JSON/Markdown pair, so those paths are
+  not claimed as complete verdict artifacts.
+- Dataset `data/teacher_train_mix_v2p11_submitfix1262` retains the exact 1,211-row v2.10 prefix and
+  the 15 late strict Fable rows. Only the 36 Stage-A terminal prose targets are replaced by the exact
+  harness bash submission call. Its sealed manifest SHA-256 is
+  `36a7f3b13ad1dbd89fa5a02af92cdfe9f8581cedf54ea984b73d5749ec52c223`, `train.jsonl` SHA-256 is
+  `04530c4a9237c3af88dcfe1bcce72a3de8ad3982ad2965f96ef436c0c87f254a`, and full 1,262-row
+  format/loss replay report SHA-256 is
+  `8656bb9ce3f60157e9e7ddb97a547e0415ffbf0a3781f54238bb6d0684816e8f`. Replay found zero failures,
+  zero fallback spans, and zero supervised fallback spans. The independent real-data validator
+  returned 1,211 base rows, 51 Fable rows, 36 terminal repairs, 15 unchanged late rows, maximum
+  rendered length 26,594/32,768, and `init_adapter=null`.
+- The one allowed successor is a fresh raw-base bf16 LoRA with rank/alpha 32/32, LR `2e-5`, one
+  epoch, effective batch 16, full 32,768 context, and 79 optimizer steps. It is active only on GPU1
+  as `v2p11-submitfix1262-train-gpu1-v2.service`, invocation
+  `3bff6af3c2a24d24a2a96190a3fbc4ea`, wrapper PID `1611339`, trainer PID `1611492`, and watchdog
+  PID `1611494`. At optimizer step 1/79 the measured remaining ETA was 25,862 seconds, projecting
+  training completion near `18:57 PDT`; GPU1 held 69,910 MiB and host memory remained 43-47 GiB
+  against the 12-GiB stop floor. Do not inspect or touch GPU0.
+- The automatic post-training chain is active as
+  `v2p11-submitfix1262-posttrain-chain-gpu1-v1.service`, invocation
+  `88fe53ccedfd4c138847982abfc1594a`, MainPID `1615812`. Immutable GPU identity proves trainer PID
+  `1611492`, `CUDA_VISIBLE_DEVICES=1`, physical GPU index 1, and exact GPU compute-PID set
+  `[1611492]`. Local and remote launcher/chain/provenance/comparator verification passed 45/45, and
+  remote production data validation passed. After 79/79 the chain will capture immutable journals,
+  audit all adapter tensors, merge with the existing 1,188/356 architecture gate, run controller-free
+  portability10, and run the identical full300 plus bounded empty-only correction. The next scheduled
+  live check is the approximately `18:57 PDT` training boundary or an actual unit/watchdog failure.

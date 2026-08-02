@@ -38,6 +38,9 @@ EXPECTED_LATE_ROWS = 15
 EXPECTED_FULL_IDS = 300
 EXPECTED_V2P10_RESOLVED = 157
 EXPECTED_BASE_MODEL = "/media/ironbcc/CrucialX10/models/google/gemma-4-31B-it"
+EXPECTED_TRAIN_UNIT = "v2p11-clean-fable51-train-gpu1-v2.service"
+EXPECTED_GPU_IDENTITY_ARTIFACT_TYPE = "v2p11_clean_gpu_training_identity"
+EXPECTED_TRAINING_COMPLETION_ARTIFACT_TYPE = "v2p11_clean_training_completion"
 EXPECTED_MANIFEST_SHA256 = (
     "40531f44c8d5ab1d47a179418aa1adaf1ca31d0f0265f262b15c5fd424b4758a"
 )
@@ -258,10 +261,9 @@ def _validate_gpu_identity(
     if (
         identity.get("schema_version") != 1
         or identity.get("artifact_type")
-        != "v2p11_clean_gpu_training_identity"
+        != EXPECTED_GPU_IDENTITY_ARTIFACT_TYPE
         or identity.get("status") != "complete"
-        or identity.get("train_unit")
-        != "v2p11-clean-fable51-train-gpu1-v2.service"
+        or identity.get("train_unit") != EXPECTED_TRAIN_UNIT
         or identity.get("train_invocation_id") != invocation_id
         or identity.get("train_pid") != train_pid
         or identity.get("gpu_index") != 1
@@ -366,12 +368,11 @@ def _validate_training(
     if (
         completion.get("schema_version") != 1
         or completion.get("artifact_type")
-        != "v2p11_clean_training_completion"
+        != EXPECTED_TRAINING_COMPLETION_ARTIFACT_TYPE
         or completion.get("status") != "complete"
         or completion.get("base_model") != EXPECTED_BASE_MODEL
         or completion.get("init_adapter") is not None
-        or completion.get("train_unit")
-        != "v2p11-clean-fable51-train-gpu1-v2.service"
+        or completion.get("train_unit") != EXPECTED_TRAIN_UNIT
         or not isinstance(invocation_id, str)
         or len(invocation_id) != 32
         or any(character not in "0123456789abcdef" for character in invocation_id)

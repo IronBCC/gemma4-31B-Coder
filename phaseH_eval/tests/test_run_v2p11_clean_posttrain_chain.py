@@ -80,7 +80,8 @@ def test_clean_chain_seals_live_physical_gpu1_identity() -> None:
     assert 'environment.get("CUDA_VISIBLE_DEVICES") == "1"' in script
     assert 'nvidia-smi -i "$GPU_INDEX" --query-gpu=uuid' in script
     assert 'nvidia-smi -i "$GPU_INDEX" --query-compute-apps=pid' in script
-    assert '"artifact_type": "v2p11_clean_gpu_training_identity"' in script
+    assert 'GPU_IDENTITY_ARTIFACT_TYPE="${GPU_IDENTITY_ARTIFACT_TYPE:-v2p11_clean_gpu_training_identity}"' in script
+    assert '"artifact_type": artifact_type' in script
     assert '"train_pid_on_gpu": True' in script
     assert '"gpu_identity": binding(gpu_identity_path)' in script
 

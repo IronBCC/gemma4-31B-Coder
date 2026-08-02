@@ -15,17 +15,23 @@ GPU_INDEX="${GPU_INDEX:-1}"
 WAIT_SECONDS="${WAIT_SECONDS:-60}"
 MEMORY_FLOOR_GIB="${MEMORY_FLOOR_GIB:-40}"
 MEMORY_WATCHDOG_GIB="${MEMORY_WATCHDOG_GIB:-12}"
-BASE="/media/ironbcc/CrucialX10/models/google/gemma-4-31B-it"
-DATA="data/teacher_train_mix_v2p11_fable1262"
-BASE_DATA="data/teacher_train_mix_v2p10"
-ADAPTER="adapters/teacher_sft_v2p11_clean_fable51_bf16"
-CANDIDATE_NAME="teacher_sft_v2p11_clean_fable51"
-ARTIFACT_TAG="v2p11_clean_fable51"
-MERGED="/media/ironbcc/CrucialX10/models/merged/teacher_sft_v2p11_clean_fable51_full"
-MERGE_AUDIT="$MERGED/v2p11_clean_merge_audit.json"
-CONTEXT_AUDIT="runs/v2p11_clean_fable51_context_audit.json"
-TRAIN_LOG_SOURCE="/tmp/train_v2p11_clean_fable51_gpu1.log"
-WATCHDOG_LOG_SOURCE="/tmp/ram_watchdog_v2p11_clean_fable51_gpu1.log"
+BASE="${BASE:-/media/ironbcc/CrucialX10/models/google/gemma-4-31B-it}"
+DATA="${DATA:-data/teacher_train_mix_v2p11_fable1262}"
+BASE_DATA="${BASE_DATA:-data/teacher_train_mix_v2p10}"
+ADAPTER="${ADAPTER:-adapters/teacher_sft_v2p11_clean_fable51_bf16}"
+CANDIDATE_NAME="${CANDIDATE_NAME:-teacher_sft_v2p11_clean_fable51}"
+ARTIFACT_TAG="${ARTIFACT_TAG:-v2p11_clean_fable51}"
+MERGED="${MERGED:-/media/ironbcc/CrucialX10/models/merged/teacher_sft_v2p11_clean_fable51_full}"
+MERGE_AUDIT_NAME="${MERGE_AUDIT_NAME:-v2p11_clean_merge_audit.json}"
+MERGE_AUDIT="$MERGED/$MERGE_AUDIT_NAME"
+CONTEXT_AUDIT="${CONTEXT_AUDIT:-runs/v2p11_clean_fable51_context_audit.json}"
+TRAIN_LOG_SOURCE="${TRAIN_LOG_SOURCE:-/tmp/train_v2p11_clean_fable51_gpu1.log}"
+WATCHDOG_LOG_SOURCE="${WATCHDOG_LOG_SOURCE:-/tmp/ram_watchdog_v2p11_clean_fable51_gpu1.log}"
+TRAIN_SCRIPT_NAME="${TRAIN_SCRIPT_NAME:-phaseH_eval/train_v2p11_clean_gpu1.sh}"
+DATASET_VALIDATOR_MODULE="${DATASET_VALIDATOR_MODULE:-phaseH_eval.v2p11_clean_completion_provenance}"
+PROVENANCE_TOOL="${PROVENANCE_TOOL:-phaseH_eval/v2p11_clean_completion_provenance.py}"
+GPU_IDENTITY_ARTIFACT_TYPE="${GPU_IDENTITY_ARTIFACT_TYPE:-v2p11_clean_gpu_training_identity}"
+TRAINING_COMPLETION_ARTIFACT_TYPE="${TRAINING_COMPLETION_ARTIFACT_TYPE:-v2p11_clean_training_completion}"
 TRAINING_JOURNAL="runs/${ARTIFACT_TAG}_training_journal.log"
 WATCHDOG_EVIDENCE="runs/${ARTIFACT_TAG}_watchdog.log"
 UNIT_JOURNAL="runs/${ARTIFACT_TAG}_unit_journal.jsonl"
@@ -68,7 +74,7 @@ validate_live_processes() {
   if [[ -z "$wrapper_command" ]]; then
     kill -0 "$TRAIN_WRAPPER_PID" 2>/dev/null || return 0
   fi
-  [[ "$wrapper_command" == *"phaseH_eval/train_v2p11_clean_gpu1.sh"* ]] ||
+  [[ "$wrapper_command" == *"$TRAIN_SCRIPT_NAME"* ]] ||
     halt "training wrapper PID identity changed"
   main_pid="$(
     systemctl --user show "$TRAIN_UNIT" -p MainPID --value 2>/dev/null || true
@@ -126,7 +132,8 @@ seal_gpu_identity() {
     halt "trainer PID is not executing on physical GPU1"
   "$TRAIN_PY" - \
     "$TRAIN_PID" "$TRAIN_UNIT" "$TRAIN_INVOCATION_ID" \
-    "$gpu_uuid" "$gpu_compute_pids" "$GPU_IDENTITY" <<'PY'
+    "$gpu_uuid" "$gpu_compute_pids" "$GPU_IDENTITY" \
+    "$GPU_IDENTITY_ARTIFACT_TYPE" <<'PY'
 import hashlib
 import json
 import os
@@ -134,7 +141,15 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-train_pid, train_unit, invocation_id, gpu_uuid, gpu_pids_text, output = sys.argv[1:]
+(
+    train_pid,
+    train_unit,
+    invocation_id,
+    gpu_uuid,
+    gpu_pids_text,
+    output,
+    artifact_type,
+) = sys.argv[1:]
 environment = {}
 for item in Path(f"/proc/{train_pid}/environ").read_bytes().split(b"\0"):
     if b"=" in item:
@@ -147,7 +162,7 @@ gpu_compute_pids = sorted({int(value) for value in gpu_pids_text.split()})
 assert int(train_pid) in gpu_compute_pids
 report = {
     "schema_version": 1,
-    "artifact_type": "v2p11_clean_gpu_training_identity",
+    "artifact_type": artifact_type,
     "status": "complete",
     "captured_at_utc": datetime.now(timezone.utc).isoformat(),
     "train_unit": train_unit,
@@ -282,14 +297,16 @@ wait_for_memory() {
 }
 
 validate_dataset() {
-  "$TRAIN_PY" - "$DATA" "$BASE_DATA" "$CONTEXT_AUDIT" <<'PY'
+  "$TRAIN_PY" - \
+    "$DATA" "$BASE_DATA" "$CONTEXT_AUDIT" \
+    "$DATASET_VALIDATOR_MODULE" <<'PY'
+import importlib
 import json
 import sys
 from pathlib import Path
 
-from phaseH_eval.v2p11_clean_completion_provenance import _validate_dataset
-
-validated = _validate_dataset(*(Path(value) for value in sys.argv[1:]))
+module = importlib.import_module(sys.argv[4])
+validated = module._validate_dataset(*(Path(value) for value in sys.argv[1:4]))
 print(json.dumps({
     "rows": validated["rows"],
     "base_rows": validated["base_rows"],
@@ -303,7 +320,8 @@ audit_adapter() {
     "$BASE" "$DATA" "$ADAPTER" "$TRAIN_UNIT" "$TRAIN_INVOCATION_ID" \
     "$TRAIN_WRAPPER_PID" "$TRAIN_PID" "$WATCHDOG_PID" \
     "$TRAINING_JOURNAL" "$WATCHDOG_EVIDENCE" "$UNIT_JOURNAL" \
-    "$GPU_IDENTITY" "$TRAINING_COMPLETION" <<'PY'
+    "$GPU_IDENTITY" "$TRAINING_COMPLETION" \
+    "$TRAINING_COMPLETION_ARTIFACT_TYPE" <<'PY'
 import hashlib
 import json
 import math
@@ -328,6 +346,7 @@ from safetensors import safe_open
     unit_journal_value,
     gpu_identity_value,
     completion_value,
+    completion_artifact_type,
 ) = sys.argv[1:]
 adapter_path = Path(adapter)
 weights_path = adapter_path / "adapter_model.safetensors"
@@ -435,7 +454,7 @@ def binding(path):
 
 report = {
     "schema_version": 1,
-    "artifact_type": "v2p11_clean_training_completion",
+    "artifact_type": completion_artifact_type,
     "status": "complete",
     "base_model": base,
     "init_adapter": None,
@@ -490,7 +509,7 @@ merge_model() {
     --group-gb 3 --max-rss-gb 12 \
     --audit-architecture Gemma4ForConditionalGeneration \
     --audit-tensors 1188 --audit-vision 356 \
-    --audit-filename v2p11_clean_merge_audit.json
+    --audit-filename "$MERGE_AUDIT_NAME"
   [[ -f "$MERGE_AUDIT" ]] || halt "merge completed without audit"
   log "merge complete model=$MERGED"
 }
@@ -514,7 +533,7 @@ run_portability() {
 }
 
 publish_provenance() {
-  "$EVAL_PY" phaseH_eval/v2p11_clean_completion_provenance.py \
+  "$EVAL_PY" "$PROVENANCE_TOOL" \
     --candidate-name "$CANDIDATE_NAME" \
     --dataset "$DATA" \
     --base-data "$BASE_DATA" \
@@ -593,7 +612,7 @@ main() {
   publish_provenance
   wait_for_memory
   run_full300
-  log "CLEAN V2P11 GOAL CHAIN COMPLETE verdict=$VERDICT"
+  log "V2P11 DIRECT-LORA GOAL CHAIN COMPLETE verdict=$VERDICT"
 }
 
 main "$@"

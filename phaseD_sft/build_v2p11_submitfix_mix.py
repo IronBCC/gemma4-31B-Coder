@@ -323,12 +323,24 @@ def seal_submitfix_mix(*, out: Path, format_report: Path) -> dict[str, Any]:
         if not path.is_file() or binding.get("sha256") != _sha256_path(path):
             raise ValueError("submit-fix source changed before sealing")
     report_data = report.get("data")
+    report_counts = report.get("counts")
+    fallback_spans = (
+        report_counts.get("fallback_spans")
+        if isinstance(report_counts, Mapping)
+        else report.get("fallback_spans", 0)
+    )
+    supervised_fallback_spans = (
+        report_counts.get("supervised_fallback_spans")
+        if isinstance(report_counts, Mapping)
+        else report.get("supervised_fallback_spans", 0)
+    )
     if (
         not isinstance(report_data, str)
         or Path(report_data).resolve() != out
         or report.get("samples") != len(rows)
         or report.get("failure_count") != 0
-        or report.get("fallback_spans", 0) != 0
+        or fallback_spans != 0
+        or supervised_fallback_spans != 0
     ):
         raise ValueError("format-loss report does not prove the full submit-fix dataset")
     report_name = f"format-gate.{_sha256_path(format_report)}.json"

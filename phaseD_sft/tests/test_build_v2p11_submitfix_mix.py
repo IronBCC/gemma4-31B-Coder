@@ -251,3 +251,28 @@ def test_seal_requires_full_format_report(
     assert gate["report"]["sha256"] == _sha(
         out / gate["report"]["path"].split("/")[-1]
     )
+
+
+def test_seal_rejects_nested_fallback_spans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, _rows = _fixture(tmp_path, monkeypatch)
+    out = tmp_path / "submitfix"
+    submitfix.build_submitfix_mix(source=source, out=out)
+    report = tmp_path / "format.json"
+    _write_json(
+        report,
+        {
+            "data": str(out.resolve()),
+            "samples": 4,
+            "failure_count": 0,
+            "counts": {
+                "fallback_spans": 1,
+                "supervised_fallback_spans": 0,
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="full submit-fix dataset"):
+        submitfix.seal_submitfix_mix(out=out, format_report=report)

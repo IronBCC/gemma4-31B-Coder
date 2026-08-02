@@ -322,3 +322,57 @@ def test_clean_validation_uses_external_v2p10_lineage(
             candidate_model_contract=contract,
             candidate_name="teacher_sft_v2p11_clean_fable51",
         )
+
+
+def test_clean_validation_accepts_omitted_inactive_single_file_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = {
+        "model_path": str((tmp_path / "model").resolve()),
+        "served_name": "teacher_sft_v2p11_clean_fable51",
+        "model_config_sha256": "a" * 64,
+        "model_index_sha256": "b" * 64,
+        "model_safetensors_sha256": None,
+        "model_artifacts": [
+            {
+                "path": str((tmp_path / "model" / "shard.safetensors").resolve()),
+                "bytes": 1,
+                "sha256": "c" * 64,
+            }
+        ],
+    }
+    report = {
+        "artifact_type": "v2p11_clean_completion_provenance",
+        "candidate_name": "teacher_sft_v2p11_clean_fable51",
+        "dataset": {
+            "path": str(tmp_path / "dataset"),
+            "base_data": {"path": str(tmp_path / "base")},
+            "context_audit": {"path": str(tmp_path / "context.json")},
+        },
+        "training": {
+            "adapter": {"path": str(tmp_path / "adapter" / "adapter_model.safetensors")},
+            "completion": {"path": str(tmp_path / "completion.json")},
+        },
+        "v2p10_training_lineage": {
+            "contract": {"path": str(tmp_path / "lineage.json")}
+        },
+        "final_model": contract,
+        "merge_audit": {"path": str(tmp_path / "merge.json")},
+        "portability": {"gate": {"path": str(tmp_path / "gate.json")}},
+    }
+    monkeypatch.setattr(provenance, "_read_object", lambda _path: report)
+    monkeypatch.setattr(provenance, "_build_report", lambda **_kwargs: report)
+    legacy_sharded_contract = dict(contract)
+    legacy_sharded_contract.pop("model_safetensors_sha256")
+
+    validated = provenance.validate_completion_provenance(
+        tmp_path / "provenance.json",
+        full_ids_path=tmp_path / "ids.json",
+        v2p10_composite_path=tmp_path / "v2p10.json",
+        v2p10_lineage_path=tmp_path / "lineage.json",
+        candidate_model_contract=legacy_sharded_contract,
+        candidate_name="teacher_sft_v2p11_clean_fable51",
+    )
+
+    assert validated == report

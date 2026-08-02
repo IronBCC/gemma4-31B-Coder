@@ -639,6 +639,20 @@ def publish_completion_provenance(
     return report
 
 
+def _model_contracts_match(
+    candidate: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> bool:
+    candidate_value = dict(candidate)
+    expected_value = dict(expected)
+    for key in ("model_index_sha256", "model_safetensors_sha256"):
+        if key not in candidate_value and expected_value.get(key) is None:
+            candidate_value[key] = None
+        if key not in expected_value and candidate_value.get(key) is None:
+            expected_value[key] = None
+    return candidate_value == expected_value
+
+
 def validate_completion_provenance(
     provenance_path: Path,
     *,
@@ -690,7 +704,9 @@ def validate_completion_provenance(
     )
     if report != expected:
         raise ValueError("clean v2.11 completion provenance changed")
-    if dict(candidate_model_contract) != expected["final_model"]:
+    if not _model_contracts_match(
+        candidate_model_contract, expected["final_model"]
+    ):
         raise ValueError("clean provenance does not bind evaluated model")
     return expected
 

@@ -40,6 +40,8 @@ halt() {
   halt "training dataset is missing"
 [[ ! -e "$ADAPTER" ]] || halt "adapter output already exists: $ADAPTER"
 [[ ! -e "$CONTEXT_AUDIT" ]] || halt "context audit already exists: $CONTEXT_AUDIT"
+[[ ! -e "$TRAIN_LOG" && ! -e "$WATCHDOG_LOG" ]] ||
+  halt "training source log already exists"
 command -v choom >/dev/null || halt "choom is required"
 
 available_kib="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"

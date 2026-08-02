@@ -27,6 +27,7 @@ def test_submitfix_successor_is_gpu1_only_and_fail_closed() -> None:
     assert "--query-gpu=index,uuid" not in script
     assert "phaseD_sft/ram_watchdog.py" in script
     assert "train_status == 0 && watchdog_status == 0" in script
+    assert '[[ ! -e "$TRAIN_LOG" && ! -e "$WATCHDOG_LOG" ]]' in script
     assert "pkill" not in script
     assert "pgrep" not in script
 

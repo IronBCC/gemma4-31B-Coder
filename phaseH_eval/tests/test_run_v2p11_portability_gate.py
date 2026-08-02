@@ -356,6 +356,32 @@ def test_portability_launcher_guards_host_memory_during_owned_serve() -> None:
     assert "memory_watchdog_pid" in script
 
 
+def test_stock_harness_is_supervised_by_exact_serve_and_watchdog_pids() -> None:
+    script = SCRIPT.read_text()
+
+    assert (
+        'EVAL_SUPERVISOR="${EVAL_SUPERVISOR:-'
+        '$ROOT/phaseH_eval/run_while_pids_alive.py}"'
+    ) in script
+    assert 'guard_serve_pid="$owned_serve_pid"' in script
+    assert 'guard_watchdog_pid="$memory_watchdog_pid"' in script
+    assert '"$EVAL_PY" "$EVAL_SUPERVISOR"' in script
+    assert '--watch-pid "serve=$guard_serve_pid"' in script
+    assert '--watch-pid "watchdog=$guard_watchdog_pid"' in script
+    assert 'eval_status=$?' in script
+    assert 'if (( eval_status != 0 )); then' in script
+    assert 'stock Mini-SWE failed status=$eval_status' in script
+
+
+def test_owned_serve_shutdown_logs_original_process_statuses() -> None:
+    script = SCRIPT.read_text()
+
+    assert 'serve_pid="$owned_serve_pid"' in script
+    assert 'watchdog_pid="$memory_watchdog_pid"' in script
+    assert 'serve_status=$serve_status' in script
+    assert 'watchdog_status=$watchdog_status' in script
+
+
 def test_portability_launcher_is_hard_bound_to_gpu1() -> None:
     script = SCRIPT.read_text()
 
@@ -445,7 +471,10 @@ printf 'alive=%s retained=%s\\n' "$alive" "${owned_serve_pid:+yes}"
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "alive=0 retained="
+    lines = result.stdout.strip().splitlines()
+    assert "serve_status=143" in lines[0]
+    assert "watchdog_pid=none watchdog_status=0" in lines[0]
+    assert lines[-1] == "alive=0 retained="
 
 
 def test_portability_cleanup_propagates_bounded_stop_failure() -> None:

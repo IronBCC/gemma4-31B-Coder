@@ -702,6 +702,49 @@ def test_completion_provenance_dispatches_reasoned_direct_lora_contract(
     assert captured["candidate_model_contract"] == model_contract
 
 
+def test_completion_provenance_dispatches_clean_raw_base_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import phaseH_eval.v2p11_clean_completion_provenance as clean_module
+
+    provenance = tmp_path / "provenance.json"
+    provenance.write_text(
+        json.dumps({"artifact_type": "v2p11_clean_completion_provenance"})
+        + "\n"
+    )
+    captured: dict[str, object] = {}
+
+    def fake_validate(path: Path, **kwargs: object) -> dict[str, object]:
+        captured["path"] = path
+        captured.update(kwargs)
+        return {"status": "complete"}
+
+    monkeypatch.setattr(
+        clean_module, "validate_completion_provenance", fake_validate
+    )
+    full_ids = tmp_path / "ids.json"
+    v2p10 = tmp_path / "v2p10.json"
+    lineage = tmp_path / "v2p10-lineage.json"
+    model_contract = {
+        "served_name": "teacher_sft_v2p11_clean_fable51"
+    }
+
+    validated = compare_module.validate_completion_provenance(
+        provenance,
+        full_ids_path=full_ids,
+        v2p10_composite_path=v2p10,
+        v2p10_lineage_path=lineage,
+        candidate_model_contract=model_contract,
+        candidate_name="teacher_sft_v2p11_clean_fable51",
+    )
+
+    assert validated == {"status": "complete"}
+    assert captured["path"] == provenance.resolve()
+    assert captured["v2p10_lineage_path"] == lineage.resolve()
+    assert captured["candidate_model_contract"] == model_contract
+
+
 def test_completion_provenance_dispatches_r3_behavior_poststage_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

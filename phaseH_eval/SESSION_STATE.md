@@ -3369,3 +3369,31 @@ Full analysis + run-by-run history: `phaseD_sft/V6_49K_RETROSPECTIVE.md`. Compre
   run a controller-free portability/regression gate, and proceed to the same full300 plus empty-only
   correction only if correctness is not below canonical v2.10. The promotion target remains strictly
   greater than v2.10's verified 157/300 on the identical 300 IDs.
+
+### Clean v2.11 post-training chain launch (2026-08-01 17:11 PDT)
+
+- The clean lineage now has a separate fail-closed completion contract. It revalidates the immutable
+  1,262-row outer Fable dataset and raw replay evidence, proves the first 1,211 rows equal the exact
+  canonical v2.10 training JSONL, binds the canonical v2.10 training lineage externally, requires
+  `init_adapter=null`, and rejects the old continuation LR/recovery/KTO/interpolation lineage. The
+  full300 comparator dispatches this artifact type without weakening the fixed v2.10 157/300 control.
+- Portability generation is supervised against the exact owned vLLM and RAM-watchdog PIDs. Either
+  guard exiting terminates the Mini-SWE process group and prevents partial predictions from being
+  scored. Shutdown evidence retains the original serve/watchdog PIDs and statuses.
+- A Luna/default read-only audit found two gaps: copied training logs could be stale, and the training
+  completion did not prove physical GPU1 execution. Both are fixed. The chain rejects every
+  pre-existing evidence target and seals a new immutable live GPU artifact before waiting. Artifact
+  `runs/v2p11_clean_fable51_gpu1_training_identity.json` records trainer PID `68900`, training
+  invocation `bf042e80eda24928a28c6c0784cbc0b2`, `CUDA_VISIBLE_DEVICES=1`, physical GPU index 1,
+  UUID `GPU-700a782a-8fa3-5b76-2a3d-11102618a1df`, and the exact GPU1 compute-PID set `[68900]`.
+- Expanded local and remote verification passed 104/104 tests. The real remote dataset validator also
+  returned 1,211 base rows plus 36 Stage-A and 15 late strict-replay Fable rows, maximum 26,594 of
+  32,768 tokens, and null initialization.
+- Training remained healthy at `17:00 PDT`: optimizer step 10/79, microstep 164/1264, 21,191 seconds
+  remaining, with the measured training boundary near `22:53 PDT`. The automatic waiter is active as
+  `v2p11-clean-fable51-posttrain-chain-gpu1-v1.service`, invocation
+  `96a45ce081d145cab517dd119df742b6`, MainPID `171435`. After training it will capture immutable
+  logs, audit all 820 adapter tensors and checkpoint 79, merge with the 1,188/356 audit, run
+  controller-free portability10, publish clean provenance, then execute the identical full300 with
+  empty-only correction. Do not query or touch GPU0; recheck at training completion or a real guard/
+  service failure, not every optimizer step.

@@ -38,6 +38,7 @@ SERVE_STOP_WAIT_SECONDS="${SERVE_STOP_WAIT_SECONDS:-1}"
 MEMORY_ADMISSION_GIB="${MEMORY_ADMISSION_GIB:-40}"
 MEMORY_WATCHDOG_GIB="${MEMORY_WATCHDOG_GIB:-12}"
 RAM_WATCHDOG_PY="${RAM_WATCHDOG_PY:-$ROOT/.venv-train/bin/python}"
+EVAL_SUPERVISOR="${EVAL_SUPERVISOR:-$ROOT/phaseH_eval/run_while_pids_alive.py}"
 owned_serve_pid=""
 memory_watchdog_pid=""
 
@@ -120,32 +121,39 @@ finish_memory_watchdog() {
 }
 
 stop_owned_serve() {
-  local pid watchdog_status=0
-  pid="$owned_serve_pid"
-  [[ -n "$pid" ]] || return
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -TERM "$pid"
+  local serve_pid watchdog_pid serve_status=0 watchdog_status=0
+  serve_pid="$owned_serve_pid"
+  watchdog_pid="$memory_watchdog_pid"
+  [[ -n "$serve_pid" ]] || return
+  if kill -0 "$serve_pid" 2>/dev/null; then
+    kill -TERM "$serve_pid"
     for _ in $(seq 1 "$SERVE_STOP_WAIT_LOOPS"); do
-      kill -0 "$pid" 2>/dev/null || break
+      kill -0 "$serve_pid" 2>/dev/null || break
       sleep "$SERVE_STOP_WAIT_SECONDS"
     done
   fi
-  if kill -0 "$pid" 2>/dev/null; then
+  if kill -0 "$serve_pid" 2>/dev/null; then
     return 1
   fi
-  wait "$pid" 2>/dev/null || true
-  owned_serve_pid=""
+  if wait "$serve_pid" 2>/dev/null; then
+    serve_status=0
+  else
+    serve_status=$?
+  fi
   finish_memory_watchdog || watchdog_status=$?
+  log "owned serve stopped serve_pid=$serve_pid serve_status=$serve_status watchdog_pid=${watchdog_pid:-none} watchdog_status=$watchdog_status"
+  owned_serve_pid=""
   wait_for_gpu1_idle
   (( watchdog_status == 0 ))
 }
 
 cleanup() {
-  local status=$?
+  local status=$? cleanup_serve_pid
+  cleanup_serve_pid="$owned_serve_pid"
   trap - EXIT
   set +e
   if ! stop_owned_serve; then
-    log "HALT: owned serve PID $owned_serve_pid did not stop"
+    log "HALT: owned serve PID ${cleanup_serve_pid:-none} did not stop cleanly"
     status=1
   fi
   exit "$status"
@@ -510,7 +518,7 @@ score_run() {
 
 run_stock_harness() {
   local name="$1" model="$2" run_root="$3"
-  local filter
+  local filter guard_serve_pid guard_watchdog_pid eval_status stop_status=0
   ensure_eval_manifest "$name" "$model" "$run_root"
   start_owned_serve "$name" "$model" "/tmp/serve_${name}_portability.log"
   run_tool_canary "$name" "$run_root"
@@ -526,8 +534,19 @@ print("^(?:" + "|".join(re.escape(value) for value in ids) + ")$")
 PY
     )"
     log "running stock Mini-SWE holdout name=$name"
+    guard_serve_pid="$owned_serve_pid"
+    guard_watchdog_pid="$memory_watchdog_pid"
+    [[ "$guard_serve_pid" =~ ^[1-9][0-9]*$ ]] ||
+      halt "stock Mini-SWE requires an exact serve PID"
+    [[ "$guard_watchdog_pid" =~ ^[1-9][0-9]*$ ]] ||
+      halt "stock Mini-SWE requires an exact watchdog PID"
+    set +e
     OPENAI_API_KEY=dummy \
     MSWEA_COST_TRACKING=ignore_errors \
+      "$EVAL_PY" "$EVAL_SUPERVISOR" \
+        --watch-pid "serve=$guard_serve_pid" \
+        --watch-pid "watchdog=$guard_watchdog_pid" \
+        -- \
       "$EVAL_PY" phaseH_eval/mini_extra_selfretry.py swebench \
         --subset verified --split test --filter "$filter" \
         --workers 4 \
@@ -542,6 +561,12 @@ PY
         -c model.cost_tracking=ignore_errors \
         -o "$run_root" \
         >> "$run_root/generation.log" 2>&1
+    eval_status=$?
+    set -e
+    if (( eval_status != 0 )); then
+      stop_owned_serve || stop_status=$?
+      halt "stock Mini-SWE failed status=$eval_status serve_pid=$guard_serve_pid watchdog_pid=$guard_watchdog_pid stop_status=$stop_status"
+    fi
   fi
   stop_owned_serve ||
     halt "owned serve PID $owned_serve_pid did not stop"
